@@ -1,0 +1,20 @@
+[package]
+name = "stree"
+version = "1.0.0"
+edition = "2021"
+description = "通用声明式结构化树形终端视图引擎"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = true
+
+[dependencies]
+crossterm = "0.27"
+clap = { version = "4.0", features = ["derive"] }
+unicode-width = "0.1"
+thiserror = "1.0"
+anyhow = "1.0"
+signal-hook = "0.3"
+regex = "1.10"
