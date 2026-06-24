@@ -22,11 +22,39 @@ pub struct BindConfig {
 
 impl BindConfig {
     pub fn new() -> Self {
-        Self { bindings: HashMap::new() }
+        let mut config = Self { bindings: HashMap::new() };
+        // 默认绑定
+        let defaults = vec![
+            ("q",         "__EXIT__"),
+            ("esc",       "__ESC__"),
+            ("tab",       "__TAB__"),
+            ("up",        "__UP__"),
+            ("k",         "__UP__"),
+            ("down",      "__DOWN__"),
+            ("j",         "__DOWN__"),
+            ("left",      "__EXPAND__"),
+            ("h",         "__EXPAND__"),
+            ("right",     "__EXPAND__"),
+            ("l",         "__EXPAND__"),
+            ("space",     "__MARK__"),
+            ("g",         "__TOP__"),
+            ("G",         "__BOTTOM__"),
+            ("/",         "__ACTIVATE_SEARCH__"),
+            (":",         "__ACTIVATE_CMD__"),
+            ("enter",     "__ENTER__"),
+        ];
+        for (key_desc, cmd) in defaults {
+            if let Some(key_event) = parse_key_desc(key_desc) {
+                let args = split_args(cmd);
+                let key = KeyBindingKey(key_event.code, key_event.modifiers);
+                config.bindings.insert(key, (args, false));
+            }
+        }
+        config
     }
 
     pub fn parse(bind_args: &[String]) -> Self {
-        let mut config = BindConfig::new();
+        let mut config = BindConfig::new(); // 先加载默认
         for arg in bind_args {
             if let Some((key_event, cmd_template, is_silent)) = parse_binding(arg) {
                 let args = split_args(&cmd_template);
@@ -37,7 +65,6 @@ impl BindConfig {
         config
     }
 
-    // 【修改】返回值带上 is_silent 标志
     pub fn get(&self, key: &KeyEvent) -> Option<&(Vec<String>, bool)> {
         let k = KeyBindingKey(key.code, key.modifiers);
         self.bindings.get(&k)

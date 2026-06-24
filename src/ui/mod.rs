@@ -16,7 +16,7 @@ pub struct RenderCtx<'a> {
 use std::io::Write;
 use crossterm::{cursor, style, QueueableCommand};
 
-pub fn draw_border<W: Write>(out: &mut W, rect: &WindowRect, title: Option<&str>, border: BorderStyle, is_focused: bool) -> std::io::Result<()> {
+pub fn draw_border<W: Write>(out: &mut W, rect: &WindowRect, title: Option<&str>, border: BorderStyle, is_focused: bool, border_chars: Option<&str>) -> std::io::Result<()> {
     let width = rect.width as usize;
     if width < 2 { return Ok(()); }
     if border == BorderStyle::Box && rect.height < 2 { return Ok(()); }
@@ -26,13 +26,26 @@ pub fn draw_border<W: Write>(out: &mut W, rect: &WindowRect, title: Option<&str>
     let y_bottom = rect.start_row + rect.height - 1;
 
     let border_color = if is_focused { Color::Green } else { Color::DarkGrey };
+    let (top_left, top_right, bottom_left, bottom_right, vertical, horizontal) = if let Some(chars) = border_chars {
+        let chars: Vec<char> = chars.chars().collect();
+        (
+            chars.get(0).copied().unwrap_or(' '),
+            chars.get(1).copied().unwrap_or(' '),
+            chars.get(2).copied().unwrap_or(' '),
+            chars.get(3).copied().unwrap_or(' '),
+            chars.get(4).copied().unwrap_or('│'),
+            chars.get(5).copied().unwrap_or('─'),
+        )
+    } else {
+        ('┌', '┐', '└', '┘', '│', '─')
+    };
 
     match border {
         BorderStyle::None => {}
         BorderStyle::Line => {
             out.queue(style::SetForegroundColor(border_color))?;
             let mut top_line = String::with_capacity(width);
-            for _ in 0..width { top_line.push('─'); }
+            for _ in 0..width { top_line.push(horizontal); }
             out.queue(cursor::MoveTo(x, y_top))?;
             out.queue(style::Print(top_line))?;
             out.queue(style::SetForegroundColor(Color::Reset))?;
@@ -40,7 +53,7 @@ pub fn draw_border<W: Write>(out: &mut W, rect: &WindowRect, title: Option<&str>
         BorderStyle::Box => {
             out.queue(style::SetForegroundColor(border_color))?;
             let mut top_line = String::with_capacity(width);
-            top_line.push('┌');
+            top_line.push(top_left);
             if let Some(t) = title {
                 if !t.is_empty() {
                     let title_str = format!(" {} ", t);
@@ -48,25 +61,24 @@ pub fn draw_border<W: Write>(out: &mut W, rect: &WindowRect, title: Option<&str>
                 }
             }
             let current_len = top_line.chars().count();
-            for _ in current_len..width - 1 { top_line.push('─'); }
-            top_line.push('┐');
+            for _ in current_len..width - 1 { top_line.push(horizontal); }
+            top_line.push(top_right);
             out.queue(cursor::MoveTo(x, y_top))?;
             out.queue(style::Print(top_line))?;
 
             let mut bottom_line = String::with_capacity(width);
-            bottom_line.push('└');
-            for _ in 1..width - 1 { bottom_line.push('─'); }
-            bottom_line.push('┘');
+            bottom_line.push(bottom_left);
+            for _ in 1..width - 1 { bottom_line.push(horizontal); }
+            bottom_line.push(bottom_right);
             out.queue(cursor::MoveTo(x, y_bottom))?;
             out.queue(style::Print(bottom_line))?;
 
             for row in 1..rect.height - 1 {
                 out.queue(cursor::MoveTo(x, y_top + row as u16))?;
-                out.queue(style::Print("│"))?;
+                out.queue(style::Print(vertical.to_string()))?;
                 out.queue(cursor::MoveTo(x + rect.width - 1, y_top + row as u16))?;
-                out.queue(style::Print("│"))?;
+                out.queue(style::Print(vertical.to_string()))?;
             }
-            out.queue(style::SetForegroundColor(Color::Reset))?;
         }
     }
     Ok(())
@@ -208,7 +220,7 @@ pub fn draw_tree_window<W: Write>(out: &mut W, rect: &WindowRect, tree: &crate::
     let max_rows = (rect.height as usize).saturating_sub(border_overhead);
     let start = scroll_offset;
     let end = (start + max_rows).min(tree.visible_ids.len());
-    let is_filtering = !tree.search_query.trim().is_empty();
+    let is_filtering = false;
     let mut drawn = 0;
 
     for i in start..end {
@@ -221,7 +233,6 @@ pub fn draw_tree_window<W: Write>(out: &mut W, rect: &WindowRect, tree: &crate::
         let mut display = String::new();
 
         // 标记 * 放在最左侧
-        display.push(if is_marked { '*' } else { ' ' });
         display.push(' ');
 
         for _ in 0..depth * 2 { display.push(' '); }
@@ -235,8 +246,21 @@ pub fn draw_tree_window<W: Write>(out: &mut W, rect: &WindowRect, tree: &crate::
         let screen_row = rect.start_row + border_offset + drawn as u16;
         let start_col = rect.start_col + border_offset;
         let (final_color, is_bold) = {
-            let (c, b) = style_engine.get_style(&entity.tags);
-            let c = if is_focused { c.unwrap_or(Color::White) } else { Color::DarkGrey };
+            let mut tags_with_state = entity.tags.clone();
+            if is_selected {
+                if !tags_with_state.is_empty() { tags_with_state.push_str(","); }
+                tags_with_state.push_str("__selected__");
+            }
+            if is_marked {
+                if !tags_with_state.is_empty() { tags_with_state.push_str(","); }
+                tags_with_state.push_str("__marked__");
+            }
+            let (c, b) = style_engine.get_style(&tags_with_state);
+            let c = if is_focused {
+                c.unwrap_or(Color::White)
+            } else {
+                c.unwrap_or(Color::DarkGrey)
+            };
             (c, b)
         };
 
@@ -244,7 +268,7 @@ pub fn draw_tree_window<W: Write>(out: &mut W, rect: &WindowRect, tree: &crate::
         if is_bold { out.queue(crossterm::style::SetAttribute(crossterm::style::Attribute::Bold))?; }
         out.queue(crossterm::style::SetForegroundColor(final_color))?;
 
-        let highlight = if is_filtering && tree.matched_ids.contains(id) { Some(tree.search_query.as_str()) } else { None };
+        let highlight = None;
 
         draw_text(out, start_col, screen_row, &display, rect.width - 2, highlight, final_color)?;
 
@@ -271,16 +295,6 @@ pub fn render_all<W: Write>(ctx: &RenderCtx, out: &mut W) -> std::io::Result<()>
     let rects = crate::layout::calc_window_rects(&ctx.engine.layout, term_width, term_height);
     if rects.is_empty() { return Ok(()); }
 
-    // 收集搜索状态，用于覆盖状态栏
-    let mut search_info: Option<(bool, String)> = None;
-    if let Focus::Component(name) = &ctx.engine.focused {
-        if let Some(Component::Tree(t)) = ctx.engine.components.get(name) {
-            if t.in_search_mode || !t.search_query.is_empty() {
-                search_info = Some((t.in_search_mode, t.search_query.clone()));
-            }
-        }
-    }
-
     // 找到状态栏的 rect，用于后续错误覆盖
     let mut status_rect_opt: Option<WindowRect> = None;
 
@@ -289,7 +303,8 @@ pub fn render_all<W: Write>(ctx: &RenderCtx, out: &mut W) -> std::io::Result<()>
         let title = comp.map(|_| name.as_str());
         let is_focused = ctx.engine.focused == Focus::Component(name.clone());
 
-        draw_border(out, rect, title, *border, is_focused)?;
+        let border_chars = ctx.engine.border_chars.get(name).map(|s| s.as_str());
+        draw_border(out, rect, title, *border, is_focused, border_chars)?;
 
         match comp {
             Some(Component::Tree(t)) => {
@@ -324,79 +339,62 @@ pub fn render_all<W: Write>(ctx: &RenderCtx, out: &mut W) -> std::io::Result<()>
                 let col = rect.start_col;
                 let cover_width = rect.width as usize;
 
-                if let Some((in_search, query)) = &search_info {
-                    let _ = in_search;
-                    let status_text = format!("/{}", query);
-                    out.queue(cursor::MoveTo(col, row))?;
-                    out.queue(style::Print(" ".repeat(cover_width)))?;
-                    out.queue(cursor::MoveTo(col, row))?;
-                    out.queue(style::SetAttribute(style::Attribute::Reverse))?;
-                    let display_text: String = status_text.chars().take(cover_width).collect();
-                    out.queue(style::Print(&display_text))?;
-                    out.queue(style::SetAttribute(style::Attribute::Reset))?;
-                } else {
-                    let mut status_text = s.format_template.clone();
-                    status_text = status_text.replace("{stree_focus}", match &ctx.engine.focused { Focus::Component(n) => n, _ => "None" });
+                let mut status_text = s.format_template.clone();
+                status_text = status_text.replace("{stree_focus}", match &ctx.engine.focused { Focus::Component(n) => n, _ => "None" });
 
-                    if let Some(t) = ctx.engine.get_focused_tree_state() {
-                        status_text = status_text.replace("{stree_visible}", &t.visible_ids.len().to_string());
-                        status_text = status_text.replace("{stree_total}", &t.dataset.entities.len().to_string());
-                        status_text = status_text.replace("{stree_marked}", &t.marked_ids.len().to_string());
-                        status_text = status_text.replace("{stree_id}", t.selected_id.as_deref().unwrap_or(""));
-                    }
-
-                    out.queue(cursor::MoveTo(col, row))?;
-                    out.queue(style::Print(" ".repeat(cover_width)))?;
-                    out.queue(cursor::MoveTo(col, row))?;
-                    let display_text: String = status_text.chars().take(cover_width).collect();
-                    out.queue(style::Print(&display_text))?;
+                if let Some(t) = ctx.engine.get_focused_tree_state() {
+                    status_text = status_text.replace("{stree_visible}", &t.visible_ids.len().to_string());
+                    status_text = status_text.replace("{stree_total}", &t.dataset.entities.len().to_string());
+                    status_text = status_text.replace("{stree_marked}", &t.marked_ids.len().to_string());
+                    status_text = status_text.replace("{stree_id}", t.selected_id.as_deref().unwrap_or(""));
                 }
+
+                out.queue(cursor::MoveTo(col, row))?;
+                out.queue(style::Print(" ".repeat(cover_width)))?;
+                out.queue(cursor::MoveTo(col, row))?;
+                let display_text: String = status_text.chars().take(cover_width).collect();
+                out.queue(style::Print(&display_text))?;
             }
 
             Some(Component::Input(input)) => {
-                // 【修复】只在 active 状态下渲染
                 if !input.is_active {
-                    continue; // 跳过这个组件的渲染
+                    continue;
                 }
 
-                // 【核心修复】根据 border 类型计算内容区位置，避免覆盖边框
                 let (inner_col, inner_row, inner_w) = match border {
                     BorderStyle::Box => (rect.start_col + 1, rect.start_row + 1, rect.width.saturating_sub(2)),
-                    BorderStyle::Line => (rect.start_col, rect.start_row + 1, rect.width), // Line 边框占 1 行顶边
+                    BorderStyle::Line => (rect.start_col, rect.start_row + 1, rect.width),
                     BorderStyle::None => (rect.start_col, rect.start_row, rect.width),
                 };
 
                 let width = inner_w as usize;
+                let prefix_len = input.prefix.chars().count();
+                let content_width = width.saturating_sub(prefix_len);
 
-                // 清空行
+                // 差分：内容没变只移动硬件光标
+                let render_key = format!("{}{}{}", input.prefix, input.buffer, input.cursor);
+                let same = input.last_rendered == render_key;
+                // 注：不能在这里赋值，用 RefCell 或者每次重绘后在外面更新
+                if same {
+                    let cursor_col = inner_col + prefix_len as u16 + input.cursor as u16;
+                    out.queue(cursor::MoveTo(cursor_col, inner_row))?;
+                    continue;
+                }
+
+                // 完整重绘
                 out.queue(cursor::MoveTo(inner_col, inner_row))?;
                 out.queue(style::Print(" ".repeat(width)))?;
                 out.queue(cursor::MoveTo(inner_col, inner_row))?;
 
-                // 显示前缀
-                let prefix_display = &input.prefix;
                 out.queue(style::SetForegroundColor(Color::Yellow))?;
-                out.queue(style::SetAttribute(style::Attribute::Bold))?;
-                out.queue(style::Print(prefix_display))?;
-                out.queue(style::SetAttribute(style::Attribute::NormalIntensity))?;
+                out.queue(style::Print(&input.prefix))?;
                 out.queue(style::SetForegroundColor(Color::Reset))?;
 
-                let prefix_len = prefix_display.chars().count();
-                let content_width = width.saturating_sub(prefix_len);
-
-                // 显示输入内容
                 let display: String = input.buffer.chars().take(content_width).collect();
                 out.queue(style::Print(&display))?;
 
-                // 光标
-                if input.cursor <= content_width {
-                    let cursor_col = inner_col + prefix_len as u16 + input.cursor as u16;
-                    out.queue(cursor::MoveTo(cursor_col, inner_row))?;
-                    out.queue(style::SetAttribute(style::Attribute::Reverse))?;
-                    let cursor_char = input.buffer.chars().nth(input.cursor).unwrap_or(' ');
-                    out.queue(style::Print(cursor_char.to_string()))?;
-                    out.queue(style::SetAttribute(style::Attribute::Reset))?;
-                }
+                let cursor_col = inner_col + prefix_len as u16 + input.cursor as u16;
+                out.queue(cursor::MoveTo(cursor_col, inner_row))?;
             }
             None => {}
         }
@@ -417,6 +415,12 @@ pub fn render_all<W: Write>(ctx: &RenderCtx, out: &mut W) -> std::io::Result<()>
             out.queue(style::Print(&display_err))?;
             out.queue(style::SetAttribute(style::Attribute::Reset))?;
         }
+    }
+
+    if ctx.engine.has_active_input() {
+        out.queue(cursor::Show)?;
+    } else {
+        out.queue(cursor::Hide)?;
     }
 
     out.flush()?;

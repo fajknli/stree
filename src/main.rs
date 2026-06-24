@@ -45,10 +45,14 @@ struct Cli {
 
     #[arg(long = "bind", action = clap::ArgAction::Append)]
     binds: Vec<String>,
+    #[arg(long = "border-chars", action = clap::ArgAction::Append)]
+    border_chars: Vec<String>,
     #[arg(long, default_value = "")]
     status_col: String,
     #[arg(long)]
     select: Option<String>,
+    #[arg(long = "no-mouse", action = clap::ArgAction::SetTrue)]
+    no_mouse: bool,
     #[arg(long, default_value_t = 3)]
     scroll_step: u8,
 }
@@ -100,6 +104,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         full_dataset,
         layout,
         key_bindings,
+        !cli.no_mouse,
+        cli.border_chars,
         cli.trees,
         cli.views,
         cli.statusbars,
@@ -167,9 +173,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(e.into());
         }
 
-        let poll_timeout = if last_event_time.elapsed() < Duration::from_secs(1) { Duration::from_millis(10) }
-        else if last_event_time.elapsed() > Duration::from_secs(5) { Duration::from_millis(200) }
-        else { Duration::from_millis(50) };
+        let poll_timeout = if engine.has_active_input() {
+            Duration::from_millis(16)
+        } else {
+            if last_event_time.elapsed() < Duration::from_secs(1) { Duration::from_millis(10) }
+            else if last_event_time.elapsed() > Duration::from_secs(5) { Duration::from_millis(200) }
+            else { Duration::from_millis(50) }
+        };
 
         if event::poll(poll_timeout)? {
             last_event_time = std::time::Instant::now();
@@ -190,11 +200,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if result == "__CANCEL__" {
                                         // 取消，什么都不做
                                     } else {
-                                        // 提交成功，执行 on_submit 命令
                                         if let Some(app::Component::Input(input)) = engine.components.get(&input_name) {
-                                            if let Some(ref cmd_template) = input.on_submit {
+                                            if input.prefix == "/" {
+                                                // 搜索：内部消化
+                                                engine.apply_search(&result);
+                                            } else if let Some(ref cmd_template) = input.on_submit {
+                                                // 命令：走外部脚本
                                                 let cmd = cmd_template.replace("{input}", &result);
-                                                eprintln!("DEBUG on_submit cmd: {}", cmd);
                                                 let args = crate::config::split_args(&cmd);
                                                 if !args.is_empty() {
                                                     match exec::execute_command_silent(&args) {
@@ -218,159 +230,148 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // 搜索模式拦截
-                    if let Some(name) = focused_name {
-                        if let Some(app::Component::Tree(t)) = engine.components.get(&name) {
-                            if t.in_search_mode {
-                                match key_event.code {
-                                    KeyCode::Esc => {
-                                        engine.update_search_query(String::new());
-                                        if let Some(app::Component::Tree(t)) = engine.components.get_mut(&name) { t.in_search_mode = false; }
-                                    }
-                                    KeyCode::Enter => {
-                                        if let Some(app::Component::Tree(t)) = engine.components.get_mut(&name) { t.in_search_mode = false; }
-                                    }
-                                    KeyCode::Backspace => {
-                                        if let Some(app::Component::Tree(t)) = engine.components.get_mut(&name) {
-                                            if t.search_query.is_empty() {
-                                                t.in_search_mode = false;
-                                            } else {
-                                                let q = { let mut s = t.search_query.clone(); s.pop(); s };
-                                                engine.update_search_query(q);
-                                            }
-                                        }
-                                    }
-                                    KeyCode::Char('u') if key_event.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
-                                        engine.update_search_query(String::new());
-                                    }
-                                    KeyCode::Char('c') if key_event.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
-                                        engine.update_search_query(String::new());
-                                        if let Some(app::Component::Tree(t)) = engine.components.get_mut(&name) { t.in_search_mode = false; }
-                                    }
-                                    KeyCode::Char(c) => {
-                                        if key_event.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) || key_event.modifiers.contains(crossterm::event::KeyModifiers::ALT) { continue 'main_loop; }
-                                        let q = {
-                                            if let Some(app::Component::Tree(t)) = engine.components.get(&name) {
-                                                let mut s = t.search_query.clone(); s.push(c); s
-                                            } else { String::new() }
-                                        };
-                                        engine.update_search_query(q);
-                                    }
-                                    _ => {}
-                                }
-                                continue 'main_loop;
-                            }
-                        }
-                    }
-
                     // 普通按键
                     match key_event.code {
-                        KeyCode::Tab => engine.handle_tab(),
-                        KeyCode::Char('q') | KeyCode::Char('Q') => break 'main_loop,
-                        KeyCode::Esc => {
-                            let need_clear = if let app::Focus::Component(n) = &engine.focused {
-                                if let Some(app::Component::Tree(t)) = engine.components.get(n) { !t.search_query.is_empty() } else { false }
-                            } else { false };
-                            if need_clear { engine.update_search_query(String::new()); } else { break 'main_loop; }
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => engine.move_up(),
-                        KeyCode::Down | KeyCode::Char('j') => engine.move_down(),
-                        KeyCode::Left | KeyCode::Char('h') => engine.toggle_expand(),
-                        KeyCode::Right | KeyCode::Char('l') => engine.toggle_expand(),
-                        KeyCode::Char('/') => {
-                            let focused_name = if let app::Focus::Component(n) = &engine.focused { n.clone() } else { String::new() };
-                            if !focused_name.is_empty() {
-                                if let Some(app::Component::Tree(t)) = engine.components.get_mut(&focused_name) { t.in_search_mode = true; }
-                            }
-                        }
-                        KeyCode::Char(':') => {
-                            if engine.components.contains_key("Cmd") {
-                                engine.activate_input("Cmd");
-                            }
-                        }
-                        KeyCode::Char('g') => engine.jump_to_top(),
-                        KeyCode::Char('G') => engine.jump_to_bottom(),
-                        KeyCode::Char('n') => engine.jump_to_next_match(),
-                        KeyCode::Char('N') => engine.jump_to_prev_match(),
                         _ => {
-                            // 【修改】解构出 is_silent
                             if let Some((full_cmd_args, is_silent)) = engine.prepare_key_binding_args(&key_event, columns, rows) {
-
-                                // 【新增】检查是否是 @activate_input 命令
-                                if full_cmd_args.len() == 2 && full_cmd_args[0] == "__ACTIVATE_INPUT__" {
-                                    let input_name = &full_cmd_args[1];
-                                    engine.activate_input(input_name);
-                                    continue 'main_loop;
-                                }
-
-                                if is_silent {
-                                    // ================= 静默执行模式 =================
-                                    // 不退出 Alternate Screen，不关闭鼠标捕获，瞬间执行
-                                    match exec::execute_command_silent(&full_cmd_args) {
-                                        Ok(code) => {
-                                            if code != 0 {
-                                                // 【修改】不再获取 stderr 文本，仅提示退出码
-                                                engine.last_error = Some(format!("Silent cmd exited with code {}", code));
+                                if full_cmd_args.len() == 1 {
+                                    match full_cmd_args[0].as_str() {
+                                        "__EXIT__" => break 'main_loop,
+                                        "__ESC__" => {
+                                            if engine.has_active_input() {
+                                                engine.cancel_input();
                                             }
                                         }
-                                        Err(e) => {
-                                            engine.last_error = Some(e.to_string());
+                                        "__TAB__" => engine.handle_tab(),
+                                        "__UP__" => engine.move_up(),
+                                        "__DOWN__" => engine.move_down(),
+                                        "__EXPAND__" => engine.toggle_expand(),
+                                        "__MARK__" => engine.toggle_mark(),
+                                        "__TOP__" => engine.jump_to_top(),
+                                        "__BOTTOM__" => engine.jump_to_bottom(),
+                                        "__ENTER__" => engine.toggle_expand(),
+                                        "__ACTIVATE_SEARCH__" => {
+                                            if engine.components.contains_key("Cmd") {
+                                                engine.activate_input("Cmd", "/");
+                                            }
                                         }
-                                    }
-
-                                    // 【核心修复 5】静默执行后排空事件队列，防止积压按键狂飙
-                                    let mut drain_count = 0;
-                                    while crossterm::event::poll(Duration::ZERO).unwrap_or(false) && drain_count < 100 {
-                                        let _ = crossterm::event::read();
-                                        drain_count += 1;
-                                    }
-                                } else {
-                                    // ================= 全屏执行模式 (原有逻辑) =================
-                                    let _ = terminal::disable_raw_mode();
-                                    let _ = stdout().execute(DisableMouseCapture);
-                                    let _ = stdout().execute(terminal::LeaveAlternateScreen);
-                                    let _ = stdout().execute(crossterm::cursor::Show);
-                                    let _ = stdout().flush();
-
-                                    let mut cmd = std::process::Command::new(&full_cmd_args[0]);
-                                    cmd.args(&full_cmd_args[1..]);
-                                    if let Ok(tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
-                                        if let Ok(stdin_c) = tty.try_clone() { cmd.stdin(stdin_c); }
-                                        if let Ok(stdout_c) = tty.try_clone() { cmd.stdout(stdout_c); }
-                                        cmd.stderr(tty);
-                                    }
-
-                                    let status = cmd.status();
-
-                                    let mut drain_count = 0;
-                                    while crossterm::event::poll(Duration::ZERO).unwrap_or(false) && drain_count < 100 {
-                                        let _ = crossterm::event::read();
-                                        drain_count += 1;
-                                    }
-
-                                    let _ = stdout().execute(crossterm::cursor::Hide);
-                                    let _ = stdout().execute(terminal::EnterAlternateScreen);
-                                    let _ = stdout().execute(EnableMouseCapture);
-                                    let _ = terminal::enable_raw_mode();
-
-                                    match status {
-                                        Ok(s) => {
-                                            if s.success() { engine.trigger_reload(); }
-                                            else { engine.last_error = Some(format!("退出码: {}", s.code().unwrap_or(-1))); }
+                                        "__ACTIVATE_CMD__" => {
+                                            if engine.components.contains_key("Cmd") {
+                                                engine.activate_input("Cmd", ":");
+                                            }
                                         }
-                                        Err(e) => { engine.last_error = Some(e.to_string()); }
+                                        _ => {
+                                            // 外部命令（单参数）
+                                            if is_silent {
+                                                match exec::execute_command_silent(&full_cmd_args) {
+                                                    Ok(code) => {
+                                                        if code != 0 {
+                                                            engine.last_error = Some(format!("Silent cmd exited with code {}", code));
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        engine.last_error = Some(e.to_string());
+                                                    }
+                                                }
+                                                let mut drain_count = 0;
+                                                while crossterm::event::poll(Duration::ZERO).unwrap_or(false) && drain_count < 100 {
+                                                    let _ = crossterm::event::read();
+                                                    drain_count += 1;
+                                                }
+                                            } else {
+                                                let _ = terminal::disable_raw_mode();
+                                                let _ = stdout().execute(DisableMouseCapture);
+                                                let _ = stdout().execute(terminal::LeaveAlternateScreen);
+                                                let _ = stdout().execute(crossterm::cursor::Show);
+                                                let _ = stdout().flush();
+                                                let mut cmd = std::process::Command::new(&full_cmd_args[0]);
+                                                cmd.args(&full_cmd_args[1..]);
+                                                if let Ok(tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+                                                    if let Ok(stdin_c) = tty.try_clone() { cmd.stdin(stdin_c); }
+                                                    if let Ok(stdout_c) = tty.try_clone() { cmd.stdout(stdout_c); }
+                                                    cmd.stderr(tty);
+                                                }
+                                                let status = cmd.status();
+                                                let mut drain_count = 0;
+                                                while crossterm::event::poll(Duration::ZERO).unwrap_or(false) && drain_count < 100 {
+                                                    let _ = crossterm::event::read();
+                                                    drain_count += 1;
+                                                }
+                                                let _ = stdout().execute(crossterm::cursor::Hide);
+                                                let _ = stdout().execute(terminal::EnterAlternateScreen);
+                                                let _ = stdout().execute(EnableMouseCapture);
+                                                let _ = terminal::enable_raw_mode();
+                                                match status {
+                                                    Ok(s) => {
+                                                        if s.success() { engine.trigger_reload(); }
+                                                        else { engine.last_error = Some(format!("退出码: {}", s.code().unwrap_or(-1))); }
+                                                    }
+                                                    Err(e) => { engine.last_error = Some(e.to_string()); }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
-                            } else if key_event.code == KeyCode::Enter {
-                                engine.toggle_expand();
-                            } else if key_event.code == KeyCode::Char(' ') {
-                                engine.toggle_mark();
+                                // @activate_input 处理
+                                else if full_cmd_args.len() == 2 && full_cmd_args[0] == "__ACTIVATE_INPUT__" {
+                                    engine.activate_input(&full_cmd_args[1], "");
+                                }
+                                else {
+                                    if is_silent {
+                                        match exec::execute_command_silent(&full_cmd_args) {
+                                            Ok(code) => {
+                                                if code != 0 {
+                                                    engine.last_error = Some(format!("Silent cmd exited with code {}", code));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                engine.last_error = Some(e.to_string());
+                                            }
+                                        }
+                                        let mut drain_count = 0;
+                                        while crossterm::event::poll(Duration::ZERO).unwrap_or(false) && drain_count < 100 {
+                                            let _ = crossterm::event::read();
+                                            drain_count += 1;
+                                        }
+                                    } else {
+                                        let _ = terminal::disable_raw_mode();
+                                        let _ = stdout().execute(DisableMouseCapture);
+                                        let _ = stdout().execute(terminal::LeaveAlternateScreen);
+                                        let _ = stdout().execute(crossterm::cursor::Show);
+                                        let _ = stdout().flush();
+                                        let mut cmd = std::process::Command::new(&full_cmd_args[0]);
+                                        cmd.args(&full_cmd_args[1..]);
+                                        if let Ok(tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+                                            if let Ok(stdin_c) = tty.try_clone() { cmd.stdin(stdin_c); }
+                                            if let Ok(stdout_c) = tty.try_clone() { cmd.stdout(stdout_c); }
+                                            cmd.stderr(tty);
+                                        }
+                                        let status = cmd.status();
+                                        let mut drain_count = 0;
+                                        while crossterm::event::poll(Duration::ZERO).unwrap_or(false) && drain_count < 100 {
+                                            let _ = crossterm::event::read();
+                                            drain_count += 1;
+                                        }
+                                        let _ = stdout().execute(crossterm::cursor::Hide);
+                                        let _ = stdout().execute(terminal::EnterAlternateScreen);
+                                        let _ = stdout().execute(EnableMouseCapture);
+                                        let _ = terminal::enable_raw_mode();
+                                        match status {
+                                            Ok(s) => {
+                                                if s.success() { engine.trigger_reload(); }
+                                                else { engine.last_error = Some(format!("退出码: {}", s.code().unwrap_or(-1))); }
+                                            }
+                                            Err(e) => { engine.last_error = Some(e.to_string()); }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
 
                 Event::Mouse(mouse_event) => {
+                    if !engine.mouse_enabled { continue 'main_loop; }
                     let rects = crate::layout::calc_window_rects(&engine.layout, columns, rows);
                     for (rect, name, _border) in rects.iter() {
                         let in_x = mouse_event.column >= rect.start_col && mouse_event.column < rect.start_col + rect.width;
@@ -407,15 +408,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                         crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right) => {
                                             if let Some(app::Component::Tree(t)) = engine.components.get_mut(name) {
-                                                if t.marked_ids.contains(&clicked_id) { t.marked_ids.remove(&clicked_id); }
-                                                else { t.marked_ids.insert(clicked_id); }
+                                                let was_marked = t.marked_ids.contains(&clicked_id);
+                                                if was_marked {
+                                                    t.marked_ids.remove(&clicked_id);
+                                                } else {
+                                                    t.marked_ids.insert(clicked_id.clone());
+                                                }
+                                                engine.drag_mode = !was_marked;
                                             }
+                                            engine.drag_start_idx = Some(target_idx);
+                                            engine.drag_active = true;
                                         }
                                         crossterm::event::MouseEventKind::ScrollUp => {
                                             engine.move_up_n(scroll_step as usize);
                                         }
                                         crossterm::event::MouseEventKind::ScrollDown => {
                                             engine.move_down_n(scroll_step as usize);
+                                        }
+                                        crossterm::event::MouseEventKind::Up(_) => {
+                                            engine.drag_active = false;
+                                            engine.drag_start_idx = None;
+                                        }
+                                        crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Right) => {
+                                            if engine.drag_active {
+                                                if let Some(start_idx) = engine.drag_start_idx {
+                                                    let range = if target_idx >= start_idx {
+                                                        start_idx..=target_idx
+                                                    } else {
+                                                        target_idx..=start_idx
+                                                    };
+                                                    if let Some(app::Component::Tree(t)) = engine.components.get_mut(name) {
+                                                        for i in range {
+                                                            if let Some(id) = t.visible_ids.get(i) {
+                                                                if engine.drag_mode {
+                                                                    t.marked_ids.insert(id.clone());
+                                                                } else {
+                                                                    t.marked_ids.remove(id);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                         _ => {}
                                     }

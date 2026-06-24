@@ -26,6 +26,7 @@ pub enum LayoutNode {
         name: String,
         size: Option<WindowSize>, // None 表示未声明，参与剩余空间均分
         border: BorderStyle,
+        border_chars: Option<String>,
     },
     Container {
         direction: Direction,
@@ -196,7 +197,7 @@ fn parse_window(s: &str) -> Option<LayoutNode> {
         return None;
     }
 
-    Some(LayoutNode::Window { name, size, border })
+    Some(LayoutNode::Window { name, size, border, border_chars: None })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -368,6 +369,7 @@ fn compute_rects(node: &LayoutNode, rect: WindowRect, rects: &mut Vec<(WindowRec
 pub fn default_layout() -> Layout {
     Layout {
         root: LayoutNode::Window {
+            border_chars: None,
             name: "Main".to_string(),
             size: None, // None 表示不声明尺寸，自动占满全屏
             border: BorderStyle::Box,

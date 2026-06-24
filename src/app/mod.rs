@@ -22,13 +22,10 @@ pub struct TreeState {
     pub selected_id: Option<String>,
     pub expanded_ids: HashSet<String>,
     pub marked_ids: HashSet<String>,
+    pub markable: bool,
     pub visible_ids: Vec<String>,
     pub visible_depths: Vec<usize>,
     pub selected_idx: usize,
-    pub search_query: String,
-    pub in_search_mode: bool,
-    pub matched_ids: HashSet<String>,
-    pub ancestors_of_matched: HashSet<String>,
     pub source_cmd: Option<String>,
     pub relations_path: Option<String>,
 }
@@ -57,6 +54,7 @@ pub struct InputState {
     pub cursor: usize,          // 字符索引（不是字节）
     pub is_active: bool,
     pub prefix: String,         // "/" 或 ":" 等
+    pub last_rendered: String,
     pub on_submit: Option<String>, // 提交时执行的命令模板
 }
 
@@ -68,6 +66,7 @@ impl InputState {
             is_active: false,
             prefix: prefix.to_string(),
             on_submit: None,
+            last_rendered: String::new(),
         }
     }
 
@@ -129,6 +128,8 @@ pub enum Component {
 
 #[derive(Debug)]
 pub struct Engine {
+    pub drag_start_idx: Option<usize>,   // 拖拽起始行索引
+    pub drag_active: bool,               // 是否正在拖拽
     pub components: HashMap<String, Component>,
     pub layout: Layout,
     pub key_bindings: BindConfig,
@@ -137,7 +138,10 @@ pub struct Engine {
     pub last_click_time: Option<Instant>,
     pub last_clicked_id: Option<String>,
     pub global_relations: Vec<crate::protocol::Relation>,
+    pub mouse_enabled: bool,
     pub main_tree_name: Option<String>,
+    pub border_chars: HashMap<String, String>,
+    pub drag_mode: bool,  // true=标记模式, false=取消标记模式
 }
 
 impl Engine {
@@ -145,12 +149,21 @@ impl Engine {
         initial_dataset: Dataset,
         layout: Layout,
         key_bindings: BindConfig,
+        mouse_enabled: bool,
+        border_chars: Vec<String>,
         trees: Vec<String>,
         views: Vec<String>,
         statusbars: Vec<String>,
         inputs: Vec<String>,
         relations_path: Option<String>,
     ) -> Self {
+        let mut border_chars_map = HashMap::new();
+        for bc in &border_chars {
+            let parts: Vec<&str> = bc.splitn(2, ':').collect();
+            if parts.len() == 2 {
+                border_chars_map.insert(parts[0].to_string(), parts[1].to_string());
+            }
+        }
         let mut components = HashMap::new();
         let global_relations = if let Some(ref p) = relations_path {
             crate::protocol::parse_relations(Some(p)).unwrap_or_default()
@@ -162,7 +175,12 @@ impl Engine {
         let mut first_tree_name = None;
 
         for t_cfg in trees {
-            let parts: Vec<&str> = t_cfg.splitn(2, ':').collect();
+            let (markable, rest) = if t_cfg.starts_with("nomark:") {
+                (false, &t_cfg[7..])
+            } else {
+                (true, t_cfg.as_str())
+            };
+            let parts: Vec<&str> = rest.splitn(2, ':').collect();
             let name = parts[0].to_string();
             let source_cmd = parts.get(1).map(|s| s.to_string());
 
@@ -209,11 +227,8 @@ impl Engine {
                 visible_ids: Vec::new(),
                 visible_depths: Vec::new(),
                 selected_idx: 0,
-                search_query: String::new(),
-                in_search_mode: false,
-                matched_ids: HashSet::new(),
-                ancestors_of_matched: HashSet::new(),
                 source_cmd,
+                markable,
                 relations_path: relations_path.clone(),
             };
             tree_state.rebuild_visible_ids();
@@ -264,12 +279,17 @@ impl Engine {
             components,
             layout,
             key_bindings,
+            mouse_enabled,
+            drag_mode: false,
             focused: focused.clone(),
             last_error: init_error,
             last_click_time: None,
             last_clicked_id: None,
             global_relations,
             main_tree_name: first_tree_name,
+            border_chars: border_chars_map,
+            drag_start_idx: None,
+            drag_active: false,
         };
 
         if let Focus::Component(name) = &focused {
@@ -358,33 +378,6 @@ impl Engine {
             self.broadcast_selection_changed(&focused_name);
         } else if let Some(Component::View(v)) = self.components.get_mut(&focused_name) {
             v.scroll_offset = v.max_offset;
-        }
-    }
-
-    pub fn jump_to_next_match(&mut self) {
-        self.last_error = None;
-        let focused_name = if let Focus::Component(name) = &self.focused { name.clone() } else { return; };
-        if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
-            t.jump_to_next_match();
-            self.broadcast_selection_changed(&focused_name);
-        }
-    }
-
-    pub fn jump_to_prev_match(&mut self) {
-        self.last_error = None;
-        let focused_name = if let Focus::Component(name) = &self.focused { name.clone() } else { return; };
-        if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
-            t.jump_to_prev_match();
-            self.broadcast_selection_changed(&focused_name);
-        }
-    }
-
-    pub fn update_search_query(&mut self, query: String) {
-        self.last_error = None;
-        let focused_name = if let Focus::Component(name) = &self.focused { name.clone() } else { return; };
-        if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
-            t.update_search_query(query);
-            self.broadcast_selection_changed(&focused_name);
         }
     }
 
@@ -755,9 +748,32 @@ impl Engine {
         None
     }
 
-    pub fn activate_input(&mut self, name: &str) {
+    pub fn activate_input(&mut self, name: &str, prefix: &str) {
         if let Some(Component::Input(input)) = self.components.get_mut(name) {
+            input.prefix = prefix.to_string();
             input.activate();
+        }
+    }
+    pub fn apply_search(&mut self, query: &str) {
+        let focused_name = if let Focus::Component(name) = &self.focused { name.clone() } else { return };
+        if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
+            let matched = search::match_entities(&t.dataset.entities, query);
+            t.rebuild_visible_ids();
+            if !matched.is_empty() {
+                t.visible_ids.retain(|id| matched.contains(id));
+                if !t.visible_ids.is_empty() {
+                    t.selected_idx = 0;
+                    t.selected_id = Some(t.visible_ids[0].clone());
+                }
+            }
+        }
+    }
+    pub fn cancel_input(&mut self) {
+        if let Some((name, _)) = self.components.iter().find(|(_, c)| matches!(c, Component::Input(i) if i.is_active)) {
+            let name = name.clone();
+            if let Some(Component::Input(input)) = self.components.get_mut(&name) {
+                input.deactivate();
+            }
         }
     }
 }
@@ -766,93 +782,24 @@ impl TreeState {
     pub fn rebuild_visible_ids(&mut self) {
         self.visible_ids.clear();
         self.visible_depths.clear();
-        let is_filtering = !self.search_query.trim().is_empty();
-
         for root in &self.root_tree {
-            Self::collect_visible_recursive(
-                root,
-                is_filtering,
-                &self.matched_ids,
-                &self.ancestors_of_matched,
-                &self.expanded_ids,
-                &mut self.visible_ids,
-                &mut self.visible_depths,
-            );
+            Self::collect_visible(root, &self.expanded_ids, &mut self.visible_ids, &mut self.visible_depths);
         }
     }
 
-    fn collect_visible_recursive(
+    fn collect_visible(
         node: &TreeNode,
-        is_filtering: bool,
-        matched_ids: &HashSet<String>,
-        ancestors_of_matched: &HashSet<String>,
         expanded_ids: &HashSet<String>,
         visible_ids: &mut Vec<String>,
         visible_depths: &mut Vec<usize>,
     ) {
-        let is_match = matched_ids.contains(&node.entity.id);
-        let is_ancestor = ancestors_of_matched.contains(&node.entity.id);
-        if is_filtering && !is_match && !is_ancestor { return; }
-
         visible_ids.push(node.entity.id.clone());
         visible_depths.push(node.depth);
-
         if expanded_ids.contains(&node.entity.id) {
             for child in &node.children {
-                Self::collect_visible_recursive(
-                    child, is_filtering, matched_ids, ancestors_of_matched,
-                    expanded_ids, visible_ids, visible_depths,
-                );
+                Self::collect_visible(child, expanded_ids, visible_ids, visible_depths);
             }
         }
-    }
-
-    pub fn update_search_query(&mut self, query: String) {
-        self.search_query = query;
-        self.matched_ids = search::match_entities(&self.dataset.entities, &self.search_query);
-        self.ancestors_of_matched.clear();
-        if !self.matched_ids.is_empty() {
-            let mut temp_ancestors = HashSet::new();
-            for root in &self.root_tree {
-                Self::collect_ancestors_inner(root, &self.matched_ids, &mut temp_ancestors, &mut Vec::new());
-            }
-            self.ancestors_of_matched = temp_ancestors;
-        }
-        for ancestor_id in &self.ancestors_of_matched {
-            self.expanded_ids.insert(ancestor_id.clone());
-        }
-        self.rebuild_visible_ids();
-        if !self.matched_ids.is_empty() {
-            if let Some(first_match) = self.visible_ids.iter().find(|id| self.matched_ids.contains(*id)).cloned() {
-                self.select_id(&first_match);
-            }
-        } else {
-            if let Some(first_id) = self.visible_ids.first().cloned() {
-                self.select_id(&first_id);
-            }
-        }
-    }
-
-    fn collect_ancestors_inner(node: &TreeNode, matched_ids: &HashSet<String>, ancestors: &mut HashSet<String>, path: &mut Vec<String>) {
-        let is_match = matched_ids.contains(&node.entity.id);
-        let has_matched_descendant = Self::has_matched_descendant_inner(node, matched_ids);
-        if has_matched_descendant {
-            for id in path.iter() { ancestors.insert(id.clone()); }
-            if !is_match { ancestors.insert(node.entity.id.clone()); }
-        }
-        path.push(node.entity.id.clone());
-        for child in &node.children {
-            Self::collect_ancestors_inner(child, matched_ids, ancestors, path);
-        }
-        path.pop();
-    }
-
-    fn has_matched_descendant_inner(node: &TreeNode, matched_ids: &HashSet<String>) -> bool {
-        if matched_ids.contains(&node.entity.id) { return true; }
-        for child in &node.children {
-            if Self::has_matched_descendant_inner(child, matched_ids) { return true; }
-        }
-        false
     }
 
     pub fn get_selected_entity(&self) -> Option<&crate::protocol::Entity> {
@@ -901,6 +848,7 @@ impl TreeState {
     }
 
     pub fn toggle_mark(&mut self) {
+        if !self.markable { return; }
         if let Some(id) = self.selected_id.clone() {
             if self.marked_ids.contains(&id) {
                 self.marked_ids.remove(&id);
@@ -924,34 +872,6 @@ impl TreeState {
         if self.visible_ids.is_empty() { return; }
         self.selected_idx = self.visible_ids.len().saturating_sub(1);
         self.selected_id = Some(self.visible_ids.last().unwrap().clone());
-    }
-
-    pub fn jump_to_next_match(&mut self) {
-        if self.visible_ids.is_empty() || self.matched_ids.is_empty() { return; }
-        let start = self.selected_idx + 1;
-        let len = self.visible_ids.len();
-        for i in 0..len {
-            let idx = (start + i) % len;
-            if self.matched_ids.contains(&self.visible_ids[idx]) {
-                self.selected_idx = idx;
-                self.selected_id = Some(self.visible_ids[idx].clone());
-                return;
-            }
-        }
-    }
-
-    pub fn jump_to_prev_match(&mut self) {
-        if self.visible_ids.is_empty() || self.matched_ids.is_empty() { return; }
-        let start = if self.selected_idx == 0 { self.visible_ids.len().saturating_sub(1) } else { self.selected_idx - 1 };
-        let len = self.visible_ids.len();
-        for i in 0..len {
-            let idx = (start + len - i) % len;
-            if self.matched_ids.contains(&self.visible_ids[idx]) {
-                self.selected_idx = idx;
-                self.selected_id = Some(self.visible_ids[idx].clone());
-                return;
-            }
-        }
     }
 
     pub fn select_id(&mut self, id: &str) {
@@ -990,6 +910,7 @@ mod tests {
 
         let mut state = TreeState {
             dataset,
+            markable: true,
             root_tree,
             selected_id: None,
             expanded_ids: HashSet::new(),
@@ -997,10 +918,6 @@ mod tests {
             visible_ids: vec!["U-01".into()],
             visible_depths: vec![0],
             selected_idx: 0,
-            search_query: String::new(),
-            in_search_mode: false,
-            matched_ids: HashSet::new(),
-            ancestors_of_matched: HashSet::new(),
             source_cmd: None,
             relations_path: None,
         };

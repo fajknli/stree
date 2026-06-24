@@ -30,6 +30,8 @@ impl StyleEngine {
             color_map: Self::build_color_map(),
         };
 
+        engine.add_rule("__marked__", "yellow,bold");
+
         if input.trim().is_empty() {
             return engine;
         }
