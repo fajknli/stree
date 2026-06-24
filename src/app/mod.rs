@@ -1,11 +1,22 @@
 // src/app/mod.rs
 
+pub mod view;
+pub mod statusbar;
+pub mod input;
+pub mod tree;
+pub mod overlay;
+
+pub use overlay::OverlayState;
+pub use view::ViewState;
+pub use statusbar::StatusBarState;
+pub use input::InputState;
+pub use tree::TreeState;
+
 use crate::config::BindConfig;
 use crate::exec;
 use crate::layout::Layout;
 use crate::protocol::Dataset;
 use crate::search;
-use crate::tree::TreeNode;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -16,120 +27,18 @@ pub enum Focus {
 }
 
 #[derive(Debug)]
-pub struct TreeState {
-    pub dataset: Dataset,
-    pub root_tree: Vec<TreeNode>,
-    pub selected_id: Option<String>,
-    pub expanded_ids: HashSet<String>,
-    pub marked_ids: HashSet<String>,
-    pub markable: bool,
-    pub visible_ids: Vec<String>,
-    pub visible_depths: Vec<usize>,
-    pub selected_idx: usize,
-    pub source_cmd: Option<String>,
-    pub relations_path: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct ViewState {
-    pub cmd_template: String,
-    pub scroll_offset: usize,
-    pub content_buffer: String,
-    pub cached_entity_id: Option<String>,
-    pub max_offset: usize,
-    /// 当前格子宽度（由 update_view_rects 写入），用于 {width} 占位符
-    pub rect_width: u16,
-    /// 当前格子高度（内容区高度），用于 {height} 占位符
-    pub rect_height: u16,
-}
-
-#[derive(Debug)]
-pub struct StatusBarState {
-    pub format_template: String,
-}
-
-#[derive(Debug)]
-pub struct InputState {
-    pub buffer: String,
-    pub cursor: usize,          // 字符索引（不是字节）
-    pub is_active: bool,
-    pub prefix: String,         // "/" 或 ":" 等
-    pub last_rendered: String,
-    pub on_submit: Option<String>, // 提交时执行的命令模板
-}
-
-impl InputState {
-    pub fn new(prefix: &str) -> Self {
-        Self {
-            buffer: String::new(),
-            cursor: 0,
-            is_active: false,
-            prefix: prefix.to_string(),
-            on_submit: None,
-            last_rendered: String::new(),
-        }
-    }
-
-    pub fn insert_char(&mut self, c: char) {
-        let char_pos = self.cursor;
-        let byte_pos: usize = self.buffer.chars().take(char_pos).map(|ch| ch.len_utf8()).sum();
-        self.buffer.insert(byte_pos, c);
-        self.cursor += 1;
-    }
-
-    pub fn backspace(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            let byte_pos: usize = self.buffer.chars().take(self.cursor).map(|ch| ch.len_utf8()).sum();
-            let next_byte_pos = byte_pos + self.buffer[byte_pos..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
-            self.buffer.replace_range(byte_pos..next_byte_pos, "");
-        }
-    }
-
-    pub fn move_left(&mut self) {
-        if self.cursor > 0 { self.cursor -= 1; }
-    }
-
-    pub fn move_right(&mut self) {
-        let char_count = self.buffer.chars().count();
-        if self.cursor < char_count { self.cursor += 1; }
-    }
-
-    pub fn move_home(&mut self) { self.cursor = 0; }
-
-    pub fn move_end(&mut self) {
-        self.cursor = self.buffer.chars().count();
-    }
-
-    pub fn clear(&mut self) {
-        self.buffer.clear();
-        self.cursor = 0;
-    }
-
-    pub fn activate(&mut self) {
-        // 不再覆盖 prefix，保留创建时设定的 prefix
-        self.clear();
-        self.is_active = true;
-    }
-
-    pub fn deactivate(&mut self) {
-        self.is_active = false;
-        self.clear();
-    }
-}
-
-#[derive(Debug)]
 pub enum Component {
     Tree(TreeState),
     View(ViewState),
     StatusBar(StatusBarState),
     Input(InputState),
+    Overlay(OverlayState),
 }
 
 #[derive(Debug)]
 pub struct Engine {
-    pub drag_start_idx: Option<usize>,   // 拖拽起始行索引
-    pub drag_active: bool,               // 是否正在拖拽
+    pub drag_start_idx: Option<usize>,
+    pub drag_active: bool,
     pub components: HashMap<String, Component>,
     pub layout: Layout,
     pub key_bindings: BindConfig,
@@ -141,9 +50,14 @@ pub struct Engine {
     pub mouse_enabled: bool,
     pub main_tree_name: Option<String>,
     pub border_chars: HashMap<String, String>,
-    pub drag_mode: bool,  // true=标记模式, false=取消标记模式
+    pub drag_mode: bool,
 }
-
+fn parse_component_prefixes(cfg: &str) -> (bool, bool, bool, String) {
+    let (click, rest) = if cfg.starts_with("click:") { (true, &cfg[6..]) } else { (false, cfg) };
+    let (focus, rest) = if rest.starts_with("focus:") { (true, &rest[6..]) } else { (false, rest) };
+    let (nomark, rest) = if rest.starts_with("nomark:") { (true, &rest[7..]) } else { (false, rest) };
+    (click, focus, nomark, rest.to_string())
+}
 impl Engine {
     pub fn new(
         initial_dataset: Dataset,
@@ -156,6 +70,7 @@ impl Engine {
         statusbars: Vec<String>,
         inputs: Vec<String>,
         relations_path: Option<String>,
+        overlays: Vec<String>,
     ) -> Self {
         let mut border_chars_map = HashMap::new();
         for bc in &border_chars {
@@ -175,11 +90,7 @@ impl Engine {
         let mut first_tree_name = None;
 
         for t_cfg in trees {
-            let (markable, rest) = if t_cfg.starts_with("nomark:") {
-                (false, &t_cfg[7..])
-            } else {
-                (true, t_cfg.as_str())
-            };
+            let (click_to_fire, focus_to_fire, markable, rest) = parse_component_prefixes(&t_cfg);
             let parts: Vec<&str> = rest.splitn(2, ':').collect();
             let name = parts[0].to_string();
             let source_cmd = parts.get(1).map(|s| s.to_string());
@@ -230,6 +141,8 @@ impl Engine {
                 source_cmd,
                 markable,
                 relations_path: relations_path.clone(),
+                click_to_fire,
+                focus_to_fire,
             };
             tree_state.rebuild_visible_ids();
             if let Some(first_id) = tree_state.visible_ids.first().cloned() {
@@ -266,9 +179,30 @@ impl Engine {
             let prefix = parts.get(1).filter(|s| !s.is_empty()).map(|s| s.to_string()).unwrap_or_else(|| ":".to_string());
             let on_submit = parts.get(2).map(|s| s.to_string());
 
-            let mut input_state = crate::app::InputState::new(&prefix);
+            let mut input_state = InputState::new(&prefix);
             input_state.on_submit = on_submit;
             components.insert(name, Component::Input(input_state));
+        }
+
+        for o_cfg in overlays {
+            let parts: Vec<&str> = o_cfg.splitn(5, ':').collect();
+            // 格式: Name:Position:Width:Height:Text
+            // Position: center | top-left | bottom-right | x,y
+            let name = parts[0].to_string();
+            let _position = parts.get(1).map(|s| s.to_string()).unwrap_or_else(|| "center".to_string());
+            let width: u16 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(40);
+            let height: u16 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+            let text = parts.get(4).map(|s| s.to_string()).unwrap_or_default();
+
+            // 位置先占位，渲染时计算
+            components.insert(name, Component::Overlay(OverlayState {
+                visible: false,
+                text,
+                x: 0,
+                y: 0,
+                width,
+                height,
+            }));
         }
 
         let focused = first_tree_name.clone()
@@ -296,7 +230,6 @@ impl Engine {
             engine.broadcast_selection_changed(name);
         }
 
-        // 【新增】启动时主动初始化所有 View，不再依赖 Tree 驱动
         engine.init_views();
 
         engine
@@ -304,7 +237,6 @@ impl Engine {
 
     pub fn handle_tab(&mut self) {
         self.last_error = None;
-        // 过滤掉 StatusBar 组件，不参与焦点循环
         let mut names: Vec<String> = self.components.iter()
             .filter(|(_, c)| !matches!(c, Component::StatusBar(_)))
             .map(|(k, _)| k.clone())
@@ -389,10 +321,7 @@ impl Engine {
         self.broadcast_selection_changed(tree_name);
     }
 
-    /// 只有 tree_name 是当前焦点树时才驱动 View 刷新。
-    /// 这样多棵树各自独立，焦点在哪棵树，哪棵树的选中才驱动 View。
     pub fn broadcast_selection_changed(&mut self, tree_name: &str) {
-        // 只有焦点树才驱动 View 刷新
         let is_focused_tree = match &self.focused {
             Focus::Component(n) => n == tree_name,
             Focus::None => false,
@@ -412,7 +341,6 @@ impl Engine {
             .map(|e| format!("\"{}\"", e.path.replace("\"", "\\\"")))
             .unwrap_or_default();
 
-        // 焦点窗口名，注入给 {window}
         let window_name = tree_name.to_string();
 
         for (view_name, comp) in self.components.iter_mut() {
@@ -457,13 +385,11 @@ impl Engine {
                     }
                 }
 
-                let _ = view_name; // 消除未使用警告
+                let _ = view_name;
             }
         }
     }
 
-    /// 启动时主动初始化所有 View，不依赖 Tree 选中
-    /// 这样 View 可以独立渲染，不需要伪造 Tree 来驱动
     pub fn init_views(&mut self) {
         for (view_name, comp) in self.components.iter_mut() {
             if let Component::View(v) = comp {
@@ -474,7 +400,7 @@ impl Engine {
                 let template_args_vec = crate::config::split_args(&v.cmd_template);
                 let full_cmd_args = exec::replace_placeholders_in_args(
                     &template_args_vec,
-                    None, // 没有选中实体，占位符会替换为空
+                    None,
                     "", "", &window_name, &width_str, &height_str,
                 );
 
@@ -499,7 +425,6 @@ impl Engine {
         }
     }
 
-    /// 当前焦点树，用于 statusbar 读取统计信息
     pub fn get_focused_tree_state(&self) -> Option<&TreeState> {
         let name = match &self.focused {
             Focus::Component(n) => n,
@@ -508,7 +433,6 @@ impl Engine {
         if let Some(Component::Tree(t)) = self.components.get(name) {
             return Some(t);
         }
-        // 焦点不在树上时回退到主树
         self.get_main_tree_state()
     }
 
@@ -523,11 +447,9 @@ impl Engine {
         None
     }
 
-    // 【修改】返回值变为 Option<(Vec<String>, bool)>
     pub fn prepare_key_binding_args(&self, key: &crossterm::event::KeyEvent, term_width: u16, term_height: u16) -> Option<(Vec<String>, bool)> {
         let (cmd_template_args, is_silent) = self.key_bindings.get(key)?;
 
-        // 取焦点树（焦点不在树上时取主树）
         let tree_name = match &self.focused {
             Focus::Component(n) => {
                 if matches!(self.components.get(n), Some(Component::Tree(_))) {
@@ -578,7 +500,6 @@ impl Engine {
         if full_cmd_args.is_empty() || (full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) {
             None
         } else {
-            // 【修改】返回命令和静默标志
             Some((full_cmd_args, *is_silent))
         }
     }
@@ -606,7 +527,6 @@ impl Engine {
                         } else if let Some(first_id) = t.visible_ids.first().cloned() {
                             t.select_id(&first_id);
                         }
-                        // IPC 更新树后，若它是焦点树则广播
                         let target_owned = target.to_string();
                         self.broadcast_selection_changed(&target_owned);
                     }
@@ -614,7 +534,6 @@ impl Engine {
                 Component::View(v) => {
                     v.content_buffer = data.to_string();
                     v.scroll_offset = 0;
-                    // IPC 推进 View 时清除缓存 id，防止下次同实体选中时被跳过
                     v.cached_entity_id = None;
                 }
                 Component::StatusBar(s) => {
@@ -650,7 +569,6 @@ impl Engine {
         }
     }
 
-    /// 更新各 View 的滚动上限和格子尺寸
     pub fn update_view_rects(&mut self, view_rects: HashMap<String, (usize, u16, u16)>) {
         for (name, (max_rows, width, height)) in view_rects {
             if let Some(Component::View(v)) = self.components.get_mut(&name) {
@@ -754,6 +672,7 @@ impl Engine {
             input.activate();
         }
     }
+
     pub fn apply_search(&mut self, query: &str) {
         let focused_name = if let Focus::Component(name) = &self.focused { name.clone() } else { return };
         if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
@@ -768,6 +687,7 @@ impl Engine {
             }
         }
     }
+
     pub fn cancel_input(&mut self) {
         if let Some((name, _)) = self.components.iter().find(|(_, c)| matches!(c, Component::Input(i) if i.is_active)) {
             let name = name.clone();
@@ -775,181 +695,5 @@ impl Engine {
                 input.deactivate();
             }
         }
-    }
-}
-
-impl TreeState {
-    pub fn rebuild_visible_ids(&mut self) {
-        self.visible_ids.clear();
-        self.visible_depths.clear();
-        for root in &self.root_tree {
-            Self::collect_visible(root, &self.expanded_ids, &mut self.visible_ids, &mut self.visible_depths);
-        }
-    }
-
-    fn collect_visible(
-        node: &TreeNode,
-        expanded_ids: &HashSet<String>,
-        visible_ids: &mut Vec<String>,
-        visible_depths: &mut Vec<usize>,
-    ) {
-        visible_ids.push(node.entity.id.clone());
-        visible_depths.push(node.depth);
-        if expanded_ids.contains(&node.entity.id) {
-            for child in &node.children {
-                Self::collect_visible(child, expanded_ids, visible_ids, visible_depths);
-            }
-        }
-    }
-
-    pub fn get_selected_entity(&self) -> Option<&crate::protocol::Entity> {
-        let id = self.selected_id.as_ref()?;
-        self.dataset.entity_map.get(id)
-    }
-
-    pub fn get_marked_entities(&self) -> Vec<&crate::protocol::Entity> {
-        self.dataset.entities.iter()
-            .filter(|e| self.marked_ids.contains(&e.id) && !e.id.is_empty())
-            .collect()
-    }
-
-    pub fn move_up(&mut self) {
-        if self.visible_ids.is_empty() { return; }
-        if self.selected_idx > 0 {
-            self.selected_idx -= 1;
-            self.selected_id = Some(self.visible_ids[self.selected_idx].clone());
-        }
-    }
-
-    pub fn move_down(&mut self) {
-        if self.visible_ids.is_empty() { return; }
-        if self.selected_idx < self.visible_ids.len().saturating_sub(1) {
-            self.selected_idx += 1;
-            self.selected_id = Some(self.visible_ids[self.selected_idx].clone());
-        }
-    }
-
-    pub fn toggle_expand(&mut self) {
-        let target_id = self.selected_id.clone();
-        if let Some(id) = target_id {
-            let has_children = crate::tree::find_node_in_roots(&self.root_tree, &id)
-                .map(|n| !n.children.is_empty())
-                .unwrap_or(false);
-            if has_children {
-                if self.expanded_ids.contains(&id) {
-                    self.expanded_ids.remove(&id);
-                } else {
-                    self.expanded_ids.insert(id.clone());
-                }
-                self.rebuild_visible_ids();
-                self.select_id(&id);
-            }
-        }
-    }
-
-    pub fn toggle_mark(&mut self) {
-        if !self.markable { return; }
-        if let Some(id) = self.selected_id.clone() {
-            if self.marked_ids.contains(&id) {
-                self.marked_ids.remove(&id);
-            } else {
-                self.marked_ids.insert(id);
-            }
-            if self.selected_idx < self.visible_ids.len().saturating_sub(1) {
-                self.selected_idx += 1;
-                self.selected_id = Some(self.visible_ids[self.selected_idx].clone());
-            }
-        }
-    }
-
-    pub fn jump_to_top(&mut self) {
-        if self.visible_ids.is_empty() { return; }
-        self.selected_idx = 0;
-        self.selected_id = Some(self.visible_ids[0].clone());
-    }
-
-    pub fn jump_to_bottom(&mut self) {
-        if self.visible_ids.is_empty() { return; }
-        self.selected_idx = self.visible_ids.len().saturating_sub(1);
-        self.selected_id = Some(self.visible_ids.last().unwrap().clone());
-    }
-
-    pub fn select_id(&mut self, id: &str) {
-        if self.dataset.entity_map.contains_key(id) {
-            if let Some(idx) = self.visible_ids.iter().position(|v| v == id) {
-                self.selected_idx = idx;
-                self.selected_id = Some(id.to_string());
-            } else {
-                // 【核心修复】如果节点存在但不可见，强制重置到第一个可见项，防止 selected_idx 越界
-                self.selected_idx = 0;
-                self.selected_id = self.visible_ids.first().cloned();
-            }
-        } else {
-            self.selected_idx = 0;
-            self.selected_id = self.visible_ids.first().cloned();
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::protocol::{Dataset, Entity};
-
-    fn create_test_tree() -> TreeState {
-        let mut dataset = Dataset::new();
-        dataset.entities.push(Entity {
-            id: "U-01".into(),
-            display: "Root".into(),
-            path: "/root.md".into(),
-            tags: "live".into(),
-        });
-        dataset.entity_map.insert("U-01".into(), dataset.entities[0].clone());
-
-        let root_tree = vec![TreeNode::new(dataset.entities[0].clone(), 0)];
-
-        let mut state = TreeState {
-            dataset,
-            markable: true,
-            root_tree,
-            selected_id: None,
-            expanded_ids: HashSet::new(),
-            marked_ids: HashSet::new(),
-            visible_ids: vec!["U-01".into()],
-            visible_depths: vec![0],
-            selected_idx: 0,
-            source_cmd: None,
-            relations_path: None,
-        };
-        state.select_id("U-01");
-        state
-    }
-
-    #[test]
-    fn test_select_id_fallback_when_invisible() {
-        let mut state = create_test_tree();
-
-        // 清空 visible_ids，模拟节点被过滤
-        state.visible_ids.clear();
-        state.visible_ids.push("U-02".into()); // 不存在的 ID
-
-        // 选择存在的 ID，但不可见
-        state.select_id("U-01");
-
-        // 应该 fallback 到第一个可见项
-        assert_eq!(state.selected_idx, 0);
-        assert_eq!(state.selected_id, Some("U-02".into()));
-    }
-
-    #[test]
-    fn test_select_id_nonexistent() {
-        let mut state = create_test_tree();
-
-        // 选择不存在的 ID
-        state.select_id("NONEXISTENT");
-
-        // 应该 fallback 到第一个可见项
-        assert_eq!(state.selected_idx, 0);
-        assert_eq!(state.selected_id, Some("U-01".into()));
     }
 }

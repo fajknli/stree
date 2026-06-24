@@ -13,6 +13,7 @@ mod tree;
 mod ui;
 
 use clap::{Parser, Subcommand};
+use crate::app::Component;
 use crossterm::{terminal, ExecutableCommand};
 use crossterm::event::{self, Event, KeyCode, EnableMouseCapture, DisableMouseCapture};
 use std::io::{self, stdout, Read, Write, IsTerminal};
@@ -42,6 +43,8 @@ struct Cli {
     statusbars: Vec<String>,
     #[arg(long = "input", action = clap::ArgAction::Append)]
     inputs: Vec<String>,
+    #[arg(long = "overlay", action = clap::ArgAction::Append)]
+    overlays: Vec<String>,
 
     #[arg(long = "bind", action = clap::ArgAction::Append)]
     binds: Vec<String>,
@@ -111,6 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.statusbars,
         cli.inputs,
         cli.relations.clone(),
+        cli.overlays,
     );
 
     if let Some(ref id) = cli.select {
@@ -315,6 +319,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // @activate_input 处理
                                 else if full_cmd_args.len() == 2 && full_cmd_args[0] == "__ACTIVATE_INPUT__" {
                                     engine.activate_input(&full_cmd_args[1], "");
+                                }
+                                // Overlay 显隐
+                                else if full_cmd_args.len() == 2 && full_cmd_args[0] == "__OVERLAY_SHOW__" {
+                                    if let Some(Component::Overlay(o)) = engine.components.get_mut(&full_cmd_args[1]) {
+                                        o.visible = true;
+                                    }
+                                }
+                                else if full_cmd_args.len() == 2 && full_cmd_args[0] == "__OVERLAY_HIDE__" {
+                                    if let Some(Component::Overlay(o)) = engine.components.get_mut(&full_cmd_args[1]) {
+                                        o.visible = false;
+                                    }
                                 }
                                 else {
                                     if is_silent {

@@ -307,6 +307,7 @@ pub fn render_all<W: Write>(ctx: &RenderCtx, out: &mut W) -> std::io::Result<()>
         draw_border(out, rect, title, *border, is_focused, border_chars)?;
 
         match comp {
+            Some(Component::Overlay(_)) => {}
             Some(Component::Tree(t)) => {
                 let border_overhead = match border {
                     BorderStyle::Box => 2,
@@ -397,6 +398,45 @@ pub fn render_all<W: Write>(ctx: &RenderCtx, out: &mut W) -> std::io::Result<()>
                 out.queue(cursor::MoveTo(cursor_col, inner_row))?;
             }
             None => {}
+        }
+    }
+
+    // Overlay 渲染（浮层，不参与 Flexbox）
+    for (name, comp) in &ctx.engine.components {
+        if let Component::Overlay(o) = comp {
+            if !o.visible { continue; }
+
+            // 计算位置
+            let (ox, oy) = match o.x == 0 && o.y == 0 {
+                true => {
+                    // 默认居中
+                    let cx = (term_width.saturating_sub(o.width)) / 2;
+                    let cy = (term_height.saturating_sub(o.height)) / 2;
+                    (cx, cy)
+                }
+                false => (o.x, o.y),
+            };
+
+            let overlay_rect = WindowRect {
+                start_col: ox,
+                start_row: oy,
+                width: o.width,
+                height: o.height,
+            };
+
+            // 画边框（不带标题，非焦点色）
+            draw_border(out, &overlay_rect, None, BorderStyle::Box, false, None)?;
+
+            // 画文字（内部区域）
+            let lines: Vec<&str> = o.text.lines().collect();
+            let inner_col = ox + 1;
+            let inner_row = oy + 1;
+            let inner_w = o.width.saturating_sub(2);
+            let inner_h = o.height.saturating_sub(2);
+            for (i, line) in lines.iter().enumerate() {
+                if i >= inner_h as usize { break; }
+                draw_text(out, inner_col, inner_row + i as u16, line, inner_w, None, Color::White)?;
+            }
         }
     }
 

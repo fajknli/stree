@@ -124,6 +124,10 @@ fn parse_key_desc(desc: &str) -> Option<KeyEvent> {
     };
 
     let code = match key_part {
+        "f1" => KeyCode::F(1), "f2" => KeyCode::F(2), "f3" => KeyCode::F(3),
+        "f4" => KeyCode::F(4), "f5" => KeyCode::F(5), "f6" => KeyCode::F(6),
+        "f7" => KeyCode::F(7), "f8" => KeyCode::F(8), "f9" => KeyCode::F(9),
+        "f10" => KeyCode::F(10), "f11" => KeyCode::F(11), "f12" => KeyCode::F(12),
         "enter" => KeyCode::Enter, "esc" => KeyCode::Esc, "tab" => KeyCode::Tab,
         "backspace" => KeyCode::Backspace, "delete" => KeyCode::Delete,
         "space" => KeyCode::Char(' '), "up" => KeyCode::Up, "down" => KeyCode::Down,
