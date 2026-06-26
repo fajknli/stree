@@ -8,7 +8,6 @@ const MAX_LINES: usize = 300;
 const MAX_LINE_CHARS: usize = 500;
 const MAX_TOTAL_BYTES: usize = 1024 * 1024;
 
-/// 【扩展占位符】支持 {id}, {path}, {display}, {status}, {ids}, {paths}, {window}, {width}, {height}
 pub fn replace_placeholders_in_args(
     template_args: &[String],
     selected_entity: Option<&Entity>,
@@ -17,6 +16,7 @@ pub fn replace_placeholders_in_args(
     window_name: &str,
     width: &str,
     height: &str,
+    event: &str,
 ) -> Vec<String> {
     template_args.iter().map(|arg| {
         let mut res = arg.clone();
@@ -34,6 +34,7 @@ pub fn replace_placeholders_in_args(
         res = res.replace("{ids}", ids_str);
         res = res.replace("{paths}", paths_str);
         res = res.replace("{window}", window_name);
+        res = res.replace("{event}", event);
         res = res.replace("{width}", width);
         res = res.replace("{height}", height);
         res
@@ -51,7 +52,7 @@ pub fn execute_command_args(cmd_args: &[String]) -> std::io::Result<(i32, String
         .env("CLICOLOR_FORCE", "1")
         .env("TERM", "xterm-256color")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped()) // 捕获 stderr
+        .stderr(Stdio::piped())
         .spawn()?;
 
     let mut stdout_buf = String::new();
@@ -82,7 +83,6 @@ pub fn execute_command_args(cmd_args: &[String]) -> std::io::Result<(i32, String
                 break;
             }
 
-            // 性能优化：不遍历整行，只取需要的长度
             let final_line = if line.len() > MAX_LINE_CHARS * 4 {
                 let mut s: String = line.chars().take(MAX_LINE_CHARS - 3).collect();
                 s.push_str("...");
@@ -103,7 +103,6 @@ pub fn execute_command_args(cmd_args: &[String]) -> std::io::Result<(i32, String
         }
     }
 
-    // 读取 stderr
     if let Some(err) = child.stderr.take() {
         let reader = BufReader::new(err);
         for line in reader.lines() {
@@ -121,7 +120,6 @@ pub fn execute_command_args(cmd_args: &[String]) -> std::io::Result<(i32, String
     let status = child.wait()?;
     let code = status.code().unwrap_or(-1);
 
-    // 如果退出码非0且 stdout 为空，返回 stderr 内容
     if code != 0 && stdout_buf.trim().is_empty() && !stderr_buf.trim().is_empty() {
         return Ok((code, format!("[ERR] {}\n", stderr_buf.trim())));
     }
@@ -153,19 +151,16 @@ pub fn execute_reload_hook(hook_cmd: Option<&str>) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// 【新增】静默执行命令：不接管 TTY，不输出到屏幕，绝不阻塞 UI
 pub fn execute_command_silent(cmd_args: &[String]) -> std::io::Result<i32> {
     if cmd_args.is_empty() {
         return Ok(0);
     }
 
-    // 【核心防御】将三个标准流全部设为 null，切断管道继承。
-    // 使用 .status() 代替 .output()，只等主进程退出，绝不读取管道，彻底杜绝 fd 继承死锁。
     let status = Command::new(&cmd_args[0])
         .args(&cmd_args[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null()) // 彻底丢弃 stderr，换取绝对的 UI 安全
+        .stderr(Stdio::null())
         .status()?;
 
     Ok(status.code().unwrap_or(-1))
@@ -194,6 +189,7 @@ mod tests {
             "Main",
             "80",
             "24",
+            "", // 补全 event 参数
         );
 
         assert_eq!(result, vec!["vim", "/path/with spaces.md"]);
@@ -217,6 +213,7 @@ mod tests {
             "Main",
             "80",
             "24",
+            "", // 补全 event 参数
         );
 
         assert_eq!(result[1], "\"/path/with\\\"quote.md\"");
@@ -233,6 +230,7 @@ mod tests {
             "Main",
             "80",
             "24",
+            "", // 补全 event 参数
         );
 
         assert_eq!(result, vec!["echo", "", ""]);

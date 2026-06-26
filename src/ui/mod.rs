@@ -16,6 +16,24 @@ pub struct RenderCtx<'a> {
 use std::io::Write;
 use crossterm::{cursor, style, QueueableCommand};
 
+/// 渲染层防弹衣：将 Rect 严格裁剪在终端边界内，防止 ANSI 越界触发终端换行
+fn clip_rect_to_term(rect: &WindowRect, term_width: u16, term_height: u16) -> Option<WindowRect> {
+    let mut r = *rect;
+    if r.start_col >= term_width || r.start_row >= term_height {
+        return None; // 完全在屏幕外
+    }
+    if r.start_col + r.width > term_width {
+        r.width = term_width - r.start_col;
+    }
+    if r.start_row + r.height > term_height {
+        r.height = term_height - r.start_row;
+    }
+    if r.width == 0 || r.height == 0 {
+        return None; // 尺寸为 0，不渲染
+    }
+    Some(r)
+}
+
 pub fn draw_border<W: Write>(out: &mut W, rect: &WindowRect, title: Option<&str>, border: BorderStyle, is_focused: bool, border_chars: Option<&str>) -> std::io::Result<()> {
     let width = rect.width as usize;
     if width < 2 { return Ok(()); }
@@ -98,7 +116,6 @@ pub fn draw_text<W: Write>(out: &mut W, start_col: u16, row: u16, text: &str, ma
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             if chars.peek() == Some(&'[') {
-                // CSI 序列：\x1b[...X（X 是任意字母，不只是 'm'）
                 let mut ansi = String::from("\x1b[");
                 chars.next();
                 while let Some(&next_c) = chars.peek() {
@@ -108,8 +125,6 @@ pub fn draw_text<W: Write>(out: &mut W, start_col: u16, row: u16, text: &str, ma
                 }
                 segments.push(Segment::Ansi(ansi));
             } else if chars.peek() == Some(&'_') || chars.peek() == Some(&']') {
-                // 【新增】OSC 序列：\x1b_...\x1b\\ 或 \x1b]...\x1b\\
-                // 用于 Kitty Graphics Protocol、iTerm2 Inline Images 等
                 let mut osc = String::from("\x1b");
                 let osc_type = chars.next().unwrap();
                 osc.push(osc_type);
@@ -117,14 +132,12 @@ pub fn draw_text<W: Write>(out: &mut W, start_col: u16, row: u16, text: &str, ma
                 while let Some(&next_c) = chars.peek() {
                     osc.push(next_c);
                     chars.next();
-                    // 检测 String Terminator (ST)：\x1b\\
                     if next_c == '\\' && osc.ends_with("\x1b\\") {
                         break;
                     }
                 }
                 segments.push(Segment::Osc(osc));
             } else {
-                // 未知转义序列，当普通文本处理
                 segments.push(Segment::Text(String::from(c)));
             }
         } else {
@@ -155,7 +168,7 @@ pub fn draw_text<W: Write>(out: &mut W, start_col: u16, row: u16, text: &str, ma
     let mut truncated = false;
     if total_w > max_w {
         truncated = true;
-        while total_w >= max_w && keep_count > 0 {
+        while total_w > max_w && keep_count > 0 {
             let (_, cw) = plain_chars[keep_count - 1];
             total_w -= cw;
             keep_count -= 1;
@@ -178,7 +191,7 @@ pub fn draw_text<W: Write>(out: &mut W, start_col: u16, row: u16, text: &str, ma
     for seg in &segments {
         match seg {
             Segment::Ansi(s) => { out.queue(style::Print(s))?; }
-            Segment::Osc(s) => { out.queue(style::Print(s))?; } // 【新增】透传 OSC 序列
+            Segment::Osc(s) => { out.queue(style::Print(s))?; }
             Segment::Text(s) => {
                 for c in s.chars() {
                     if current_plain_count < keep_count {
@@ -232,7 +245,6 @@ pub fn draw_tree_window<W: Write>(out: &mut W, rect: &WindowRect, tree: &crate::
 
         let mut display = String::new();
 
-        // 标记 * 放在最左侧
         display.push(' ');
 
         for _ in 0..depth * 2 { display.push(' '); }
@@ -270,7 +282,7 @@ pub fn draw_tree_window<W: Write>(out: &mut W, rect: &WindowRect, tree: &crate::
 
         let highlight = None;
 
-        draw_text(out, start_col, screen_row, &display, rect.width - 2, highlight, final_color)?;
+        draw_text(out, start_col, screen_row, &display, rect.width.saturating_sub(2), highlight, final_color)?;
 
         out.queue(crossterm::style::SetForegroundColor(crossterm::style::Color::Reset))?;
         if is_bold { out.queue(crossterm::style::SetAttribute(crossterm::style::Attribute::NormalIntensity))?; }
@@ -279,50 +291,57 @@ pub fn draw_tree_window<W: Write>(out: &mut W, rect: &WindowRect, tree: &crate::
     }
 
     if drawn == 0 && tree.visible_ids.is_empty() {
-        draw_text(out, rect.start_col + 1, rect.start_row + 1, "No data available", rect.width - 2, None, if is_focused { Color::White } else { Color::DarkGrey })?;
+        draw_text(out, rect.start_col + 1, rect.start_row + 1, "No data available", rect.width.saturating_sub(2), None, if is_focused { Color::White } else { Color::DarkGrey })?;
         drawn = 1;
     } else if drawn == 0 && is_filtering {
-        draw_text(out, rect.start_col + 1, rect.start_row + 1, "No matches found", rect.width - 2, None, if is_focused { Color::White } else { Color::DarkGrey })?;
+        draw_text(out, rect.start_col + 1, rect.start_row + 1, "No matches found", rect.width.saturating_sub(2), None, if is_focused { Color::White } else { Color::DarkGrey })?;
         drawn = 1;
     }
     Ok(drawn)
 }
 
+/// 【重构】多图层统一渲染入口
+/// 按 Z 轴升序遍历所有可见图层的窗口，统一绘制
 pub fn render_all<W: Write>(ctx: &RenderCtx, out: &mut W) -> std::io::Result<()> {
     out.queue(crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
     let term_width = ctx.term_size.columns;
     let term_height = ctx.term_size.rows;
-    let rects = crate::layout::calc_window_rects(&ctx.engine.layout, term_width, term_height);
-    if rects.is_empty() { return Ok(()); }
 
-    // 找到状态栏的 rect，用于后续错误覆盖
+    let all_rects = ctx.engine.calc_all_rects(term_width, term_height);
+    if all_rects.is_empty() { return Ok(()); }
+
     let mut status_rect_opt: Option<WindowRect> = None;
 
-    for (rect, name, border) in rects.iter() {
+    for (rect, name, border, _z_index) in &all_rects {
+        // 【核心防御】：裁剪越界 Rect，彻底消灭右边字符跑到左边的 Bug
+        let safe_rect = match clip_rect_to_term(rect, term_width, term_height) {
+            Some(r) => r,
+            None => continue, // 完全在屏幕外或尺寸为 0，跳过渲染
+        };
+
         let comp = ctx.engine.components.get(name);
         let title = comp.map(|_| name.as_str());
         let is_focused = ctx.engine.focused == Focus::Component(name.clone());
 
         let border_chars = ctx.engine.border_chars.get(name).map(|s| s.as_str());
-        draw_border(out, rect, title, *border, is_focused, border_chars)?;
+        draw_border(out, &safe_rect, title, *border, is_focused, border_chars)?;
 
         match comp {
-            Some(Component::Overlay(_)) => {}
             Some(Component::Tree(t)) => {
                 let border_overhead = match border {
                     BorderStyle::Box => 2,
                     _ => 0,
                 };
-                let max_rows = (rect.height as usize).saturating_sub(border_overhead);
+                let max_rows = (safe_rect.height as usize).saturating_sub(border_overhead);
                 let scroll_offset = calc_scroll_offset(t.selected_idx, t.visible_ids.len(), max_rows);
-                draw_tree_window(out, rect, t, ctx.style_engine, scroll_offset, is_focused, *border)?;
+                draw_tree_window(out, &safe_rect, t, ctx.style_engine, scroll_offset, is_focused, *border)?;
             }
             Some(Component::View(v)) => {
                 let content = v.content_buffer.as_str();
                 let lines: Vec<&str> = content.lines().collect();
                 let (inner_col, inner_row, inner_w, inner_h) = match border {
-                    BorderStyle::Box => (rect.start_col + 1, rect.start_row + 1, rect.width.saturating_sub(2), rect.height.saturating_sub(2)),
-                    _ => (rect.start_col, rect.start_row, rect.width, rect.height),
+                    BorderStyle::Box => (safe_rect.start_col + 1, safe_rect.start_row + 1, safe_rect.width.saturating_sub(2), safe_rect.height.saturating_sub(2)),
+                    _ => (safe_rect.start_col, safe_rect.start_row, safe_rect.width, safe_rect.height),
                 };
                 let max_rows = inner_h as usize;
                 let max_offset = lines.len().saturating_sub(max_rows);
@@ -335,10 +354,10 @@ pub fn render_all<W: Write>(ctx: &RenderCtx, out: &mut W) -> std::io::Result<()>
                 }
             }
             Some(Component::StatusBar(s)) => {
-                status_rect_opt = Some(*rect);
-                let row = rect.start_row;
-                let col = rect.start_col;
-                let cover_width = rect.width as usize;
+                status_rect_opt = Some(safe_rect);
+                let row = safe_rect.start_row;
+                let col = safe_rect.start_col;
+                let cover_width = safe_rect.width as usize;
 
                 let mut status_text = s.format_template.clone();
                 status_text = status_text.replace("{stree_focus}", match &ctx.engine.focused { Focus::Component(n) => n, _ => "None" });
@@ -363,26 +382,23 @@ pub fn render_all<W: Write>(ctx: &RenderCtx, out: &mut W) -> std::io::Result<()>
                 }
 
                 let (inner_col, inner_row, inner_w) = match border {
-                    BorderStyle::Box => (rect.start_col + 1, rect.start_row + 1, rect.width.saturating_sub(2)),
-                    BorderStyle::Line => (rect.start_col, rect.start_row + 1, rect.width),
-                    BorderStyle::None => (rect.start_col, rect.start_row, rect.width),
+                    BorderStyle::Box => (safe_rect.start_col + 1, safe_rect.start_row + 1, safe_rect.width.saturating_sub(2)),
+                    BorderStyle::Line => (safe_rect.start_col, safe_rect.start_row + 1, safe_rect.width),
+                    BorderStyle::None => (safe_rect.start_col, safe_rect.start_row, safe_rect.width),
                 };
 
                 let width = inner_w as usize;
                 let prefix_len = input.prefix.chars().count();
                 let content_width = width.saturating_sub(prefix_len);
 
-                // 差分：内容没变只移动硬件光标
                 let render_key = format!("{}{}{}", input.prefix, input.buffer, input.cursor);
                 let same = input.last_rendered == render_key;
-                // 注：不能在这里赋值，用 RefCell 或者每次重绘后在外面更新
                 if same {
                     let cursor_col = inner_col + prefix_len as u16 + input.cursor as u16;
                     out.queue(cursor::MoveTo(cursor_col, inner_row))?;
                     continue;
                 }
 
-                // 完整重绘
                 out.queue(cursor::MoveTo(inner_col, inner_row))?;
                 out.queue(style::Print(" ".repeat(width)))?;
                 out.queue(cursor::MoveTo(inner_col, inner_row))?;
@@ -401,46 +417,7 @@ pub fn render_all<W: Write>(ctx: &RenderCtx, out: &mut W) -> std::io::Result<()>
         }
     }
 
-    // Overlay 渲染（浮层，不参与 Flexbox）
-    for (name, comp) in &ctx.engine.components {
-        if let Component::Overlay(o) = comp {
-            if !o.visible { continue; }
-
-            // 计算位置
-            let (ox, oy) = match o.x == 0 && o.y == 0 {
-                true => {
-                    // 默认居中
-                    let cx = (term_width.saturating_sub(o.width)) / 2;
-                    let cy = (term_height.saturating_sub(o.height)) / 2;
-                    (cx, cy)
-                }
-                false => (o.x, o.y),
-            };
-
-            let overlay_rect = WindowRect {
-                start_col: ox,
-                start_row: oy,
-                width: o.width,
-                height: o.height,
-            };
-
-            // 画边框（不带标题，非焦点色）
-            draw_border(out, &overlay_rect, None, BorderStyle::Box, false, None)?;
-
-            // 画文字（内部区域）
-            let lines: Vec<&str> = o.text.lines().collect();
-            let inner_col = ox + 1;
-            let inner_row = oy + 1;
-            let inner_w = o.width.saturating_sub(2);
-            let inner_h = o.height.saturating_sub(2);
-            for (i, line) in lines.iter().enumerate() {
-                if i >= inner_h as usize { break; }
-                draw_text(out, inner_col, inner_row + i as u16, line, inner_w, None, Color::White)?;
-            }
-        }
-    }
-
-    // 全局错误提示直接覆盖在状态栏上，不再多占一行
+    // 全局错误提示直接覆盖在状态栏上
     if let Some(err) = &ctx.engine.last_error {
         if let Some(rect) = status_rect_opt {
             out.queue(cursor::MoveTo(rect.start_col, rect.start_row))?;
@@ -449,7 +426,6 @@ pub fn render_all<W: Write>(ctx: &RenderCtx, out: &mut W) -> std::io::Result<()>
             out.queue(cursor::MoveTo(rect.start_col, rect.start_row))?;
             out.queue(style::SetBackgroundColor(Color::Red))?;
             out.queue(style::SetForegroundColor(Color::White))?;
-            // 【修复】截断错误信息，防止溢出导致换行破坏布局
             let err_text = format!(" ERR: {} ", err);
             let display_err: String = err_text.chars().take(cover_width).collect();
             out.queue(style::Print(&display_err))?;

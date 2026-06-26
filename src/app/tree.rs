@@ -2,7 +2,7 @@
 
 use crate::protocol::Dataset;
 use crate::tree::TreeNode;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 #[derive(Debug)]
 pub struct TreeState {
