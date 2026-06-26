@@ -155,15 +155,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut view_rects_info = std::collections::HashMap::new();
         for (rect, name, border, _z) in all_rects.iter() {
             if let Some(app::Component::View(_)) = engine.components.get(name) {
-                let inner_h = match border {
-                    crate::layout::BorderStyle::Box => (rect.height as usize).saturating_sub(2),
-                    _ => rect.height as usize,
-                };
-                let inner_w = match border {
-                    crate::layout::BorderStyle::Box => rect.width.saturating_sub(2),
-                    _ => rect.width,
-                };
-                view_rects_info.insert(name.clone(), (inner_h, inner_w, inner_h as u16));
+                // 【修复】：调用纯函数获取内容区尺寸，消灭 match border
+                let (inner_w, inner_h) = crate::layout::content_size(rect, *border);
+
+                view_rects_info.insert(name.clone(), (inner_h as usize, inner_w, inner_h));
             }
         }
         engine.update_view_rects(view_rects_info);

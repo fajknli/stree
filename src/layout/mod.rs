@@ -539,7 +539,6 @@ fn compute_rects(
                 }
             }
 
-            let rem_flex = flex_len.saturating_sub(allocated_flex);
             // 【核心补丁：余数均摊，彻底消灭右边空隙】
             let allocated_sum: u16 = content_sizes.iter().sum();
             let mut remainder = flex_len.saturating_sub(allocated_sum);
@@ -598,6 +597,17 @@ fn compute_rects(
             }
         }
     }
+}
+
+/// 计算给定物理矩形和边框样式下的纯内容区尺寸 (width, height)
+/// 这是全局唯一的边框开销计算逻辑，消灭各处的 match border
+pub fn content_size(rect: &WindowRect, border: BorderStyle) -> (u16, u16) {
+    let (overhead_x, overhead_y) = match border {
+        BorderStyle::Box => (2, 2),
+        BorderStyle::Line => (0, 1), // Line 只有顶部一条线，不占左右宽度，但占顶部 1 行
+        BorderStyle::None => (0, 0),
+    };
+    (rect.width.saturating_sub(overhead_x), rect.height.saturating_sub(overhead_y))
 }
 
 pub fn default_layout() -> Layout {
