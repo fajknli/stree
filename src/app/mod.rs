@@ -71,8 +71,11 @@ pub struct Engine {
     pub border_chars: HashMap<String, String>,
     pub drag_mode: bool,
     pub drag_resize_target: Option<DragTarget>,
-    /// 窗口级别的运行时尺寸覆盖（拖拽产生，存储百分比或绝对值）
+    /// 窗口级别的运行时尺寸覆盖（拖拽产生，存储 Absolute 用于当前渲染）
     pub window_rect_overrides: std::collections::HashMap<String, layout::WindowSize>,
+
+    /// 【新增】延迟池：存储松手时算好的 Percent，等待终端 Resize 时激活
+    pub pending_percent_overrides: std::collections::HashMap<String, layout::WindowSize>,
 
 
     // 信号防抖与状态追踪
@@ -253,6 +256,7 @@ impl Engine {
             drag_active: false,
             drag_resize_target: None,
             window_rect_overrides: std::collections::HashMap::new(),
+            pending_percent_overrides: std::collections::HashMap::new(), // 【新增】
             last_signal_emit: HashMap::new(),
             last_emitted_select_id: None,
         };
@@ -704,6 +708,7 @@ impl Engine {
     pub fn handle_ipc_update(&mut self, target: &str, data: &str, term_width: u16, term_height: u16) {
         if target == "@layout-reset" {
             self.window_rect_overrides.clear();
+            self.pending_percent_overrides.clear(); // 【新增】
             return;
         }
         if let Some(layer_name) = target.strip_prefix("@layout-reset ") {
@@ -789,6 +794,8 @@ impl Engine {
             }
         }
     }
+
+
 
     pub fn get_main_tree_state(&self) -> Option<&TreeState> {
         let name = self.main_tree_name.as_ref()?;
@@ -994,5 +1001,45 @@ impl Engine {
                     && my.width == neighbor.width
             }
         }
+    }
+    /// 查找两个相邻窗口在父容器中的“原始百分比总和”
+    pub fn get_sibling_percent_sum(&self, name1: &str, name2: &str) -> Option<u16> {
+        for layer in &self.layout_layers {
+            if let Some(sum) = Self::find_sibling_sum_in_node(&layer.layout.layers[0].root, name1, name2) {
+                return Some(sum);
+            }
+        }
+        None
+    }
+
+    fn find_sibling_sum_in_node(node: &crate::layout::LayoutNode, name1: &str, name2: &str) -> Option<u16> {
+        if let crate::layout::LayoutNode::Container { children, .. } = node {
+            let mut sum = 0;
+            let mut found_count = 0;
+
+            for child in children {
+                if let crate::layout::LayoutNode::Window { name, size, .. } = child {
+                    if name == name1 || name == name2 {
+                        if let Some(crate::layout::WindowSize::Percent(p)) = size {
+                            sum += p;
+                            found_count += 1;
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+            }
+
+            if found_count == 2 {
+                return Some(sum);
+            }
+
+            for child in children {
+                if let Some(sum) = Self::find_sibling_sum_in_node(child, name1, name2) {
+                    return Some(sum);
+                }
+            }
+        }
+        None
     }
 }

@@ -136,11 +136,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scroll_step = cli.scroll_step;
     let mut last_event_time = std::time::Instant::now();
 
+    // 追踪终端尺寸，用于触发延迟池激活
+    let mut last_columns: u16 = 0;
+    let mut last_rows: u16 = 0;
+
     'main_loop: loop {
         if signal::check_and_clear_quit() { break 'main_loop; }
 
         let (columns, rows) = match crossterm::terminal::size() { Ok(s) => s, Err(_) => continue };
         let term_size = crossterm::terminal::WindowSize { width: columns, height: rows, columns, rows };
+
+        // 【新增】检测终端 Resize，激活延迟池中的 Percent
+        if last_columns > 0 && last_rows > 0 && (columns != last_columns || rows != last_rows) {
+            if !engine.pending_percent_overrides.is_empty() {
+                // 终端尺寸变了！把延迟池里的 Percent 激活，覆盖 Absolute
+                // Flexbox 会自动根据新的终端尺寸和 Percent 完美重算嵌套布局
+                for (name, size) in engine.pending_percent_overrides.drain() {
+                    engine.window_rect_overrides.insert(name, size);
+                }
+            }
+        }
+        last_columns = columns;
+        last_rows = rows;
 
         if signal::check_and_clear_reload() {
             engine.trigger_reload(columns, rows);
@@ -394,7 +411,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
                                 if let Some(app::DragTarget::ResizeEdge(ref primary, ref neighbor, dir)) = engine.drag_resize_target {
                                     let all_rects_now = engine.calc_all_rects(columns, rows);
-                                    // 【改动】同时提取 Rect 和 BorderStyle，用于计算边框开销
                                     let mr = all_rects_now.iter().find(|(_, n, _, _)| n == primary).map(|(r, _, b, _)| (*r, *b));
                                     let nr = all_rects_now.iter().find(|(_, n, _, _)| n == neighbor).map(|(r, _, b, _)| (*r, *b));
 
@@ -407,22 +423,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     (n, m, neighbor, primary, n_border, m_border)
                                                 };
 
-                                                // 计算边框开销 (Box=2, Line=1, None=0)
-                                                let left_border_extra = match left_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
-                                                let right_border_extra = match right_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
+                                                let left_extra = match left_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
+                                                let right_extra = match right_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
 
-                                                // 【核心1】：极限 Clamp，保证内容宽度 >= 0 (物理宽度 >= 边框开销)
-                                                let min_split = left.start_col + left_border_extra;
-                                                let max_split = right.start_col + right.width.saturating_sub(right_border_extra);
+                                                let min_split = left.start_col + left_extra;
+                                                let max_split = right.start_col + right.width.saturating_sub(right_extra);
                                                 if min_split > max_split { continue 'main_loop; }
 
                                                 let split = mouse_event.column.clamp(min_split, max_split);
-                                                let new_left_physical_w = split - left.start_col;
-                                                let new_left_content_w = new_left_physical_w.saturating_sub(left_border_extra);
+                                                let new_left_physical = split - left.start_col;
+                                                let new_left_content = new_left_physical.saturating_sub(left_extra);
 
-                                                // 【核心2】：Drag 阶段写入 Absolute，保证绝对跟手，零精度丢失
-                                                engine.window_rect_overrides.insert(left_name.clone(), crate::layout::WindowSize::Absolute(new_left_content_w));
-                                                engine.window_rect_overrides.insert(right_name.clone(), crate::layout::WindowSize::Percent(100));
+                                                // 【核心 1】：计算 A+B 的总内容宽度，保证拖拽时总宽度守恒，C 窗口绝对不动
+                                                let total_ab_physical = left.width + right.width;
+                                                let total_ab_content = total_ab_physical.saturating_sub(left_extra + right_extra);
+                                                let new_right_content = total_ab_content.saturating_sub(new_left_content);
+
+                                                // 写入 Absolute，实现绝对跟手
+                                                engine.window_rect_overrides.insert(left_name.clone(), crate::layout::WindowSize::Absolute(new_left_content));
+                                                engine.window_rect_overrides.insert(right_name.clone(), crate::layout::WindowSize::Absolute(new_right_content));
                                             }
                                             crate::layout::Direction::Vertical => {
                                                 let (top, bottom, top_name, bottom_name, top_border, bottom_border) = if m.start_row < n.start_row {
@@ -431,28 +450,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     (n, m, neighbor, primary, n_border, m_border)
                                                 };
 
-                                                let top_border_extra = match top_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
-                                                let bottom_border_extra = match bottom_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
+                                                let top_extra = match top_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
+                                                let bottom_extra = match bottom_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
 
-                                                let min_split = top.start_row + top_border_extra;
-                                                let max_split = bottom.start_row + bottom.height.saturating_sub(bottom_border_extra);
+                                                let min_split = top.start_row + top_extra;
+                                                let max_split = bottom.start_row + bottom.height.saturating_sub(bottom_extra);
                                                 if min_split > max_split { continue 'main_loop; }
 
                                                 let split = mouse_event.row.clamp(min_split, max_split);
-                                                let new_top_physical_h = split - top.start_row;
-                                                let new_top_content_h = new_top_physical_h.saturating_sub(top_border_extra);
+                                                let new_top_physical = split - top.start_row;
+                                                let new_top_content = new_top_physical.saturating_sub(top_extra);
 
-                                                // Drag 阶段写入 Absolute
-                                                engine.window_rect_overrides.insert(top_name.clone(), crate::layout::WindowSize::Absolute(new_top_content_h));
-                                                engine.window_rect_overrides.insert(bottom_name.clone(), crate::layout::WindowSize::Percent(100));
+                                                let total_ab_physical = top.height + bottom.height;
+                                                let total_ab_content = total_ab_physical.saturating_sub(top_extra + bottom_extra);
+                                                let new_bottom_content = total_ab_content.saturating_sub(new_top_content);
+
+                                                engine.window_rect_overrides.insert(top_name.clone(), crate::layout::WindowSize::Absolute(new_top_content));
+                                                engine.window_rect_overrides.insert(bottom_name.clone(), crate::layout::WindowSize::Absolute(new_bottom_content));
                                             }
                                         }
                                     }
                                 }
                             }
                             crossterm::event::MouseEventKind::Up(_) => {
-                                // 【核心3】：Up 阶段，将绝对像素反算回百分比，恢复终端缩放自适应
+                                // 【延迟池方案】：松手时不改变当前帧的 overrides（保持 Absolute，0 跳动）
+                                // 算好的 Percent 存入延迟池，等待终端 Resize 时再激活
                                 if let Some(app::DragTarget::ResizeEdge(ref primary, ref neighbor, dir)) = engine.drag_resize_target {
+                                    // 1. 查户口：获取原始百分比总和（保证多窗口不挤压）
+                                    let original_sum_pct = engine.get_sibling_percent_sum(primary, neighbor).unwrap_or(100);
+
                                     let all_rects_now = engine.calc_all_rects(columns, rows);
                                     let mr = all_rects_now.iter().find(|(_, n, _, _)| n == primary).map(|(r, _, b, _)| (*r, *b));
                                     let nr = all_rects_now.iter().find(|(_, n, _, _)| n == neighbor).map(|(r, _, b, _)| (*r, *b));
@@ -466,20 +492,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     (n, m, neighbor, primary, n_border, m_border)
                                                 };
 
-                                                let total_width = left.width + right.width;
-                                                let left_border_extra = match left_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
-                                                let right_border_extra = match right_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
-                                                let flex_len = total_width.saturating_sub(left_border_extra + right_border_extra);
+                                                let left_extra = match left_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
+                                                let right_extra = match right_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
 
-                                                if flex_len > 0 {
-                                                    let left_content_w = left.width.saturating_sub(left_border_extra);
-                                                    // 【数学魔法】：向上取整反算百分比，对冲 Flexbox 的向下取整，防止窗口缩水
-                                                    let left_pct = ((left_content_w as u32 * 100) + flex_len as u32 - 1) / flex_len as u32;
-                                                    let left_pct = left_pct.min(100) as u16;
-                                                    let right_pct = 100 - left_pct;
+                                                let total_ab_physical = left.width + right.width;
+                                                let total_ab_content = total_ab_physical.saturating_sub(left_extra + right_extra);
 
-                                                    engine.window_rect_overrides.insert(left_name.clone(), crate::layout::WindowSize::Percent(left_pct));
-                                                    engine.window_rect_overrides.insert(right_name.clone(), crate::layout::WindowSize::Percent(right_pct));
+                                                if total_ab_content > 0 {
+                                                    let left_content_w = left.width.saturating_sub(left_extra);
+                                                    // 向上取整，对冲 Flexbox 的向下取整
+                                                    let numerator = left_content_w as u32 * original_sum_pct as u32;
+                                                    let denominator = total_ab_content as u32;
+                                                    let global_left_pct = (numerator + denominator - 1) / denominator;
+                                                    let global_left_pct = global_left_pct.min(original_sum_pct as u32) as u16;
+                                                    let global_right_pct = original_sum_pct - global_left_pct;
+
+                                                    // 【核心】：只存入延迟池，绝对不修改 window_rect_overrides！
+                                                    engine.pending_percent_overrides.insert(left_name.clone(), crate::layout::WindowSize::Percent(global_left_pct));
+                                                    engine.pending_percent_overrides.insert(right_name.clone(), crate::layout::WindowSize::Percent(global_right_pct));
                                                 }
                                             }
                                             crate::layout::Direction::Vertical => {
@@ -489,20 +519,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     (n, m, neighbor, primary, n_border, m_border)
                                                 };
 
-                                                let total_height = top.height + bottom.height;
-                                                let top_border_extra = match top_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
-                                                let bottom_border_extra = match bottom_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
-                                                let flex_len = total_height.saturating_sub(top_border_extra + bottom_border_extra);
+                                                let top_extra = match top_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
+                                                let bottom_extra = match bottom_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
 
-                                                if flex_len > 0 {
-                                                    let top_content_h = top.height.saturating_sub(top_border_extra);
-                                                    // 向上取整反算百分比
-                                                    let top_pct = ((top_content_h as u32 * 100) + flex_len as u32 - 1) / flex_len as u32;
-                                                    let top_pct = top_pct.min(100) as u16;
-                                                    let bottom_pct = 100 - top_pct;
+                                                let total_ab_physical = top.height + bottom.height;
+                                                let total_ab_content = total_ab_physical.saturating_sub(top_extra + bottom_extra);
 
-                                                    engine.window_rect_overrides.insert(top_name.clone(), crate::layout::WindowSize::Percent(top_pct));
-                                                    engine.window_rect_overrides.insert(bottom_name.clone(), crate::layout::WindowSize::Percent(bottom_pct));
+                                                if total_ab_content > 0 {
+                                                    let top_content_h = top.height.saturating_sub(top_extra);
+                                                    let numerator = top_content_h as u32 * original_sum_pct as u32;
+                                                    let denominator = total_ab_content as u32;
+                                                    let global_top_pct = (numerator + denominator - 1) / denominator;
+                                                    let global_top_pct = global_top_pct.min(original_sum_pct as u32) as u16;
+                                                    let global_bottom_pct = original_sum_pct - global_top_pct;
+
+                                                    engine.pending_percent_overrides.insert(top_name.clone(), crate::layout::WindowSize::Percent(global_top_pct));
+                                                    engine.pending_percent_overrides.insert(bottom_name.clone(), crate::layout::WindowSize::Percent(global_bottom_pct));
                                                 }
                                             }
                                         }

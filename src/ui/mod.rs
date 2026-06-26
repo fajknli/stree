@@ -112,34 +112,54 @@ impl<'a, W: Write> WindowRenderer<'a, W> {
         if let Some(bg) = text_style.bg { self.out.queue(style::SetBackgroundColor(bg))?; }
         if text_style.bold { self.out.queue(style::SetAttribute(style::Attribute::Bold))?; }
 
-        // 解析 ANSI 和文本段 (省略详细解析代码，复用原逻辑)
+        // ================= 1. 通用词法分析器：黑盒透传所有控制序列 =================
         let mut segments = Vec::new();
         let mut chars = text.chars().peekable();
+
         while let Some(c) = chars.next() {
             if c == '\x1b' {
-                if chars.peek() == Some(&'[') {
-                    let mut ansi = String::from("\x1b[");
-                    chars.next();
-                    while let Some(&next_c) = chars.peek() {
-                        ansi.push(next_c); chars.next();
-                        if next_c.is_ascii_alphabetic() { break; }
+                let mut ctrl_seq = String::from("\x1b");
+
+                if let Some(&next_c) = chars.peek() {
+                    if next_c == '[' {
+                        // 【CSI 家族】：\x1b[ 开始，以 0x40 ('@') 到 0x7E ('~') 之间的字符结束
+                        ctrl_seq.push(chars.next().unwrap());
+                        while let Some(&c) = chars.peek() {
+                            ctrl_seq.push(chars.next().unwrap());
+                            if (0x40..=0x7E).contains(&(c as u32)) { break; }
+                        }
+                    } else if [']', '_', 'P', '^', 'X'].contains(&next_c) {
+                        // 【字符串命令家族】：OSC (\x1b]), APC (\x1b_), DCS (\x1bP) 等
+                        // 它们通常以 \x07 (BEL) 或 \x1b\\ (ST) 结束
+                        ctrl_seq.push(chars.next().unwrap());
+                        while let Some(&c) = chars.peek() {
+                            ctrl_seq.push(chars.next().unwrap());
+                            if c == '\x07' || (c == '\\' && ctrl_seq.ends_with("\x1b\\")) {
+                                break;
+                            }
+                        }
+                    } else {
+                        // 未知的 ESC 组合，保守处理，当作单个控制字符吞掉
+                        ctrl_seq.push(chars.next().unwrap());
                     }
-                    segments.push(Segment::Ansi(ansi));
-                } else {
-                    segments.push(Segment::Text(String::from(c)));
                 }
+
+                // 统一打包为 Control 段
+                segments.push(Segment::Control(ctrl_seq));
             } else {
+                // 【普通文本段】：一直收集，直到遇到下一个 \x1b
                 let mut text_seg = String::new();
                 text_seg.push(c);
                 while let Some(&next_c) = chars.peek() {
                     if next_c == '\x1b' { break; }
-                    text_seg.push(next_c); chars.next();
+                    text_seg.push(next_c);
+                    chars.next();
                 }
                 segments.push(Segment::Text(text_seg));
             }
         }
 
-        // 计算纯文本字符及其宽度
+        // ================= 2. 宽度计算（Control 彻底隐身） =================
         let mut total_w = 0;
         let mut plain_chars: Vec<(char, usize)> = Vec::new();
         for seg in &segments {
@@ -150,14 +170,15 @@ impl<'a, W: Write> WindowRenderer<'a, W> {
                     total_w += cw;
                 }
             }
+            // 注意：Segment::Control 在这里完全被忽略，total_w 不会增加哪怕 1 像素！
         }
 
-        // 【核心修复】：为 ~ 预留 1 格宽度，防止总宽度越界触发终端换行
+        // ================= 3. 截断逻辑（Control 永远不会被劈开） =================
         let mut keep_count = plain_chars.len();
         let mut truncated = false;
         if total_w > max_w {
             truncated = true;
-            let target_w = max_w.saturating_sub(1);
+            let target_w = max_w.saturating_sub(1); // 为 ~ 预留 1 格
             while total_w > target_w && keep_count > 0 {
                 let (_, cw) = plain_chars[keep_count - 1];
                 total_w -= cw;
@@ -165,7 +186,7 @@ impl<'a, W: Write> WindowRenderer<'a, W> {
             }
         }
 
-        // 高亮处理
+        // ================= 4. 高亮处理（仅针对纯文本） =================
         let lower_highlight = highlight.unwrap_or("").to_lowercase();
         let plain_str: String = plain_chars.iter().take(keep_count).map(|(c, _)| *c).collect();
         let lower_plain = plain_str.to_lowercase();
@@ -178,11 +199,14 @@ impl<'a, W: Write> WindowRenderer<'a, W> {
             }
         }
 
-        // 实际绘制
+        // ================= 5. 实际绘制（Control 原样吐给终端） =================
         let mut current_plain_count = 0;
         for seg in &segments {
             match seg {
-                Segment::Ansi(s) => { self.out.queue(style::Print(s))?; }
+                Segment::Control(s) => {
+                    // 不管你是 OSC 8 超链接，还是 OSC 52 剪贴板，直接原样透传
+                    self.out.queue(style::Print(s))?;
+                }
                 Segment::Text(s) => {
                     for c in s.chars() {
                         if current_plain_count < keep_count {
@@ -217,7 +241,10 @@ impl<'a, W: Write> WindowRenderer<'a, W> {
     }
 }
 
-enum Segment { Text(String), Ansi(String) }
+enum Segment {
+    Text(String),    // 可见数据流：参与宽度计算和截断
+    Control(String), // 终端控制流（CSI/OSC/APC/DCS等）：不占宽度，原样透传
+}
 
 // ================= 3. 渲染管线与组件提纯 =================
 
