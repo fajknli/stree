@@ -232,63 +232,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             _ => {}
                         }
                     }
-
                     match key_event.code {
                         _ => {
                             if let Some((full_cmd_args, is_silent)) = engine.prepare_key_binding_args(&key_event, columns, rows) {
-                                if full_cmd_args.len() == 1 {
-                                    match full_cmd_args[0].as_str() {
-                                        "__EXIT__" => break 'main_loop,
-                                        "__ESC__" => {
-                                            if engine.has_active_input() {
-                                                engine.cancel_input();
-                                            }
+                                if let Some(internal_cmd) = app::InternalCommand::from_args(&full_cmd_args) {
+                                    match internal_cmd {
+                                        app::InternalCommand::Exit => break 'main_loop,
+                                        app::InternalCommand::Esc => {
+                                            if engine.has_active_input() { engine.cancel_input(); }
                                         }
-                                        "__TAB__" => engine.handle_tab(columns, rows),
-                                        "__UP__" => engine.move_up(columns, rows),
-                                        "__DOWN__" => engine.move_down(columns, rows),
-                                        "__EXPAND__" => engine.toggle_expand(),
-                                        "__MARK__" => engine.toggle_mark(),
-                                        "__TOP__" => engine.jump_to_top(columns, rows),
-                                        "__BOTTOM__" => engine.jump_to_bottom(columns, rows),
-                                        "__ENTER__" => {
+                                        app::InternalCommand::Tab => engine.handle_tab(columns, rows),
+                                        app::InternalCommand::Up => engine.move_up(columns, rows),
+                                        app::InternalCommand::Down => engine.move_down(columns, rows),
+                                        app::InternalCommand::Expand => engine.toggle_expand(),
+                                        app::InternalCommand::Mark => engine.toggle_mark(),
+                                        app::InternalCommand::Top => engine.jump_to_top(columns, rows),
+                                        app::InternalCommand::Bottom => engine.jump_to_bottom(columns, rows),
+                                        app::InternalCommand::Enter => {
                                             engine.toggle_expand();
                                             engine.emit("confirm", columns, rows);
                                         }
-                                        "__ACTIVATE_SEARCH__" => {
-                                            if engine.components.contains_key("Cmd") {
-                                                engine.activate_input("Cmd", "/");
-                                            }
+                                        app::InternalCommand::ActivateSearch => {
+                                            if engine.components.contains_key("Cmd") { engine.activate_input("Cmd", "/"); }
                                         }
-                                        "__ACTIVATE_CMD__" => {
-                                            if engine.components.contains_key("Cmd") {
-                                                engine.activate_input("Cmd", ":");
-                                            }
+                                        app::InternalCommand::ActivateCmd => {
+                                            if engine.components.contains_key("Cmd") { engine.activate_input("Cmd", ":"); }
                                         }
-                                        // 【新增】布局层显隐控制指令
-                                        "__TOGGLE_LAYOUT__" => {
-                                            // 需要第二个参数，但单参数指令无法传递
-                                            // 这里仅作占位，实际使用需通过 __ACTIVATE_INPUT__ 或外部 IPC
+                                        app::InternalCommand::ActivateInput(name) => {
+                                            engine.activate_input(&name, "");
                                         }
-                                        _ => {
-                                            execute_binding(&mut engine, &full_cmd_args, is_silent, columns, rows);
-                                        }
+                                        app::InternalCommand::ToggleLayout(name) => engine.toggle_layout_visible(&name),
+                                        app::InternalCommand::ShowLayout(name) => engine.set_layout_visible(&name, true),
+                                        app::InternalCommand::HideLayout(name) => engine.set_layout_visible(&name, false),
                                     }
-                                }
-                                else if full_cmd_args.len() == 2 && full_cmd_args[0] == "__ACTIVATE_INPUT__" {
-                                    engine.activate_input(&full_cmd_args[1], "");
-                                }
-                                // 【重构】Overlay 指令替换为 Layout 层显隐控制
-                                else if full_cmd_args.len() == 2 && full_cmd_args[0] == "__TOGGLE_LAYOUT__" {
-                                    engine.toggle_layout_visible(&full_cmd_args[1]);
-                                }
-                                else if full_cmd_args.len() == 2 && full_cmd_args[0] == "__SHOW_LAYOUT__" {
-                                    engine.set_layout_visible(&full_cmd_args[1], true);
-                                }
-                                else if full_cmd_args.len() == 2 && full_cmd_args[0] == "__HIDE_LAYOUT__" {
-                                    engine.set_layout_visible(&full_cmd_args[1], false);
-                                }
-                                else {
+                                } else {
                                     execute_binding(&mut engine, &full_cmd_args, is_silent, columns, rows);
                                 }
                             }

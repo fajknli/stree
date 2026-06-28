@@ -55,6 +55,53 @@ pub enum Component {
     // Overlay 已删除
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum InternalCommand {
+    Exit,
+    Esc,
+    Tab,
+    Up,
+    Down,
+    Expand,
+    Mark,
+    Top,
+    Bottom,
+    Enter,
+    ActivateSearch,
+    ActivateCmd,
+    ActivateInput(String),
+    ToggleLayout(String),
+    ShowLayout(String),
+    HideLayout(String),
+}
+
+impl InternalCommand {
+    pub fn from_args(args: &[String]) -> Option<Self> {
+        if args.is_empty() { return None; }
+        let cmd = args[0].as_str();
+        let val = args.get(1).cloned();
+        match (cmd, val) {
+            ("__EXIT__", None) => Some(Self::Exit),
+            ("__ESC__", None) => Some(Self::Esc),
+            ("__TAB__", None) => Some(Self::Tab),
+            ("__UP__", None) => Some(Self::Up),
+            ("__DOWN__", None) => Some(Self::Down),
+            ("__EXPAND__", None) => Some(Self::Expand),
+            ("__MARK__", None) => Some(Self::Mark),
+            ("__TOP__", None) => Some(Self::Top),
+            ("__BOTTOM__", None) => Some(Self::Bottom),
+            ("__ENTER__", None) => Some(Self::Enter),
+            ("__ACTIVATE_SEARCH__", None) => Some(Self::ActivateSearch),
+            ("__ACTIVATE_CMD__", None) => Some(Self::ActivateCmd),
+            ("__ACTIVATE_INPUT__", Some(name)) => Some(Self::ActivateInput(name)),
+            ("__TOGGLE_LAYOUT__", Some(name)) => Some(Self::ToggleLayout(name)),
+            ("__SHOW_LAYOUT__", Some(name)) => Some(Self::ShowLayout(name)),
+            ("__HIDE_LAYOUT__", Some(name)) => Some(Self::HideLayout(name)),
+            _ => None,
+        }
+    }
+}
+
 /// 运行时布局层状态
 #[derive(Debug, Clone)]
 pub struct LayoutLayerState {
