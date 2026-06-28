@@ -1,5 +1,15 @@
 // src/layout/mod.rs
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+// 全局计数器，每次调用 generate_container_id() 都会自动 +1
+static CONTAINER_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+pub fn generate_container_id_pub() -> String {
+    let id = CONTAINER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("__c{}", id)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Direction {
     Horizontal,
@@ -29,6 +39,7 @@ pub enum LayoutNode {
         draggable: bool,
     },
     Container {
+        id: String, // 【新增】隐式 ID，用于 Overrides 和边界定位
         direction: Direction,
         percent: Option<u16>,
         children: Vec<LayoutNode>,
@@ -193,6 +204,7 @@ fn parse_node(s: &str) -> Option<LayoutNode> {
         // 确保真的分割出了多个子节点，否则退化为窗口解析
         if children.len() > 1 {
             Some(LayoutNode::Container {
+                id: generate_container_id_pub(),
                 direction: Direction::Horizontal,
                 percent: None,
                 children,
@@ -253,6 +265,7 @@ fn parse_container(s: &str, dir: Direction) -> Option<LayoutNode> {
     }
 
     Some(LayoutNode::Container {
+        id: generate_container_id_pub(),
         direction: dir,
         percent,
         children,
@@ -356,7 +369,7 @@ fn parse_window(s: &str) -> Option<LayoutNode> {
     Some(LayoutNode::Window { name, size, border, border_chars: None, draggable })
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct WindowRect {
     pub start_col: u16,
     pub start_row: u16,
@@ -485,10 +498,9 @@ fn compute_rects(
                 };
                 total_border_overhead = total_border_overhead.saturating_add(border_extra);
 
-                // 【核心改动】：优先使用 override 的 size
                 let child_size = match child {
                     LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
-                    LayoutNode::Container { percent, .. } => percent.map(WindowSize::Percent),
+                    LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or(percent.map(WindowSize::Percent)),
                 };
 
                 match child_size {
@@ -520,7 +532,7 @@ fn compute_rects(
             for child in children.iter() {
                 let child_size = match child {
                     LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
-                    LayoutNode::Container { percent, .. } => percent.map(WindowSize::Percent),
+                    LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or(percent.map(WindowSize::Percent)),
                 };
 
                 let s = match child_size {
@@ -542,20 +554,29 @@ fn compute_rects(
             // 【核心补丁：余数均摊，彻底消灭右边空隙】
             let allocated_sum: u16 = content_sizes.iter().sum();
             let mut remainder = flex_len.saturating_sub(allocated_sum);
-            let mut i = children.len();
-            while remainder > 0 && i > 0 {
-                i -= 1;
-                let child_size = match children.get(i) {
-                    Some(LayoutNode::Window { name, size, .. }) => overrides.get(name).copied().or(*size),
-                    Some(LayoutNode::Container { percent, .. }) => percent.map(WindowSize::Percent),
-                    None => None,
-                };
-                // 只有非 Absolute 的节点才能吸收余数
-                if !matches!(child_size, Some(WindowSize::Absolute(_))) {
-                    content_sizes[i] += 1;
-                    remainder -= 1;
+
+            // 【修复】：轮流分摊余数，直到分完为止，杜绝提前退出
+            if remainder > 0 {
+                let n = children.len();
+                let mut idx = 0;
+                let mut consecutive_skips = 0;
+                while remainder > 0 && consecutive_skips < n {
+                    let child_size = match &children[idx] {
+                        LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
+                        LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or_else(|| percent.map(WindowSize::Percent)),
+                    };
+                    // 只有非 Absolute 的节点才能吸收余数
+                    if !matches!(child_size, Some(WindowSize::Absolute(_))) {
+                        content_sizes[idx] += 1;
+                        remainder -= 1;
+                        consecutive_skips = 0; // 成功分配，重置计数器
+                    } else {
+                        consecutive_skips += 1; // 无法分配，计数器+1
+                    }
+                    idx = (idx + 1) % n; // 循环回到开头
                 }
             }
+
             // 极端兜底：如果还有剩余（比如全都是 Absolute 且空间不够），强塞给最后一个
             if remainder > 0 {
                 if let Some(last) = content_sizes.last_mut() { *last += remainder; }

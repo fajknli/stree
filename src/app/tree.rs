@@ -19,12 +19,24 @@ pub struct TreeState {
     pub relations_path: Option<String>,
     pub click_to_fire: bool,   // click: 前缀
     pub focus_to_fire: bool,   // focus: 前缀
+    pub search_query: Option<String>, // 【新增】搜索状态
 }
 
 impl TreeState {
     pub fn rebuild_visible_ids(&mut self) {
         self.visible_ids.clear();
         self.visible_depths.clear();
+
+        if let Some(query) = &self.search_query {
+            if !query.is_empty() {
+                let matched = crate::search::match_entities(&self.dataset.entities, query);
+                for root in &self.root_tree {
+                    Self::collect_matched(root, &matched, &mut self.visible_ids, &mut self.visible_depths);
+                }
+                return;
+            }
+        }
+
         for root in &self.root_tree {
             Self::collect_visible(root, &self.expanded_ids, &mut self.visible_ids, &mut self.visible_depths);
         }
@@ -42,6 +54,21 @@ impl TreeState {
             for child in &node.children {
                 Self::collect_visible(child, expanded_ids, visible_ids, visible_depths);
             }
+        }
+    }
+
+    fn collect_matched(
+        node: &TreeNode,
+        matched: &std::collections::HashSet<String>,
+        visible_ids: &mut Vec<String>,
+        visible_depths: &mut Vec<usize>,
+    ) {
+        if matched.contains(&node.entity.id) {
+            visible_ids.push(node.entity.id.clone());
+            visible_depths.push(node.depth);
+        }
+        for child in &node.children {
+            Self::collect_matched(child, matched, visible_ids, visible_depths);
         }
     }
 
@@ -164,6 +191,7 @@ mod tests {
             relations_path: None,
             click_to_fire: false,
             focus_to_fire: false,
+            search_query: None,
         };
         state.select_id("U-01");
         state

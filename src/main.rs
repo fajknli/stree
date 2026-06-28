@@ -146,11 +146,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (columns, rows) = match crossterm::terminal::size() { Ok(s) => s, Err(_) => continue };
         let term_size = crossterm::terminal::WindowSize { width: columns, height: rows, columns, rows };
 
-        // 【新增】检测终端 Resize，激活延迟池中的 Percent
         if last_columns > 0 && last_rows > 0 && (columns != last_columns || rows != last_rows) {
             if !engine.pending_percent_overrides.is_empty() {
-                // 终端尺寸变了！把延迟池里的 Percent 激活，覆盖 Absolute
-                // Flexbox 会自动根据新的终端尺寸和 Percent 完美重算嵌套布局
+                // 激活 Percent
                 for (name, size) in engine.pending_percent_overrides.drain() {
                     engine.window_rect_overrides.insert(name, size);
                 }
@@ -169,6 +167,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // 【重构】使用多图层布局计算
         let all_rects = engine.calc_all_rects(columns, rows);
+
+        engine.rebuild_draggable_edges(columns, rows);
+
         let mut view_rects_info = std::collections::HashMap::new();
         for (rect, name, border, _z) in all_rects.iter() {
             if let Some(app::Component::View(_)) = engine.components.get(name) {
@@ -431,15 +432,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 if min_split > max_split { continue 'main_loop; }
 
                                                 let split = mouse_event.column.clamp(min_split, max_split);
-                                                let new_left_physical = split - left.start_col;
-                                                let new_left_content = new_left_physical.saturating_sub(left_extra);
-
-                                                // 【核心 1】：计算 A+B 的总内容宽度，保证拖拽时总宽度守恒，C 窗口绝对不动
-                                                let total_ab_physical = left.width + right.width;
-                                                let total_ab_content = total_ab_physical.saturating_sub(left_extra + right_extra);
+                                                let new_left_content = split - left.start_col - left_extra;
+                                                let total_ab_content = (left.width + right.width).saturating_sub(left_extra + right_extra);
                                                 let new_right_content = total_ab_content.saturating_sub(new_left_content);
 
-                                                // 写入 Absolute，实现绝对跟手
                                                 engine.window_rect_overrides.insert(left_name.clone(), crate::layout::WindowSize::Absolute(new_left_content));
                                                 engine.window_rect_overrides.insert(right_name.clone(), crate::layout::WindowSize::Absolute(new_right_content));
                                             }
@@ -458,11 +454,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 if min_split > max_split { continue 'main_loop; }
 
                                                 let split = mouse_event.row.clamp(min_split, max_split);
-                                                let new_top_physical = split - top.start_row;
-                                                let new_top_content = new_top_physical.saturating_sub(top_extra);
-
-                                                let total_ab_physical = top.height + bottom.height;
-                                                let total_ab_content = total_ab_physical.saturating_sub(top_extra + bottom_extra);
+                                                let new_top_content = split - top.start_row - top_extra;
+                                                let total_ab_content = (top.height + bottom.height).saturating_sub(top_extra + bottom_extra);
                                                 let new_bottom_content = total_ab_content.saturating_sub(new_top_content);
 
                                                 engine.window_rect_overrides.insert(top_name.clone(), crate::layout::WindowSize::Absolute(new_top_content));
@@ -473,87 +466,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             crossterm::event::MouseEventKind::Up(_) => {
-                                // 【延迟池方案】：松手时不改变当前帧的 overrides（保持 Absolute，0 跳动）
-                                // 算好的 Percent 存入延迟池，等待终端 Resize 时再激活
-                                if let Some(app::DragTarget::ResizeEdge(ref primary, ref neighbor, dir)) = engine.drag_resize_target {
-                                    // 1. 查户口：获取原始百分比总和（保证多窗口不挤压）
-                                    let original_sum_pct = engine.get_sibling_percent_sum(primary, neighbor).unwrap_or(100);
+                                // 1. 获取当前物理真相（带着拖拽时的 Absolute 约束）
+                                let all_rects_now = engine.calc_all_rects(columns, rows);
 
-                                    let all_rects_now = engine.calc_all_rects(columns, rows);
-                                    let mr = all_rects_now.iter().find(|(_, n, _, _)| n == primary).map(|(r, _, b, _)| (*r, *b));
-                                    let nr = all_rects_now.iter().find(|(_, n, _, _)| n == neighbor).map(|(r, _, b, _)| (*r, *b));
+                                // 2. 【关键修复】：无论是否重组过，都必须把当前的 Absolute 转为 Percent 写回树里！
+                                // 这样才能保证同容器拖拽不回弹！
+                                engine.force_recalculate_percentages(&all_rects_now);
 
-                                    if let (Some((m, m_border)), Some((n, n_border))) = (mr, nr) {
-                                        match dir {
-                                            crate::layout::Direction::Horizontal => {
-                                                let (left, right, left_name, right_name, left_border, right_border) = if m.start_col < n.start_col {
-                                                    (m, n, primary, neighbor, m_border, n_border)
-                                                } else {
-                                                    (n, m, neighbor, primary, n_border, m_border)
-                                                };
-
-                                                let left_extra = match left_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
-                                                let right_extra = match right_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
-
-                                                let total_ab_physical = left.width + right.width;
-                                                let total_ab_content = total_ab_physical.saturating_sub(left_extra + right_extra);
-
-                                                if total_ab_content > 0 {
-                                                    let left_content_w = left.width.saturating_sub(left_extra);
-                                                    // 向上取整，对冲 Flexbox 的向下取整
-                                                    let numerator = left_content_w as u32 * original_sum_pct as u32;
-                                                    let denominator = total_ab_content as u32;
-                                                    let global_left_pct = (numerator + denominator - 1) / denominator;
-                                                    let global_left_pct = global_left_pct.min(original_sum_pct as u32) as u16;
-                                                    let global_right_pct = original_sum_pct - global_left_pct;
-
-                                                    // 【核心】：只存入延迟池，绝对不修改 window_rect_overrides！
-                                                    engine.pending_percent_overrides.insert(left_name.clone(), crate::layout::WindowSize::Percent(global_left_pct));
-                                                    engine.pending_percent_overrides.insert(right_name.clone(), crate::layout::WindowSize::Percent(global_right_pct));
-                                                }
-                                            }
-                                            crate::layout::Direction::Vertical => {
-                                                let (top, bottom, top_name, bottom_name, top_border, bottom_border) = if m.start_row < n.start_row {
-                                                    (m, n, primary, neighbor, m_border, n_border)
-                                                } else {
-                                                    (n, m, neighbor, primary, n_border, m_border)
-                                                };
-
-                                                let top_extra = match top_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
-                                                let bottom_extra = match bottom_border { crate::layout::BorderStyle::Box => 2, crate::layout::BorderStyle::Line => 1, _ => 0 };
-
-                                                let total_ab_physical = top.height + bottom.height;
-                                                let total_ab_content = total_ab_physical.saturating_sub(top_extra + bottom_extra);
-
-                                                if total_ab_content > 0 {
-                                                    let top_content_h = top.height.saturating_sub(top_extra);
-                                                    let numerator = top_content_h as u32 * original_sum_pct as u32;
-                                                    let denominator = total_ab_content as u32;
-                                                    let global_top_pct = (numerator + denominator - 1) / denominator;
-                                                    let global_top_pct = global_top_pct.min(original_sum_pct as u32) as u16;
-                                                    let global_bottom_pct = original_sum_pct - global_top_pct;
-
-                                                    engine.pending_percent_overrides.insert(top_name.clone(), crate::layout::WindowSize::Percent(global_top_pct));
-                                                    engine.pending_percent_overrides.insert(bottom_name.clone(), crate::layout::WindowSize::Percent(global_bottom_pct));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // 清理拖拽状态
+                                // 3. 清空所有约束，把控制权交还给 Flexbox
+                                engine.window_rect_overrides.clear();
                                 engine.drag_active = false;
                                 engine.drag_resize_target = None;
+                                continue 'main_loop;
                             }
                             _ => {}
                         }
                         continue 'main_loop; // 拖拽模态下，屏蔽所有其他鼠标事件
                     }
 
-                    // 【重构】使用多图层布局计算，并按 Z 轴逆向遍历实现高 Z 层优先命中
-                    let all_rects = engine.calc_all_rects(columns, rows);
+                    // 【终极重构 1】全局边界碰撞检测：无视 [drag] 属性，有缝就能拖
+                    // 按 z_index 降序排序，保证高 Z 层（浮动窗口）的边界优先命中
+                    let mut sorted_edges: Vec<_> = engine.cached_edges.iter().collect();
+                    sorted_edges.sort_by(|a, b| b.z_index.cmp(&a.z_index));
 
-                    // 按 z_index 降序遍历（高 Z 层先检测）
+                    let mut hit_edge = None;
+                    for edge in sorted_edges {
+                        let in_x = mouse_event.column >= edge.hit_rect.start_col
+                            && mouse_event.column < edge.hit_rect.start_col + edge.hit_rect.width;
+                        let in_y = mouse_event.row >= edge.hit_rect.start_row
+                            && mouse_event.row < edge.hit_rect.start_row + edge.hit_rect.height;
+
+                        if in_x && in_y {
+                            hit_edge = Some(edge);
+                            break;
+                        }
+                    }
+
+                    // 如果命中了边界，且是鼠标左键按下，直接进入拖拽模态
+                    // 【新增】交点盲区剔除：如果鼠标在交点附近，不响应边的拖拽
+                    let mut in_intersection = false;
+                    for &(x, y) in &engine.cached_intersections {
+                        if (mouse_event.column == x || mouse_event.column == x - 1) &&
+                           (mouse_event.row == y || mouse_event.row == y - 1) {
+                            in_intersection = true;
+                            break;
+                        }
+                    }
+
+                    if !in_intersection {
+                        if let Some(edge) = hit_edge {
+                            if let crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse_event.kind {
+                                let primary_id = edge.primary_id.clone();
+                                let neighbor_id = edge.neighbor_id.clone();
+                                let dir = edge.direction;
+
+                                // 【关键修复】：按下时，如果对齐，立刻重组树！
+                                let all_rects_before = engine.calc_all_rects(columns, rows);
+                                let mr = all_rects_before.iter().find(|(_, n, _, _)| n == &primary_id).map(|(r, _, _, _)| *r);
+                                let nr = all_rects_before.iter().find(|(_, n, _, _)| n == &neighbor_id).map(|(r, _, _, _)| *r);
+
+                                if let (Some(m), Some(n)) = (mr, nr) {
+                                    let is_aligned = match dir {
+                                        crate::layout::Direction::Horizontal => m.height == n.height,
+                                        crate::layout::Direction::Vertical => m.width == n.width,
+                                    };
+
+                                    if is_aligned {
+                                        let restructured = engine.restructure_tree_after_drag(&primary_id, &neighbor_id, dir, &all_rects_before);
+                                        if restructured {
+                                            // 重组后，用旧物理尺寸重算新树百分比，保证按下瞬间零跳动
+                                            engine.force_recalculate_percentages(&all_rects_before);
+                                        }
+                                    }
+                                }
+
+                                engine.drag_active = true;
+                                engine.drag_resize_target = Some(app::DragTarget::ResizeEdge(
+                                    primary_id,
+                                    neighbor_id,
+                                    dir
+                                ));
+                                continue 'main_loop;
+                            }
+                        }
+                    }
+
+                    // 【终极重构 2】如果没有命中边界，执行原有的窗口内容区命中逻辑（焦点切换、点击等）
+                    let all_rects = engine.calc_all_rects(columns, rows);
                     let mut sorted_rects: Vec<_> = all_rects.iter().collect();
                     sorted_rects.sort_by(|a, b| b.3.cmp(&a.3));
 
@@ -561,53 +560,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let in_x = mouse_event.column >= rect.start_col && mouse_event.column < rect.start_col + rect.width;
                         let in_y = mouse_event.row >= rect.start_row && mouse_event.row < rect.start_row + rect.height;
                         if !in_x || !in_y { continue; }
-
-                        // 【窗口边框拖拽命中检测】
-                        let on_border = {
-                            let top = mouse_event.row == rect.start_row;
-                            let bottom = mouse_event.row == rect.start_row + rect.height.saturating_sub(1);
-                            let left = mouse_event.column == rect.start_col;
-                            let right = mouse_event.column == rect.start_col + rect.width.saturating_sub(1);
-                            if top { Some(app::BorderSide::Top) }
-                            else if bottom { Some(app::BorderSide::Bottom) }
-                            else if left { Some(app::BorderSide::Left) }
-                            else if right { Some(app::BorderSide::Right) }
-                            else { None }
-                        };
-
-                        if let Some(side) = on_border {
-                            // 检查该窗口是否标记为 draggable
-                            let is_draggable = engine.layout_layers.iter().any(|layer| {
-                                fn check(node: &crate::layout::LayoutNode, name: &str) -> bool {
-                                    match node {
-                                        crate::layout::LayoutNode::Window { name: n, draggable, .. } => n == name && *draggable,
-                                        crate::layout::LayoutNode::Container { children, .. } => children.iter().any(|c| check(c, name)),
-                                    }
-                                }
-                                layer.layout.layers.iter().any(|l| check(&l.root, name))
-                            });
-
-                            if is_draggable {
-                                // 步骤1：树查找候选邻居
-                                if let Some((neighbor_name, dir)) = engine.find_drag_neighbor(name, side) {
-                                    // 步骤2：几何对齐校验
-                                    let all_rects_for_check = engine.calc_all_rects(columns, rows);
-                                    let my_rect = all_rects_for_check.iter().find(|(_, n, _, _)| n == name).map(|(r, _, _, _)| *r);
-                                    let nb_rect = all_rects_for_check.iter().find(|(_, n, _, _)| n == &neighbor_name).map(|(r, _, _, _)| *r);
-
-                                    if let (Some(mr), Some(nr)) = (my_rect, nb_rect) {
-                                        if engine.is_edge_aligned(&mr, &nr, side) {
-                                            // 合法！进入拖拽模态
-                                            if let crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse_event.kind {
-                                                engine.drag_active = true;
-                                                engine.drag_resize_target = Some(app::DragTarget::ResizeEdge(name.clone(), neighbor_name, dir));
-                                                continue 'main_loop; // 跳过后续的焦点切换和内容区点击
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
 
                         // 命中！焦点切换 + 门禁检查
                         let old_focus = engine.focused.clone();
@@ -633,10 +585,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let max_rows = (rect.height as usize).saturating_sub(2);
                                     let scroll_offset = ui::calc_scroll_offset(t.selected_idx, t.visible_ids.len(), max_rows);
 
-                                    // 1. 计算 target_idx (修复之前的缺失)
                                     let target_idx = scroll_offset + mouse_event.row.saturating_sub(rect.start_row).saturating_sub(1) as usize;
-
-                                    // 2. 安全提取 clicked_id，不再 break (修复空白处失效)
                                     let is_valid_click = target_idx < t.visible_ids.len();
                                     let clicked_id = if is_valid_click { Some(t.visible_ids[target_idx].clone()) } else { None };
 
@@ -689,7 +638,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         crossterm::event::MouseEventKind::Up(_) => {
                                             engine.drag_active = false;
                                             engine.drag_start_idx = None;
-                                            engine.drag_resize_target = None; // 清理边框拖拽状态
+                                            engine.drag_resize_target = None;
                                         }
                                         crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Right) => {
                                             if engine.drag_active {
@@ -714,7 +663,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 }
                                             }
                                         }
-                                        _ => {} // 删除了原来的 Drag(Left)，因为已经移到最外层拦截了
+                                        _ => {}
                                     }
                                 }
                             }

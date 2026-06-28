@@ -141,20 +141,19 @@ fn parse_binding(input: &str) -> Option<ParsedBinding> {
 fn parse_key_desc(desc: &str) -> Option<KeyEvent> {
     let lower = desc.to_lowercase();
 
-    let (modifier, key_part) = if lower.starts_with("ctrl-") || lower.starts_with("ctrl+") {
-        let rest = lower.trim_start_matches("ctrl-").trim_start_matches("ctrl+");
-        (KeyModifiers::CONTROL, rest)
+    let (modifier, key_part_original) = if lower.starts_with("ctrl-") || lower.starts_with("ctrl+") {
+        (KeyModifiers::CONTROL, &desc[5..])
     } else if lower.starts_with("alt-") || lower.starts_with("alt+") {
-        let rest = lower.trim_start_matches("alt-").trim_start_matches("alt+");
-        (KeyModifiers::ALT, rest)
+        (KeyModifiers::ALT, &desc[4..])
     } else if lower.starts_with("shift-") || lower.starts_with("shift+") {
-        let rest = lower.trim_start_matches("shift-").trim_start_matches("shift+");
-        (KeyModifiers::SHIFT, rest)
+        (KeyModifiers::SHIFT, &desc[6..])
     } else {
-        (KeyModifiers::NONE, lower.as_str())
+        (KeyModifiers::NONE, desc)
     };
 
-    let code = match key_part {
+    let key_part = key_part_original.to_lowercase();
+
+    let code = match key_part.as_str() {
         "f1" => KeyCode::F(1), "f2" => KeyCode::F(2), "f3" => KeyCode::F(3),
         "f4" => KeyCode::F(4), "f5" => KeyCode::F(5), "f6" => KeyCode::F(6),
         "f7" => KeyCode::F(7), "f8" => KeyCode::F(8), "f9" => KeyCode::F(9),
@@ -164,14 +163,45 @@ fn parse_key_desc(desc: &str) -> Option<KeyEvent> {
         "space" => KeyCode::Char(' '), "up" => KeyCode::Up, "down" => KeyCode::Down,
         "left" => KeyCode::Left, "right" => KeyCode::Right, "home" => KeyCode::Home,
         "end" => KeyCode::End, "pageup" => KeyCode::PageUp, "pagedown" => KeyCode::PageDown,
-        s if s.chars().count() == 1 => KeyCode::Char(s.chars().next().unwrap()),
+        s if s.chars().count() == 1 => {
+            // 【修复】保留单字符的原始大小写，解决 g/G 冲突
+            let c = key_part_original.chars().next().unwrap();
+            KeyCode::Char(c)
+        },
         _ => {
             return None;
         }
     };
 
+    // 兼容性处理：Shift + 字母 -> 转为大写字母且修饰符置为 NONE
+    // 这样 'shift-g' 和 'G' 的行为一致，且符合大多数终端的按键发送习惯
+    let final_modifiers = if modifier == KeyModifiers::SHIFT {
+        if let KeyCode::Char(c) = code {
+            if c.is_ascii_alphabetic() {
+                KeyModifiers::NONE
+            } else {
+                modifier
+            }
+        } else {
+            modifier
+        }
+    } else {
+        modifier
+    };
+
+    let final_code = if let (KeyCode::Char(c), KeyModifiers::NONE) = (code, final_modifiers) {
+        if c.is_ascii_lowercase() && modifier == KeyModifiers::SHIFT {
+            KeyCode::Char(c.to_ascii_uppercase())
+        } else {
+            code
+        }
+    } else {
+        code
+    };
+
     Some(KeyEvent {
-        code, modifiers: modifier,
+        code: final_code,
+        modifiers: final_modifiers,
         kind: crossterm::event::KeyEventKind::Press,
         state: crossterm::event::KeyEventState::NONE,
     })
