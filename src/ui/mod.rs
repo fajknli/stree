@@ -400,7 +400,7 @@ pub fn render_all<W: Write>(ctx: &RenderCtx, out: &mut W) -> std::io::Result<()>
 
         let comp = ctx.engine.components.get(name);
         let title = comp.map(|_| name.as_str());
-        let is_focused = ctx.engine.focused == Focus::Component(name.clone());
+        let is_focused = ctx.engine.focus.current == Focus::Component(name.clone());
         let border_chars = ctx.engine.border_chars.get(name).map(|s| s.as_str());
 
         // 1. 画物理边界
@@ -434,7 +434,7 @@ pub fn render_all<W: Write>(ctx: &RenderCtx, out: &mut W) -> std::io::Result<()>
             Some(Component::StatusBar(s)) => {
                 status_rect_opt = Some(safe_rect);
                 let mut status_text = s.format_template.clone();
-                status_text = status_text.replace("{stree_focus}", match &ctx.engine.focused { Focus::Component(n) => n, _ => "None" });
+                status_text = status_text.replace("{stree_focus}", match &ctx.engine.focus.current { Focus::Component(n) => n, _ => "None" });
                 if let Some(t) = ctx.engine.get_focused_tree_state() {
                     status_text = status_text.replace("{stree_visible}", &t.visible_ids.len().to_string());
                     status_text = status_text.replace("{stree_total}", &t.dataset.entities.len().to_string());

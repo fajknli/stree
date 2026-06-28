@@ -15,7 +15,6 @@ use crate::config::BindConfig;
 use crate::exec;
 use crate::layout::{self, Layout, WindowRect, BorderStyle};
 use crate::protocol::Dataset;
-use crate::search;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -23,6 +22,12 @@ use std::time::Instant;
 pub enum Focus {
     None,
     Component(String),
+}
+
+impl Default for Focus {
+    fn default() -> Self {
+        Focus::None
+    }
 }
 
 /// 预计算的可拖拽物理边界
@@ -110,33 +115,49 @@ pub struct LayoutLayerState {
     pub layout: Layout,
 }
 
-#[derive(Debug)]
-pub struct Engine {
-    pub drag_start_idx: Option<usize>,
-    pub drag_active: bool,
-    pub components: HashMap<String, Component>,
-    /// 多图层布局状态（按 z_index 升序）
-    pub layout_layers: Vec<LayoutLayerState>,
-    pub key_bindings: BindConfig,
-    pub focused: Focus,
-    pub last_error: Option<String>,
-    pub last_click_time: Option<Instant>,
-    pub last_clicked_id: Option<String>,
-    pub global_relations: Vec<crate::protocol::Relation>,
-    pub mouse_enabled: bool,
-    pub main_tree_name: Option<String>,
-    pub border_chars: HashMap<String, String>,
-    pub drag_mode: bool,
-    pub drag_resize_target: Option<DragTarget>,
-    /// 窗口级别的运行时尺寸覆盖（拖拽产生，存储 Absolute 用于当前渲染）
-    pub window_rect_overrides: std::collections::HashMap<String, layout::WindowSize>,
-
-    // 信号防抖与状态追踪
-    pub last_signal_emit: HashMap<String, Instant>,
-    pub last_emitted_select_id: Option<String>,
-    /// 【新增】全局可拖拽边界缓存
+#[derive(Debug, Default)]
+pub struct DragState {
+    pub active: bool,
+    pub mode: bool,
+    pub start_idx: Option<usize>,
+    pub resize_target: Option<DragTarget>,
     pub cached_edges: Vec<DragEdge>,
     pub cached_intersections: Vec<(u16, u16)>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FocusState {
+    pub current: Focus,
+    pub main_tree_name: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct MouseState {
+    pub enabled: bool,
+    pub last_click_time: Option<Instant>,
+    pub last_clicked_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct SignalState {
+    pub last_emit: HashMap<String, Instant>,
+    pub last_emitted_select_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct Engine {
+    pub components: HashMap<String, Component>,
+    pub layout_layers: Vec<LayoutLayerState>,
+    pub window_rect_overrides: HashMap<String, layout::WindowSize>,
+    pub key_bindings: BindConfig,
+    pub border_chars: HashMap<String, String>,
+    pub global_relations: Vec<crate::protocol::Relation>,
+    pub last_error: Option<String>,
+
+    pub drag: DragState,
+    pub focus: FocusState,
+    pub mouse: MouseState,
+    pub signals: SignalState,
 }
 
 fn parse_component_prefixes(cfg: &str) -> (bool, bool, bool, String) {
@@ -300,27 +321,25 @@ impl Engine {
             components,
             layout_layers,
             key_bindings,
-            mouse_enabled,
-            drag_mode: false,
-            focused: focused.clone(),
             last_error: init_error,
-            last_click_time: None,
-            last_clicked_id: None,
             global_relations,
-            main_tree_name: first_tree_name,
             border_chars: border_chars_map,
-            drag_start_idx: None,
-            drag_active: false,
-            drag_resize_target: None,
             window_rect_overrides: std::collections::HashMap::new(),
-            last_signal_emit: HashMap::new(),
-            last_emitted_select_id: None,
-            cached_edges: Vec::new(),
-            cached_intersections: Vec::new(),
+            drag: DragState::default(),
+            focus: FocusState {
+                current: focused.clone(),
+                main_tree_name: first_tree_name,
+            },
+            mouse: MouseState {
+                enabled: mouse_enabled,
+                ..Default::default()
+            },
+            signals: SignalState::default(),
         };
 
-        if let Focus::Component(name) = &focused {
-            engine.broadcast_selection_changed(name, 0, 0);
+        if let Focus::Component(name) = &engine.focus.current {
+            let name = name.clone();
+            engine.broadcast_selection_changed(&name, 0, 0);
         }
 
         engine.init_views();
@@ -404,16 +423,16 @@ impl Engine {
         // 1. 时间防抖 (针对 select 等高频信号，200ms 内只发一次)
         if signal == "select" {
             let now = Instant::now();
-            if let Some(last) = self.last_signal_emit.get(signal) {
+            if let Some(last) = self.signals.last_emit.get(signal) {
                 if now.duration_since(*last).as_millis() < 200 {
                     return;
                 }
             }
-            self.last_signal_emit.insert(signal.to_string(), now);
+            self.signals.last_emit.insert(signal.to_string(), now);
         }
 
         // 2. 获取当前焦点窗口名
-        let current_window = match &self.focused {
+        let current_window = match &self.focus.current {
             Focus::Component(n) => Some(n.as_str()),
             Focus::None => None,
         };
@@ -423,9 +442,9 @@ impl Engine {
 
         if let Some((cmd_template_args, _is_silent)) = binding {
             // 4. 组装上下文
-            let tree_name = match &self.focused {
+            let tree_name = match &self.focus.current {
                 Focus::Component(n) if matches!(self.components.get(n), Some(Component::Tree(_))) => n.clone(),
-                _ => self.main_tree_name.clone().unwrap_or_default(),
+                _ => self.focus.main_tree_name.clone().unwrap_or_default(),
             };
 
             let (selected_entity, ids_str, paths_str) = if let Some(Component::Tree(t)) = self.components.get(&tree_name) {
@@ -469,8 +488,8 @@ impl Engine {
     /// 状态防抖：只有当 selected_id 真正改变时，才发射 select 信号
     pub fn emit_select_if_changed(&mut self, term_width: u16, term_height: u16) {
         let current_id = self.get_selected_entity().map(|e| e.id.clone());
-        if current_id != self.last_emitted_select_id {
-            self.last_emitted_select_id = current_id;
+        if current_id != self.signals.last_emitted_select_id {
+            self.signals.last_emitted_select_id = current_id;
             self.emit("select", term_width, term_height);
         }
     }
@@ -486,14 +505,14 @@ impl Engine {
 
         names.sort();
 
-        if names.is_empty() { self.focused = Focus::None; return; }
-        let current_idx = match &self.focused {
+        if names.is_empty() { self.focus.current = Focus::None; return; }
+        let current_idx = match &self.focus.current {
             Focus::Component(name) => names.iter().position(|n| n == name).unwrap_or(0),
             Focus::None => 0,
         };
         let next_idx = (current_idx + 1) % names.len();
         let next_name = names[next_idx].clone();
-        self.focused = Focus::Component(next_name.clone());
+        self.focus.current = Focus::Component(next_name.clone());
 
         // 【门禁检查】：新焦点的窗口是否签署了 focus: 协议？
         let should_emit_focus = if let Some(Component::Tree(t)) = self.components.get(&next_name) {
@@ -509,7 +528,7 @@ impl Engine {
 
     pub fn move_up(&mut self, term_width: u16, term_height: u16) {
         self.last_error = None;
-        let focused_name = if let Focus::Component(name) = &self.focused { name.clone() } else { return; };
+        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
         if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
             t.move_up();
             self.broadcast_selection_changed(&focused_name, term_width, term_height);
@@ -521,7 +540,7 @@ impl Engine {
 
     pub fn move_down(&mut self, term_width: u16, term_height: u16) {
         self.last_error = None;
-        let focused_name = if let Focus::Component(name) = &self.focused { name.clone() } else { return; };
+        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
         if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
             t.move_down();
             self.broadcast_selection_changed(&focused_name, term_width, term_height);
@@ -533,7 +552,7 @@ impl Engine {
 
     pub fn toggle_expand(&mut self) {
         self.last_error = None;
-        let focused_name = if let Focus::Component(name) = &self.focused { name.clone() } else { return; };
+        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
         if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
             t.toggle_expand();
         }
@@ -541,7 +560,7 @@ impl Engine {
 
     pub fn toggle_mark(&mut self) {
         self.last_error = None;
-        let focused_name = if let Focus::Component(name) = &self.focused { name.clone() } else { return; };
+        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
         if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
             t.toggle_mark();
         }
@@ -549,7 +568,7 @@ impl Engine {
 
     pub fn jump_to_top(&mut self, term_width: u16, term_height: u16) {
         self.last_error = None;
-        let focused_name = if let Focus::Component(name) = &self.focused { name.clone() } else { return; };
+        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
         if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
             t.jump_to_top();
             self.broadcast_selection_changed(&focused_name, term_width, term_height);
@@ -561,7 +580,7 @@ impl Engine {
 
     pub fn jump_to_bottom(&mut self, term_width: u16, term_height: u16) {
         self.last_error = None;
-        let focused_name = if let Focus::Component(name) = &self.focused { name.clone() } else { return; };
+        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
         if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
             t.jump_to_bottom();
             self.broadcast_selection_changed(&focused_name, term_width, term_height);
@@ -581,7 +600,7 @@ impl Engine {
     }
 
     pub fn broadcast_selection_changed(&mut self, tree_name: &str, _term_width: u16, _term_height: u16) {
-        let is_focused_tree = match &self.focused {
+        let is_focused_tree = match &self.focus.current {
             Focus::Component(n) => n == tree_name,
             Focus::None => false,
         };
@@ -684,7 +703,7 @@ impl Engine {
     }
 
     pub fn get_focused_tree_state(&self) -> Option<&TreeState> {
-        let name = match &self.focused {
+        let name = match &self.focus.current {
             Focus::Component(n) => n,
             Focus::None => return self.get_main_tree_state(),
         };
@@ -695,9 +714,9 @@ impl Engine {
     }
 
     pub fn get_selected_entity(&self) -> Option<&crate::protocol::Entity> {
-        let name = match &self.focused {
+        let name = match &self.focus.current {
             Focus::Component(n) => n,
-            Focus::None => self.main_tree_name.as_ref()?,
+            Focus::None => self.focus.main_tree_name.as_ref()?,
         };
         if let Some(Component::Tree(t)) = self.components.get(name) {
             return t.get_selected_entity();
@@ -708,15 +727,15 @@ impl Engine {
     pub fn prepare_key_binding_args(&self, key: &crossterm::event::KeyEvent, term_width: u16, term_height: u16) -> Option<(Vec<String>, bool)> {
         let (cmd_template_args, is_silent) = self.key_bindings.get(key)?;
 
-        let tree_name = match &self.focused {
+        let tree_name = match &self.focus.current {
             Focus::Component(n) => {
                 if matches!(self.components.get(n), Some(Component::Tree(_))) {
                     n.clone()
                 } else {
-                    self.main_tree_name.as_ref()?.clone()
+                    self.focus.main_tree_name.as_ref()?.clone()
                 }
             }
-            Focus::None => self.main_tree_name.as_ref()?.clone(),
+            Focus::None => self.focus.main_tree_name.as_ref()?.clone(),
         };
 
         let tree_state = if let Some(Component::Tree(t)) = self.components.get(&tree_name) {
@@ -740,7 +759,7 @@ impl Engine {
             .collect::<Vec<_>>()
             .join(" ");
 
-        let window_name = match &self.focused {
+        let window_name = match &self.focus.current {
             Focus::Component(n) => n.clone(),
             Focus::None => String::new(),
         };
@@ -855,13 +874,13 @@ impl Engine {
 
 
     pub fn get_main_tree_state(&self) -> Option<&TreeState> {
-        let name = self.main_tree_name.as_ref()?;
+        let name = self.focus.main_tree_name.as_ref()?;
         if let Some(Component::Tree(t)) = self.components.get(name) { Some(t) } else { None }
     }
 
     pub fn move_up_n(&mut self, n: usize, term_width: u16, term_height: u16) {
         self.last_error = None;
-        let focused_name = if let Focus::Component(name) = &self.focused { name.clone() } else { return; };
+        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
         if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
             for _ in 0..n {
                 if t.selected_idx > 0 {
@@ -878,7 +897,7 @@ impl Engine {
 
     pub fn move_down_n(&mut self, n: usize, term_width: u16, term_height: u16) {
         self.last_error = None;
-        let focused_name = if let Focus::Component(name) = &self.focused { name.clone() } else { return; };
+        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
         if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
             for _ in 0..n {
                 if t.selected_idx < t.visible_ids.len().saturating_sub(1) {
@@ -947,7 +966,7 @@ impl Engine {
     }
 
     pub fn apply_search(&mut self, query: &str, term_width: u16, term_height: u16) {
-        let focused_name = if let Focus::Component(name) = &self.focused { name.clone() } else { return };
+        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return };
         if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
             if query.is_empty() {
                 t.search_query = None;
@@ -1027,7 +1046,7 @@ impl Engine {
     }
 
     pub fn rebuild_draggable_edges(&mut self, term_width: u16, term_height: u16) {
-        self.cached_edges.clear();
+        self.drag.cached_edges.clear();
 
         // 获取所有叶子 Window 的物理 Rect
         let window_rects = self.calc_all_rects(term_width, term_height);
@@ -1039,13 +1058,13 @@ impl Engine {
         // 遍历所有图层，提取叶子之间的边
         for layer in &self.layout_layers {
             if !layer.visible { continue; }
-            Self::extract_edges_from_node(&layer.layout.layers[0].root, &w_map, layer.z_index, &mut self.cached_edges);
+            Self::extract_edges_from_node(&layer.layout.layers[0].root, &w_map, layer.z_index, &mut self.drag.cached_edges);
         }
 
         // 【新增】计算横竖线的交点，用于命中剔除
-        self.cached_intersections.clear();
-        let v_edges: Vec<_> = self.cached_edges.iter().filter(|e| e.direction == layout::Direction::Vertical).collect();
-        let h_edges: Vec<_> = self.cached_edges.iter().filter(|e| e.direction == layout::Direction::Horizontal).collect();
+        self.drag.cached_intersections.clear();
+        let v_edges: Vec<_> = self.drag.cached_edges.iter().filter(|e| e.direction == layout::Direction::Vertical).collect();
+        let h_edges: Vec<_> = self.drag.cached_edges.iter().filter(|e| e.direction == layout::Direction::Horizontal).collect();
         for v in &v_edges {
             for h in &h_edges {
                 let v_x = v.hit_rect.start_col + 1; // 竖线所在列
@@ -1057,7 +1076,7 @@ impl Engine {
                 let h_x_end = h.hit_rect.start_col + h.hit_rect.width;
 
                 if v_x >= h_x_start && v_x < h_x_end && h_y >= v_y_start && h_y < v_y_end {
-                    self.cached_intersections.push((v_x, h_y));
+                    self.drag.cached_intersections.push((v_x, h_y));
                 }
             }
         }

@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if let Some(ref id) = cli.select {
-        let focused_name = if let app::Focus::Component(name) = &engine.focused { name.clone() } else { String::new() };
+        let focused_name = if let app::Focus::Component(name) = &engine.focus.current { name.clone() } else { String::new() };
         if !focused_name.is_empty() {
             engine.select_id(&focused_name, id, 0, 0);
         }
@@ -192,7 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if key_event.kind != crossterm::event::KeyEventKind::Press { continue 'main_loop; }
 
                     // 【模态拖拽拦截】拖拽中吞掉所有键盘事件，直到鼠标松开
-                    if engine.drag_active {
+                    if engine.drag.active {
                         continue 'main_loop;
                     }
 
@@ -274,13 +274,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 Event::Mouse(mouse_event) => {
-                    if !engine.mouse_enabled { continue 'main_loop; }
+                    if !engine.mouse.enabled { continue 'main_loop; }
 
                     // 【重构】模态拖拽拦截：拖拽边框时，无视 Z 轴和窗口边界，全局响应 Drag 和 Up
-                    if engine.drag_active && engine.drag_resize_target.is_some() {
+                    if engine.drag.active && engine.drag.resize_target.is_some() {
                         match mouse_event.kind {
                             crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                                if let Some(app::DragTarget::ResizeEdge(ref primary, ref neighbor, dir)) = engine.drag_resize_target {
+                                if let Some(app::DragTarget::ResizeEdge(ref primary, ref neighbor, dir)) = engine.drag.resize_target {
                                     let all_rects_now = engine.calc_all_rects(columns, rows);
                                     let mr = all_rects_now.iter().find(|(_, n, _, _)| n == primary).map(|(r, _, b, _)| (*r, *b));
                                     let nr = all_rects_now.iter().find(|(_, n, _, _)| n == neighbor).map(|(r, _, b, _)| (*r, *b));
@@ -345,8 +345,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 // 3. 清空所有约束，把控制权交还给 Flexbox
                                 engine.window_rect_overrides.clear();
-                                engine.drag_active = false;
-                                engine.drag_resize_target = None;
+                                engine.drag.active = false;
+                                engine.drag.resize_target = None;
                                 continue 'main_loop;
                             }
                             _ => {}
@@ -356,7 +356,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     // 【终极重构 1】全局边界碰撞检测：无视 [drag] 属性，有缝就能拖
                     // 按 z_index 降序排序，保证高 Z 层（浮动窗口）的边界优先命中
-                    let mut sorted_edges: Vec<_> = engine.cached_edges.iter().collect();
+                    let mut sorted_edges: Vec<_> = engine.drag.cached_edges.iter().collect();
                     sorted_edges.sort_by(|a, b| b.z_index.cmp(&a.z_index));
 
                     let mut hit_edge = None;
@@ -375,7 +375,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // 如果命中了边界，且是鼠标左键按下，直接进入拖拽模态
                     // 【新增】交点盲区剔除：如果鼠标在交点附近，不响应边的拖拽
                     let mut in_intersection = false;
-                    for &(x, y) in &engine.cached_intersections {
+                    for &(x, y) in &engine.drag.cached_intersections {
                         if (mouse_event.column == x || mouse_event.column == x - 1) &&
                            (mouse_event.row == y || mouse_event.row == y - 1) {
                             in_intersection = true;
@@ -410,8 +410,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
 
-                                engine.drag_active = true;
-                                engine.drag_resize_target = Some(app::DragTarget::ResizeEdge(
+                                engine.drag.active = true;
+                                engine.drag.resize_target = Some(app::DragTarget::ResizeEdge(
                                     primary_id,
                                     neighbor_id,
                                     dir
@@ -432,10 +432,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if !in_x || !in_y { continue; }
 
                         // 命中！焦点切换 + 门禁检查
-                        let old_focus = engine.focused.clone();
-                        engine.focused = app::Focus::Component(name.clone());
+                        let old_focus = engine.focus.current.clone();
+                        engine.focus.current = app::Focus::Component(name.clone());
 
-                        if old_focus != engine.focused {
+                        if old_focus != engine.focus.current {
                             if let Some(app::Component::Tree(t)) = engine.components.get(name) {
                                 if t.focus_to_fire {
                                     engine.emit("focus", columns, rows);
@@ -463,9 +463,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                                             if let Some(ref cid) = clicked_id {
                                                 let now = std::time::Instant::now();
-                                                let is_double_click = engine.last_click_time
+                                                let is_double_click = engine.mouse.last_click_time
                                                     .map_or(false, |t| now.duration_since(t).as_millis() < 300)
-                                                    && engine.last_clicked_id.as_deref() == Some(cid.as_str());
+                                                    && engine.mouse.last_clicked_id.as_deref() == Some(cid.as_str());
 
                                                 let tree_name = name.clone();
 
@@ -473,11 +473,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     engine.select_id(&tree_name, cid, columns, rows);
                                                     engine.toggle_expand();
                                                     engine.emit("confirm", columns, rows);
-                                                    engine.last_click_time = None;
+                                                    engine.mouse.last_click_time = None;
                                                 } else {
                                                     engine.select_id(&tree_name, cid, columns, rows);
-                                                    engine.last_click_time = Some(now);
-                                                    engine.last_clicked_id = Some(cid.clone());
+                                                    engine.mouse.last_click_time = Some(now);
+                                                    engine.mouse.last_clicked_id = Some(cid.clone());
                                                     if click_to_fire {
                                                         engine.emit("click", columns, rows);
                                                     }
@@ -493,10 +493,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     } else {
                                                         t.marked_ids.insert(cid.clone());
                                                     }
-                                                    engine.drag_mode = !was_marked;
+                                                    engine.drag.mode = !was_marked;
                                                 }
-                                                engine.drag_start_idx = Some(target_idx);
-                                                engine.drag_active = true;
+                                                engine.drag.start_idx = Some(target_idx);
+                                                engine.drag.active = true;
                                             }
                                         }
                                         crossterm::event::MouseEventKind::ScrollUp => {
@@ -506,13 +506,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             engine.move_down_n(scroll_step as usize, columns, rows);
                                         }
                                         crossterm::event::MouseEventKind::Up(_) => {
-                                            engine.drag_active = false;
-                                            engine.drag_start_idx = None;
-                                            engine.drag_resize_target = None;
+                                            engine.drag.active = false;
+                                            engine.drag.start_idx = None;
+                                            engine.drag.resize_target = None;
                                         }
                                         crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Right) => {
-                                            if engine.drag_active {
-                                                if let Some(start_idx) = engine.drag_start_idx {
+                                            if engine.drag.active {
+                                                if let Some(start_idx) = engine.drag.start_idx {
                                                     let clamped_target = target_idx.min(t.visible_ids.len().saturating_sub(1));
                                                     let range = if clamped_target >= start_idx {
                                                         start_idx..=clamped_target
@@ -522,7 +522,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     if let Some(app::Component::Tree(t)) = engine.components.get_mut(name) {
                                                         for i in range {
                                                             if let Some(id) = t.visible_ids.get(i) {
-                                                                if engine.drag_mode {
+                                                                if engine.drag.mode {
                                                                     t.marked_ids.insert(id.clone());
                                                                 } else {
                                                                     t.marked_ids.remove(id);
@@ -565,7 +565,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stdout().execute(terminal::LeaveAlternateScreen)?;
     let _ = std::fs::remove_file(std::env::var("STREE_SOCK").unwrap_or_default());
 
-    if let app::Focus::Component(name) = &engine.focused {
+    if let app::Focus::Component(name) = &engine.focus.current {
         if let Some(app::Component::Tree(t)) = engine.components.get(name) {
             if let Some(id) = &t.selected_id { println!("{}", id); }
         }
