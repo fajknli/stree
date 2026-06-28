@@ -84,10 +84,6 @@ pub struct Engine {
     /// 窗口级别的运行时尺寸覆盖（拖拽产生，存储 Absolute 用于当前渲染）
     pub window_rect_overrides: std::collections::HashMap<String, layout::WindowSize>,
 
-    /// 【新增】延迟池：存储松手时算好的 Percent，等待终端 Resize 时激活
-    pub pending_percent_overrides: std::collections::HashMap<String, layout::WindowSize>,
-
-
     // 信号防抖与状态追踪
     pub last_signal_emit: HashMap<String, Instant>,
     pub last_emitted_select_id: Option<String>,
@@ -270,7 +266,6 @@ impl Engine {
             drag_active: false,
             drag_resize_target: None,
             window_rect_overrides: std::collections::HashMap::new(),
-            pending_percent_overrides: std::collections::HashMap::new(), // 【新增】
             last_signal_emit: HashMap::new(),
             last_emitted_select_id: None,
             cached_edges: Vec::new(),
@@ -724,7 +719,6 @@ impl Engine {
     pub fn handle_ipc_update(&mut self, target: &str, data: &str, term_width: u16, term_height: u16) {
         if target == "@layout-reset" {
             self.window_rect_overrides.clear();
-            self.pending_percent_overrides.clear(); // 【新增】
             return;
         }
         if let Some(layer_name) = target.strip_prefix("@layout-reset ") {
@@ -1435,14 +1429,8 @@ impl Engine {
 
                 let overhead = match child {
                     layout::LayoutNode::Window { border, .. } => {
-                        match (dir_val, border) { // 这里用 dir_val
-                            (layout::Direction::Horizontal, layout::BorderStyle::Box) => 2,
-                            (layout::Direction::Horizontal, layout::BorderStyle::Line) => 0,
-                            (layout::Direction::Horizontal, layout::BorderStyle::None) => 0,
-                            (layout::Direction::Vertical, layout::BorderStyle::Box) => 2,
-                            (layout::Direction::Vertical, layout::BorderStyle::Line) => 1,
-                            (layout::Direction::Vertical, layout::BorderStyle::None) => 0,
-                        }
+                        let (ox, oy) = border.overhead();
+                        if dir_val == layout::Direction::Horizontal { ox } else { oy }
                     },
                     layout::LayoutNode::Container { .. } => 0,
                 };

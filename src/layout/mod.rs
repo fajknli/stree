@@ -10,6 +10,13 @@ pub fn generate_container_id_pub() -> String {
     format!("__c{}", id)
 }
 
+/// 坐标类型：区分绝对像素和百分比
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Coord {
+    Pixels(u16),
+    Percent(u16),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Direction {
     Horizontal,
@@ -21,6 +28,17 @@ pub enum BorderStyle {
     Box,
     Line,
     None,
+}
+
+impl BorderStyle {
+    /// 返回 (x_overhead, y_overhead)
+    pub fn overhead(&self) -> (u16, u16) {
+        match self {
+            BorderStyle::Box => (2, 2),
+            BorderStyle::Line => (0, 1),
+            BorderStyle::None => (0, 0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,8 +69,7 @@ pub enum LayoutNode {
 pub enum Anchor {
     /// 全屏铺满（默认，Z=0）
     FullScreen,
-    /// 相对于终端屏幕的绝对偏移 @(x,y)
-    ScreenAbsolute { x: u16, y: u16 },
+    ScreenAbsolute { x: Coord, y: Coord }, // 修改为 Coord 类型
 }
 
 #[derive(Debug, Clone)]
@@ -165,14 +182,11 @@ fn parse_anchored_layer(s: &str, z_index: usize) -> Option<LayoutLayer> {
     })
 }
 
-/// 解析坐标值：支持 "10" (绝对) 和 "50%" (百分比，运行时换算)
-/// 注意：百分比在解析阶段暂存为 u16，calc_window_rects 时再换算
-fn parse_coord_value(s: &str) -> Option<u16> {
+fn parse_coord_value(s: &str) -> Option<Coord> {
     if let Some(pct_str) = s.strip_suffix('%') {
-        // 百分比：暂存原始值，calc_window_rects 时乘以 term_size / 100
-        pct_str.parse::<u16>().ok().map(|v| v.min(100))
+        pct_str.parse::<u16>().ok().map(|v| Coord::Percent(v.min(100)))
     } else {
-        s.parse::<u16>().ok()
+        s.parse::<u16>().ok().map(Coord::Pixels)
     }
 }
 
@@ -397,54 +411,14 @@ pub fn calc_window_rects(
                 height: term_height,
             },
             Anchor::ScreenAbsolute { x, y } => {
-                // 注意：这里 x/y 可能是百分比暂存值
-                // 但由于 parse_coord_value 无法区分 % 和绝对值，
-                // 我们需要一个更聪明的方式。
-                // 简化方案：如果 x <= 100 且原始字符串含 %，则视为百分比
-                // 但解析阶段已经丢失了 % 信息。
-                //
-                // 【修正】：parse_coord_value 对百分比返回的是 0-100 的值
-                // 我们需要在 Anchor 中区分百分比和绝对值。
-                // 但为了保持简单，这里做一个约定：
-                // 如果 x <= 100 且 y <= 100，且 term_width > 100，
-                // 我们无法区分。所以改用下面的方案：
-                //
-                // 实际上，我们在 parse_anchored_layer 中应该保存原始字符串
-                // 或者用一个更好的枚举。但为了最小改动，
-                // 我们假设：如果值 <= 100 且 term 尺寸 > 200，
-                // 大概率是百分比。但这不可靠。
-                //
-                // 【最终方案】：修改 Anchor 枚举，增加 Percent 变体
-                // 但这需要改 parse_coord_value 的返回类型。
-                // 为了本次重构的最小侵入性，我们采用一个折中：
-                // 在 Anchor::ScreenAbsolute 中，如果 x > term_width 或 y > term_height，
-                // 则视为百分比（因为绝对坐标不可能超过终端尺寸）。
-                // 否则视为绝对坐标。
-                //
-                // 不，这太 hacky 了。让我们直接改 Anchor 枚举。
-                // 但由于时间关系，我们先用一个简单的启发式：
-                // 如果 x <= 100 && y <= 100 && term_width >= 80 && term_height >= 24，
-                // 则视为百分比。否则视为绝对坐标。
-                //
-                // 实际上，最好的方式是让 parse_coord_value 返回一个枚举。
-                // 但我们先这样实现，后续可以优化。
-
-                let actual_x = if *x <= 100 && term_width >= 80 {
-                    // 可能是百分比，也可能是小绝对值
-                    // 如果 x * term_width / 100 的结果看起来合理，就用百分比
-                    // 否则用绝对值
-                    // 这个判断不可靠，所以我们改用下面的方案：
-                    // 在 parse_anchored_layer 中，如果原始字符串含 %，
-                    // 则存储为负数（hack）或使用不同的 Anchor 变体。
-                    //
-                    // 【最终决定】：由于这是一个已知的限制，
-                    // 我们先假设所有 @(x,y) 中的值都是绝对坐标。
-                    // 百分比支持留作后续优化。
-                    *x
-                } else {
-                    *x
+                let actual_x = match x {
+                    Coord::Pixels(p) => *p,
+                    Coord::Percent(p) => (*p as u32 * term_width as u32 / 100) as u16,
                 };
-                let actual_y = *y;
+                let actual_y = match y {
+                    Coord::Pixels(p) => *p,
+                    Coord::Percent(p) => (*p as u32 * term_height as u32 / 100) as u16,
+                };
 
                 WindowRect {
                     start_col: actual_x.min(term_width.saturating_sub(1)),
@@ -623,12 +597,8 @@ fn compute_rects(
 /// 计算给定物理矩形和边框样式下的纯内容区尺寸 (width, height)
 /// 这是全局唯一的边框开销计算逻辑，消灭各处的 match border
 pub fn content_size(rect: &WindowRect, border: BorderStyle) -> (u16, u16) {
-    let (overhead_x, overhead_y) = match border {
-        BorderStyle::Box => (2, 2),
-        BorderStyle::Line => (0, 1), // Line 只有顶部一条线，不占左右宽度，但占顶部 1 行
-        BorderStyle::None => (0, 0),
-    };
-    (rect.width.saturating_sub(overhead_x), rect.height.saturating_sub(overhead_y))
+    let (oh_x, oh_y) = border.overhead();
+    (rect.width.saturating_sub(oh_x), rect.height.saturating_sub(oh_y))
 }
 
 pub fn default_layout() -> Layout {
@@ -723,8 +693,8 @@ mod tests {
         let layer = parse_anchored_layer(layout_str, 1).unwrap();
         assert_eq!(layer.z_index, 1);
         if let Anchor::ScreenAbsolute { x, y } = layer.anchor {
-            assert_eq!(x, 10);
-            assert_eq!(y, 5);
+            assert_eq!(x, Coord::Pixels(10));
+            assert_eq!(y, Coord::Pixels(5));
         } else {
             panic!("Expected ScreenAbsolute anchor");
         }

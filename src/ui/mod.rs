@@ -46,9 +46,9 @@ pub struct WindowRenderer<'a, W: Write> {
 
 impl<'a, W: Write> WindowRenderer<'a, W> {
     pub fn new(out: &'a mut W, rect: WindowRect, border: BorderStyle) -> Self {
-        let (offset_x, offset_y, overhead_x, overhead_y) = match border {
+        let (offset_x, offset_y, oh_x, oh_y) = match border {
             BorderStyle::Box => (1, 1, 2, 2),
-            BorderStyle::Line => (0, 1, 0, 1), // Line 顶部有一根线，Y偏移1，高度减1
+            BorderStyle::Line => (0, 1, 0, 1),
             BorderStyle::None => (0, 0, 0, 0),
         };
         Self {
@@ -56,8 +56,8 @@ impl<'a, W: Write> WindowRenderer<'a, W> {
             rect,
             offset_x,
             offset_y,
-            content_w: rect.width.saturating_sub(overhead_x),
-            content_h: rect.height.saturating_sub(overhead_y),
+            content_w: rect.width.saturating_sub(oh_x),
+            content_h: rect.height.saturating_sub(oh_y),
         }
     }
 
