@@ -39,6 +39,7 @@ impl BindConfig {
             ("up", "__UP__"), ("k", "__UP__"), ("down", "__DOWN__"), ("j", "__DOWN__"),
             ("left", "__EXPAND__"), ("h", "__EXPAND__"), ("right", "__EXPAND__"), ("l", "__EXPAND__"),
             ("space", "__MARK__"), ("g", "__TOP__"), ("G", "__BOTTOM__"),
+            ("H", "__SCROLL_LEFT__"), ("L", "__SCROLL_RIGHT__"),
             ("/", "__ACTIVATE_SEARCH__"), (":", "__ACTIVATE_CMD__"), ("enter", "__ENTER__"),
         ];
         for (key_desc, cmd) in defaults {
@@ -70,7 +71,22 @@ impl BindConfig {
     }
 
     pub fn get(&self, key: &KeyEvent) -> Option<&(Vec<String>, bool)> {
-        let k = KeyBindingKey(key.code, key.modifiers);
+        let mut code = key.code;
+        let mut modifiers = key.modifiers;
+
+        // 【修复终端兼容性】：将终端发来的 Shift + 字母 统一规范化为 NONE + 大写字母
+        if modifiers == KeyModifiers::SHIFT {
+            if let KeyCode::Char(c) = code {
+                if c.is_ascii_alphabetic() {
+                    modifiers = KeyModifiers::NONE;
+                    if c.is_ascii_lowercase() {
+                        code = KeyCode::Char(c.to_ascii_uppercase());
+                    }
+                }
+            }
+        }
+
+        let k = KeyBindingKey(code, modifiers);
         self.bindings.get(&k)
     }
 

@@ -20,6 +20,8 @@ pub struct TreeState {
     pub click_to_fire: bool,   // click: 前缀
     pub focus_to_fire: bool,   // focus: 前缀
     pub search_query: Option<String>, // 【新增】搜索状态
+    pub h_scroll: usize,
+    pub v_scroll: usize,
 }
 
 impl TreeState {
@@ -146,14 +148,15 @@ impl TreeState {
 
     pub fn select_id(&mut self, id: &str) {
         if self.dataset.entity_map.contains_key(id) {
+            self.selected_id = Some(id.to_string());
             if let Some(idx) = self.visible_ids.iter().position(|v| v == id) {
                 self.selected_idx = idx;
-                self.selected_id = Some(id.to_string());
             } else {
-                self.selected_idx = 0;
-                self.selected_id = self.visible_ids.first().cloned();
+                // 【修复 Bug #12】节点存在但不可见（被折叠），保持选中 ID 不变，但不强行跳到第一项
+                // 不修改 selected_idx，防止视图跳动
             }
         } else {
+            // ID 不在数据集中（例如数据集更新丢失了该节点），重置到第一个可见项
             self.selected_idx = 0;
             self.selected_id = self.visible_ids.first().cloned();
         }

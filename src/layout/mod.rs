@@ -43,7 +43,7 @@ impl BorderStyle {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WindowSize {
-    Percent(u16),
+    Percent(u16), // 【升级】万分比精度：0 = 0.00%, 10000 = 100.00%
     Absolute(u16),
 }
 
@@ -57,7 +57,7 @@ pub enum LayoutNode {
         draggable: bool,
     },
     Container {
-        id: String, // 【新增】隐式 ID，用于 Overrides 和边界定位
+        id: String,
         direction: Direction,
         percent: Option<u16>,
         children: Vec<LayoutNode>,
@@ -67,24 +67,40 @@ pub enum LayoutNode {
 /// 锚点类型：决定该图层的根 Rect 如何计算
 #[derive(Debug, Clone)]
 pub enum Anchor {
-    /// 全屏铺满（默认，Z=0）
     FullScreen,
-    ScreenAbsolute { x: Coord, y: Coord }, // 修改为 Coord 类型
+    ScreenAbsolute { x: Coord, y: Coord },
 }
 
 #[derive(Debug, Clone)]
 pub struct LayoutLayer {
-    pub name: Option<String>,              // ← 层名，用于 IPC 重置和拖拽锚定
-    pub z_index: usize,                    // ← 声明顺序即 Z 轴
-    pub anchor: Anchor,                    // ← 定位方式 (FullScreen / ScreenAbsolute)
-    pub root: LayoutNode,                  // ← 内部 Flexbox 树
-    pub visible: bool,                     // ← 【新增】显隐状态，默认 true
-    pub runtime_rect_override: Option<WindowRect>, // ← 【新增】拖拽产生的临时覆盖
+    pub name: Option<String>,
+    pub z_index: usize,
+    pub anchor: Anchor,
+    pub root: LayoutNode,
+    pub visible: bool,
+    pub runtime_rect_override: Option<WindowRect>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Layout {
     pub layers: Vec<LayoutLayer>,
+}
+
+/// 解析百分比字符串为万分比 u16 (0-10000)
+fn parse_percent_to_mille(s: &str) -> Option<u16> {
+    if let Some(dot) = s.find('.') {
+        let int_part = s[..dot].parse::<u16>().unwrap_or(0);
+        let frac_part = &s[dot+1..];
+        // 取前两位小数，不足补0
+        let mut chars = frac_part.chars();
+        let c1 = chars.next().unwrap_or('0');
+        let c2 = chars.next().unwrap_or('0');
+        let frac_str = format!("{}{}", c1, c2);
+        let frac = frac_str.parse::<u16>().unwrap_or(0);
+        Some((int_part * 100 + frac).min(10000))
+    } else {
+        s.parse::<u16>().ok().map(|v| (v * 100).min(10000))
+    }
 }
 
 impl Layout {
@@ -93,11 +109,9 @@ impl Layout {
         if s.is_empty() {
             return default_layout();
         }
-        // 尝试解析为带锚点的浮动布局
         if let Some(layer) = parse_anchored_layer(s, 0) {
             return Layout { layers: vec![layer] };
         }
-        // 否则解析为全屏 Flexbox 布局
         match parse_node(s) {
             Some(node) => Layout {
                 layers: vec![LayoutLayer {
@@ -126,7 +140,6 @@ pub fn parse_layouts(layout_args: &[String]) -> Layout {
     for (i, arg) in layout_args.iter().enumerate() {
         let s = arg.trim();
         if s.is_empty() { continue; }
-        // 尝试解析为带锚点的浮动布局
         if let Some(mut layer) = parse_anchored_layer(s, i) {
             layer.z_index = i;
             layers.push(layer);
@@ -160,7 +173,6 @@ fn parse_anchored_layer(s: &str, z_index: usize) -> Option<LayoutLayer> {
     let coords_str = &s[2..close_paren];
     let rest = s[close_paren + 1..].trim();
 
-    // 解析 x,y 坐标（支持绝对值和百分比）
     let parts: Vec<&str> = coords_str.splitn(2, ',').collect();
     if parts.len() != 2 {
         eprintln!("[WARN] @() 坐标格式无效，期望 @(x,y): {}", s);
@@ -173,7 +185,7 @@ fn parse_anchored_layer(s: &str, z_index: usize) -> Option<LayoutLayer> {
     let node = parse_node(rest)?;
 
     Some(LayoutLayer {
-        name: None,  // 后续可从 node 中提取
+        name: None,
         z_index,
         anchor: Anchor::ScreenAbsolute { x, y },
         root: node,
@@ -190,7 +202,6 @@ fn parse_coord_value(s: &str) -> Option<Coord> {
     }
 }
 
-/// 检查字符串中是否存在不在 () 和 [] 内部的顶层逗号
 fn has_top_level_comma(s: &str) -> bool {
     let mut depth_paren = 0;
     let mut depth_bracket = 0;
@@ -215,7 +226,6 @@ fn parse_node(s: &str) -> Option<LayoutNode> {
         parse_container(s, Direction::Vertical)
     } else if has_top_level_comma(s) {
         let children = parse_children(s)?;
-        // 确保真的分割出了多个子节点，否则退化为窗口解析
         if children.len() > 1 {
             Some(LayoutNode::Container {
                 id: generate_container_id_pub(),
@@ -240,7 +250,6 @@ fn parse_container(s: &str, dir: Direction) -> Option<LayoutNode> {
 
     let inside = &s[open_paren + 1..close_paren].trim();
 
-    // 【修复】安全地查找第一个不在括号内的逗号
     let (percent, children_str): (Option<u16>, &str) = {
         let mut depth_paren = 0;
         let mut depth_bracket = 0;
@@ -262,7 +271,8 @@ fn parse_container(s: &str, dir: Direction) -> Option<LayoutNode> {
         if let Some(comma_pos) = first_comma {
             let potential_pct = inside[..comma_pos].trim();
             if let Some(p_str) = potential_pct.strip_suffix('%') {
-                let p = p_str.parse::<u16>().ok().map(|v| v.min(100));
+                // 【升级】支持万分比
+                let p = parse_percent_to_mille(p_str);
                 (p, &inside[comma_pos + 1..])
             } else {
                 (None, inside)
@@ -288,8 +298,8 @@ fn parse_container(s: &str, dir: Direction) -> Option<LayoutNode> {
 
 fn parse_children(s: &str) -> Option<Vec<LayoutNode>> {
     let mut children = Vec::new();
-    let mut depth_paren = 0;   // 跟踪 ()
-    let mut depth_bracket = 0; // 跟踪 []
+    let mut depth_paren = 0;
+    let mut depth_bracket = 0;
     let mut start = 0;
 
     for (i, c) in s.char_indices() {
@@ -298,7 +308,6 @@ fn parse_children(s: &str) -> Option<Vec<LayoutNode>> {
             ')' => depth_paren -= 1,
             '[' => depth_bracket += 1,
             ']' => depth_bracket -= 1,
-            // 只有在所有括号都闭合时，逗号才是分隔符
             ',' if depth_paren == 0 && depth_bracket == 0 => {
                 if let Some(child) = parse_node(&s[start..i]) {
                     children.push(child);
@@ -336,7 +345,8 @@ fn parse_window(s: &str) -> Option<LayoutNode> {
         let close = rest.find(')')?;
         let size_str = rest[1..close].trim();
         let sz = if let Some(p_str) = size_str.strip_suffix('%') {
-            Some(WindowSize::Percent(p_str.parse::<u16>().ok()?.min(100)))
+            // 【升级】支持万分比
+            Some(WindowSize::Percent(parse_percent_to_mille(p_str)?))
         } else if size_str.is_empty() {
             None
         } else {
@@ -350,7 +360,6 @@ fn parse_window(s: &str) -> Option<LayoutNode> {
     let (rest_after_border, border, draggable) = if rest_after_size.starts_with('[') {
         let close = rest_after_size.find(']')?;
         let b_str = rest_after_size[1..close].trim();
-        // 支持 [box,drag] / [line,drag] / [drag] / [none] 等组合
         let parts: Vec<&str> = b_str.split(',').map(|s| s.trim()).collect();
         let drag = parts.contains(&"drag");
         let b = if parts.contains(&"line") {
@@ -383,7 +392,7 @@ fn parse_window(s: &str) -> Option<LayoutNode> {
     Some(LayoutNode::Window { name, size, border, border_chars: None, draggable })
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct WindowRect {
     pub start_col: u16,
     pub start_row: u16,
@@ -391,18 +400,16 @@ pub struct WindowRect {
     pub height: u16,
 }
 
-/// 计算所有图层的所有窗口区域
-/// 返回值增加 z_index，用于渲染排序和鼠标命中测试
 pub fn calc_window_rects(
-    layout: &Layout,
+    layers: &[LayoutLayer],
     term_width: u16,
     term_height: u16,
     overrides: &std::collections::HashMap<String, WindowSize>,
 ) -> Vec<(WindowRect, String, BorderStyle, usize)> {
     let mut all_rects = Vec::new();
 
-    for layer in &layout.layers {
-        // 根据 Anchor 计算本层的虚拟画布
+    for layer in layers {
+        if !layer.visible { continue; }
         let canvas = match &layer.anchor {
             Anchor::FullScreen => WindowRect {
                 start_col: 0,
@@ -429,11 +436,9 @@ pub fn calc_window_rects(
             }
         };
 
-        // 在该画布内执行标准 Flexbox 计算
         let mut layer_rects = Vec::new();
         compute_rects(&layer.root, canvas, &mut layer_rects, overrides);
 
-        // 附加 z_index
         for (rect, name, border) in layer_rects {
             all_rects.push((rect, name, border, layer.z_index));
         }
@@ -442,7 +447,7 @@ pub fn calc_window_rects(
     all_rects
 }
 
-// 纯粹的 Flexbox 空间分配算法（保持不变）
+// 纯粹的 Flexbox 空间分配算法（最大余数法）
 fn compute_rects(
     node: &LayoutNode,
     rect: WindowRect,
@@ -454,6 +459,14 @@ fn compute_rects(
             rects.push((rect, name.clone(), *border));
         }
         LayoutNode::Container { direction, children, .. } => {
+            // 【视觉扁平化】：单子节点直接穿透，无视方向差异！
+            if children.len() == 1 {
+                if let LayoutNode::Container { .. } = &children[0] {
+                    compute_rects(&children[0], rect, rects, overrides);
+                    return;
+                }
+            }
+
             let total_len = match direction {
                 Direction::Horizontal => rect.width,
                 Direction::Vertical => rect.height,
@@ -495,14 +508,14 @@ fn compute_rects(
 
             let mut content_sizes: Vec<u16> = Vec::with_capacity(children.len());
 
-            let pct_base = if undeclared_count > 0 && declared_pct_sum <= 100 {
-                100
+            // 【修复】万分比基数：10000
+            let pct_base = if undeclared_count > 0 && declared_pct_sum <= 10000 {
+                10000
             } else {
                 declared_pct_sum.max(1)
             };
 
-            let mut allocated_flex: u16 = 0;
-
+            // ================ Phase 1: 基础整数分配 ================
             for child in children.iter() {
                 let child_size = match child {
                     LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
@@ -519,41 +532,94 @@ fn compute_rects(
                     None => 0,
                 };
                 content_sizes.push(s);
-
-                if !matches!(child_size, Some(WindowSize::Absolute(_))) {
-                    allocated_flex = allocated_flex.saturating_add(s);
-                }
             }
 
-            // 【核心补丁：余数均摊，彻底消灭右边空隙】
-            let allocated_sum: u16 = content_sizes.iter().sum();
-            let mut remainder = flex_len.saturating_sub(allocated_sum);
+            // ================ Phase 2: 为 undeclared 节点分配公平份额 ================
+            if undeclared_count > 0 {
+                let declared_allocated: u16 = children.iter().enumerate()
+                    .filter_map(|(i, child)| {
+                        let child_size = match child {
+                            LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
+                            LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or_else(|| percent.map(WindowSize::Percent)),
+                        };
+                        if matches!(child_size, Some(WindowSize::Percent(_))) { Some(content_sizes[i]) } else { None }
+                    })
+                    .sum();
 
-            // 【修复】：轮流分摊余数，直到分完为止，杜绝提前退出
-            if remainder > 0 {
-                let n = children.len();
-                let mut idx = 0;
-                let mut consecutive_skips = 0;
-                while remainder > 0 && consecutive_skips < n {
-                    let child_size = match &children[idx] {
+                let undeclared_total = flex_len.saturating_sub(declared_allocated);
+                let undeclared_share = undeclared_total / undeclared_count;
+                let mut undeclared_rem = undeclared_total % undeclared_count;
+
+                for (i, child) in children.iter().enumerate() {
+                    let child_size = match child {
                         LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
                         LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or_else(|| percent.map(WindowSize::Percent)),
                     };
-                    // 只有非 Absolute 的节点才能吸收余数
-                    if !matches!(child_size, Some(WindowSize::Absolute(_))) {
-                        content_sizes[idx] += 1;
-                        remainder -= 1;
-                        consecutive_skips = 0; // 成功分配，重置计数器
-                    } else {
-                        consecutive_skips += 1; // 无法分配，计数器+1
+                    if child_size.is_none() {
+                        content_sizes[i] = undeclared_share;
+                        if undeclared_rem > 0 {
+                            content_sizes[i] += 1;
+                            undeclared_rem -= 1;
+                        }
                     }
-                    idx = (idx + 1) % n; // 循环回到开头
                 }
             }
 
-            // 极端兜底：如果还有剩余（比如全都是 Absolute 且空间不够），强塞给最后一个
+            // ================ Phase 3: 最大余数法分配全局余数 ================
+            let non_absolute_sum: u16 = children.iter().enumerate()
+                .filter_map(|(i, child)| {
+                    let child_size = match child {
+                        LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
+                        LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or_else(|| percent.map(WindowSize::Percent)),
+                    };
+                    if !matches!(child_size, Some(WindowSize::Absolute(_))) { Some(content_sizes[i]) } else { None }
+                })
+                .sum();
+            let remainder = flex_len.saturating_sub(non_absolute_sum) as usize;
+
             if remainder > 0 {
-                if let Some(last) = content_sizes.last_mut() { *last += remainder; }
+                let undeclared_each_pct: u32 = if undeclared_count > 0 && pct_base > 0 {
+                    (pct_base as u32).saturating_sub(declared_pct_sum as u32) / undeclared_count as u32
+                } else {
+                    0
+                };
+
+                let mut fractional_parts: Vec<(usize, u64)> = Vec::new();
+                for (i, child) in children.iter().enumerate() {
+                    let child_size = match child {
+                        LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
+                        LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or_else(|| percent.map(WindowSize::Percent)),
+                    };
+                    if !matches!(child_size, Some(WindowSize::Absolute(_))) {
+                        let exact_x10000: u64 = match child_size {
+                            Some(WindowSize::Percent(p)) => {
+                                if pct_base == 0 { 0 } else {
+                                    flex_len as u64 * p as u64 * 10000 / pct_base as u64
+                                }
+                            }
+                            None => {
+                                if pct_base == 0 { 0 } else {
+                                    flex_len as u64 * undeclared_each_pct as u64 * 10000 / pct_base as u64
+                                }
+                            }
+                            _ => 0,
+                        };
+                        let frac = exact_x10000 % 10000;
+                        fractional_parts.push((i, frac));
+                    }
+                }
+
+                fractional_parts.sort_by(|a, b| b.1.cmp(&a.1));
+
+                for (idx, _) in fractional_parts.iter().take(remainder) {
+                    content_sizes[*idx] += 1;
+                }
+
+                let distributed = fractional_parts.len().min(remainder);
+                let leftover = remainder - distributed;
+                if leftover > 0 {
+                    if let Some(last) = content_sizes.last_mut() { *last += leftover as u16; }
+                }
             }
 
             let mut physical_sizes: Vec<u16> = Vec::with_capacity(children.len());
@@ -594,8 +660,7 @@ fn compute_rects(
     }
 }
 
-/// 计算给定物理矩形和边框样式下的纯内容区尺寸 (width, height)
-/// 这是全局唯一的边框开销计算逻辑，消灭各处的 match border
+/// 计算给定物理矩形和边框样式下的纯内容区尺寸
 pub fn content_size(rect: &WindowRect, border: BorderStyle) -> (u16, u16) {
     let (oh_x, oh_y) = border.overhead();
     (rect.width.saturating_sub(oh_x), rect.height.saturating_sub(oh_y))
@@ -633,7 +698,7 @@ mod tests {
     fn test_parse_percentage() {
         let node = parse_window("area(50%):Main").unwrap();
         if let LayoutNode::Window { size, draggable: false, .. } = node {
-            assert_eq!(size, Some(WindowSize::Percent(50)));
+            assert_eq!(size, Some(WindowSize::Percent(5000))); // 50% -> 5000
         } else {
             panic!("Expected Window node");
         }
@@ -663,14 +728,15 @@ mod tests {
     fn test_flexbox_remainder_handling() {
         let layout_str = "horizontal(area(33%)[none]:A, area(33%)[none]:B, area(33%)[none]:C)";
         let layout = Layout::parse(layout_str);
-        let rects = calc_window_rects(&layout, 100, 10);
+        let rects = calc_window_rects(&layout.layers, 100, 10);
 
         assert_eq!(rects.len(), 3);
 
         let total_width: u16 = rects.iter().map(|(r, _, _, _)| r.width).sum();
-        assert_eq!(total_width, 99);
+        assert_eq!(total_width, 100);
 
-        assert_eq!(rects[0].0.width, 33);
+        // 3 个 33% 的小数部分相同，第一个获得余数
+        assert_eq!(rects[0].0.width, 34);
         assert_eq!(rects[1].0.width, 33);
         assert_eq!(rects[2].0.width, 33);
     }
@@ -679,7 +745,7 @@ mod tests {
     fn test_undeclared_nodes_share_remaining() {
         let layout_str = "horizontal(area(50%)[none]:A, area[none]:B, area[none]:C)";
         let layout = Layout::parse(layout_str);
-        let rects = calc_window_rects(&layout, 100, 10);
+        let rects = calc_window_rects(&layout.layers, 100, 10);
 
         assert_eq!(rects.len(), 3);
         assert_eq!(rects[0].0.width, 50);
@@ -709,16 +775,14 @@ mod tests {
         let layout = parse_layouts(&layouts);
         assert_eq!(layout.layers.len(), 2);
 
-        let rects = calc_window_rects(&layout, 100, 50);
-        // A, B, Popup = 3 个窗口
+        let rects = calc_window_rects(&layout.layers, 100, 50);
         assert_eq!(rects.len(), 3);
 
-        // Popup 应该在 (10,5) 位置
         let popup = rects.iter().find(|(_, name, _, _)| name == "Popup").unwrap();
         assert_eq!(popup.0.start_col, 10);
         assert_eq!(popup.0.start_row, 5);
         assert_eq!(popup.0.width, 20);
         assert_eq!(popup.0.height, 10);
-        assert_eq!(popup.3, 1); // z_index = 1
+        assert_eq!(popup.3, 1);
     }
 }

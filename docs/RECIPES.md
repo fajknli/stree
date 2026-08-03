@@ -77,7 +77,7 @@ TARGET_UID="$1"
 nohup sh -c "
     # 模拟耗时的 AI 调用（实际中可能是 ollama、openai-cli 等）
     RESULT=\$(ollama run llama3 \"Summarize: \$(get-content $TARGET_UID)\" 2>/dev/null)
-    
+
     # 任务完成后，通过 IPC 将结果推送到 Preview 窗口
     echo \"\$RESULT\" | stree update Preview
 " >/dev/null 2>&1 &
@@ -123,14 +123,14 @@ while true; do
     GIT_BRANCH=$(git branch --show-current 2>/dev/null || echo "no-git")
     TODO_COUNT=$(grep -rl "TODO" ~/notes 2>/dev/null | wc -l)
     LOAD=$(uptime | awk -F'load average:' '{print $2}' | cut -d, -f1)
-    
+
     # 拼装状态文本
     # 注意：这里可以直接使用 {stree_...} 占位符，引擎会再次解析
     STATUS_TEXT="[Git: $GIT_BRANCH] [TODO: $TODO_COUNT] [Load: $LOAD] | {stree_visible}/{stree_total} ({stree_marked} marked)"
-    
+
     # 通过 IPC 强行覆盖 Status 组件的文本
     echo "$STATUS_TEXT" | stree update Status 2>/dev/null
-    
+
     sleep 5
 done
 ```
@@ -183,12 +183,12 @@ case "$MIME" in
         # 文本文件：使用 bat 高亮，适配窗口宽度
         bat --terminal-width="$WIDTH" --color=always --style=plain "$FILE"
         ;;
-    
+
     application/pdf)
         # PDF：提取文本，限制行数防止刷屏
         pdftotext -layout "$FILE" - | head -n "$HEIGHT"
         ;;
-    
+
     image/*)
         # 图片：使用 chafa 转字符画（需安装 chafa）
         if command -v chafa >/dev/null 2>&1; then
@@ -198,7 +198,7 @@ case "$MIME" in
             echo "[Install 'chafa' for ASCII art preview]"
         fi
         ;;
-    
+
     application/zip|application/x-tar|application/gzip)
         # 压缩包：列出内容
         case "$MIME" in
@@ -207,13 +207,13 @@ case "$MIME" in
             application/gzip)    tar -tzvf "$FILE" ;;
         esac
         ;;
-    
+
     audio/*)
         # 音频：显示元信息
         echo "[Audio: $FILE]"
         ffprobe -v quiet -show_entries format=duration,bit_rate -of default=noprint_wrappers=1 "$FILE" 2>/dev/null
         ;;
-    
+
     *)
         echo "[Unknown binary: $MIME]"
         echo "[Size: $(du -h "$FILE" | cut -f1)]"
@@ -292,7 +292,7 @@ stree \
 for path in "$@"; do
     [ -z "$path" ] && continue
     [ ! -f "$path" ] && continue
-    
+
     # 执行归档逻辑
     mv "$path" "${path}.archived"
     echo "Archived: $path"
@@ -385,17 +385,17 @@ for file in *.md; do
     status="live"
     priority="normal"
     git_status="clean"
-    
+
     # 检测 Git 状态
     if git ls-files --modified | grep -q "$file"; then
         git_status="modified"
     fi
-    
+
     # 检测优先级（假设 frontmatter 中有 priority 字段）
     if grep -q "priority: high" "$file"; then
         priority="high"
     fi
-    
+
     # 输出 4 列 TSV，第 4 列为标签集
     echo -e "$id\t$id\t$file\t$status,$type,$priority,$git_status"
 done
@@ -526,5 +526,3 @@ exec stree \
 - **完整应用构建**（食谱 10）
 
 `stree` 的设计哲学是：**提供机制，不提供策略**。它给你最强大的原语，让你自由组合出任何你想要的终端应用。
-
-现在，轮到你了。去创造属于你自己的终端宇宙吧。

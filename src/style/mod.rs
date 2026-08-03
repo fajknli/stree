@@ -127,6 +127,12 @@ impl StyleEngine {
             let s = style_part.trim().to_lowercase();
             if s == "bold" {
                 is_bold = true;
+            } else if s.starts_with('#') {
+                if let Some(rgb) = parse_hex_color(&s) { // 去掉 Self::
+                    fg_color = Some(rgb);
+                } else {
+                    eprintln!("[WARN] 无效的十六进制颜色: {}", s);
+                }
             } else if let Some(&color) = self.color_map.get(&s) {
                 fg_color = Some(color);
             } else if !s.is_empty() {
@@ -152,6 +158,96 @@ impl StyleEngine {
         map.insert("darkgray".into(), Color::DarkGrey);
         map.insert("darkgrey".into(), Color::DarkGrey);
         map
+    }
+}
+
+// 提取为独立函数，供 StyleEngine 和 UiTheme 共用
+pub fn parse_hex_color(hex: &str) -> Option<Color> {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() == 6 {
+        let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+        Some(Color::Rgb { r, g, b })
+    } else if hex.len() == 3 {
+        // 支持 3 位简写，如 #fff -> #ffffff
+        let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
+        let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
+        let b = u8::from_str_radix(&hex[2..3], 16).ok()?;
+        Some(Color::Rgb { r: r * 17, g: g * 17, b: b * 17 })
+    } else {
+        None
+    }
+}
+
+// ================= 终极 UI 主题配置 =================
+#[derive(Debug, Clone)]
+pub struct UiTheme {
+    pub border_focused: Color,
+    pub border_unfocused: Color,
+    pub view_focused: Color,
+    pub view_unfocused: Color,
+    pub statusbar_fg: Color,
+    pub input_prefix: Color,
+    pub input_buffer: Color,
+    pub selected_bg: Color,
+    pub error_fg: Color,
+    pub error_bg: Color,
+    pub empty_data_fg: Color,
+}
+
+impl Default for UiTheme {
+    fn default() -> Self {
+        // 默认适配冷蓝主题
+        Self {
+            border_focused: Color::Rgb { r: 169, g: 181, b: 213 },   // #a9b5d5
+            border_unfocused: Color::Rgb { r: 86, g: 93, b: 126 },   // #565d7e
+            view_focused: Color::Rgb { r: 169, g: 181, b: 213 },     // #a9b5d5
+            view_unfocused: Color::Rgb { r: 86, g: 93, b: 126 },     // #565d7e
+            statusbar_fg: Color::Rgb { r: 212, g: 220, b: 242 },     // #d4dcf2
+            input_prefix: Color::Rgb { r: 201, g: 59, b: 59 },       // #c93b3b
+            input_buffer: Color::Rgb { r: 169, g: 181, b: 213 },     // #a9b5d5
+            selected_bg: Color::Rgb { r: 36, g: 40, b: 56 },         // #242838
+            error_fg: Color::Rgb { r: 255, g: 255, b: 255 },
+            error_bg: Color::Rgb { r: 201, g: 59, b: 59 },
+            empty_data_fg: Color::Rgb { r: 86, g: 93, b: 126 },
+        }
+    }
+}
+
+impl UiTheme {
+    pub fn parse(input: &str) -> Self {
+        let mut theme = Self::default();
+        if input.trim().is_empty() {
+            return theme;
+        }
+
+        for part in input.split(',') {
+            let kv: Vec<&str> = part.splitn(2, '=').collect();
+            if kv.len() != 2 { continue; }
+            let key = kv[0].trim();
+            let val = kv[1].trim();
+
+            if let Some(color) = parse_hex_color(val) {
+                match key {
+                    "border_focused" => theme.border_focused = color,
+                    "border_unfocused" => theme.border_unfocused = color,
+                    "view_focused" => theme.view_focused = color,
+                    "view_unfocused" => theme.view_unfocused = color,
+                    "statusbar_fg" => theme.statusbar_fg = color,
+                    "input_prefix" => theme.input_prefix = color,
+                    "input_buffer" => theme.input_buffer = color,
+                    "selected_bg" => theme.selected_bg = color,
+                    "error_fg" => theme.error_fg = color,
+                    "error_bg" => theme.error_bg = color,
+                    "empty_data_fg" => theme.empty_data_fg = color,
+                    _ => eprintln!("[WARN] 未知 UI 颜色键: {}", key),
+                }
+            } else {
+                eprintln!("[WARN] 无效的十六进制颜色: {}", val);
+            }
+        }
+        theme
     }
 }
 

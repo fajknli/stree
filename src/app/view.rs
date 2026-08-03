@@ -11,4 +11,6 @@ pub struct ViewState {
     pub rect_width: u16,
     /// 当前格子高度（内容区高度），用于 {height} 占位符
     pub rect_height: u16,
+    pub h_scroll: usize,
+    pub is_loading: bool, // 【新增】标记是否正在后台加载
 }

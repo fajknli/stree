@@ -48,6 +48,7 @@ ID \t Display \t Path \t Tags
 --tree "[click:][focus:][nomark:]Name:SourceCmd"
 ```
 
+*   **前缀组合**：`click:`, `focus:`, `nomark:` 可以无序组合使用。
 *   **`click:`**：单击节点即触发 `click` 信号（默认需双击或 Enter 触发 `confirm`）。
 *   **`focus:`**：当焦点切换到该 Tree 时，触发 `focus` 信号。
 *   **`nomark:`**：禁用该 Tree 的右键拖拽标记功能。
@@ -59,7 +60,7 @@ ID \t Display \t Path \t Tags
 --view "Name:RenderCmdTemplate"
 ```
 
-*   当 Tree 选中状态改变时，引擎使用当前选中节点的上下文展开 `RenderCmdTemplate` 并执行，其 stdout 渲染到 View 窗口。
+*   当 Tree 选中状态改变时，引擎使用当前选中节点的上下文展开 `RenderCmdTemplate` 并**异步**执行，其 stdout 渲染到 View 窗口。
 *   **特殊占位符**：在 View 的模板中，`{width}` 和 `{height}` 展开为 **View 窗口的内部内容区尺寸**（而非终端总尺寸），常用于传递给 `bat --terminal-width` 或 `ffmpeg` 等工具。
 
 ### 2.3 StatusBar 组件 (`--statusbar`)
@@ -95,7 +96,7 @@ ID \t Display \t Path \t Tags
 area(size)[border,drag]:Name
 ```
 
-*   **`size`**：`50%`（百分比）、`3`（绝对尺寸）、*(留空)*（均分剩余空间）。
+*   **`size`**：`50%`（百分比，支持两位小数精度）、`3`（绝对尺寸）、*(留空)*（均分剩余空间）。
 *   **`border`**：`box`（默认）、`line`（单顶线）、`none`。
 *   **`drag`**：允许该边框被鼠标拖拽调整大小。
 
@@ -136,7 +137,7 @@ area(size)[border,drag]:Name
 | `h` / `Left` | 折叠/父节点 | `l` / `Right` | 展开/子节点 |
 | `Enter` | 展开并触发 `confirm` | `Space` | 切换标记 (Mark) |
 | `g` / `G` | 跳转顶部/底部 | `Tab` | 切换焦点窗口 |
-| `/` | 激活搜索 (前缀 `/`) | `:` | 激活命令 (前缀 `:`) |
+| `H` / `L` | 左右滚动 5 字符 | `/` / `:` | 激活搜索/命令输入 |
 | `Esc` | 取消输入/退出 | `q` | 退出并输出选中 ID |
 
 ### 4.3 鼠标行为
@@ -149,7 +150,7 @@ area(size)[border,drag]:Name
 
 ---
 
-## 5. 执行模型与占位符 (`--bind`)
+## 5. 执行模型与信号绑定 (`--bind`)
 
 ### 5.1 占位符展开
 
@@ -163,29 +164,68 @@ area(size)[border,drag]:Name
 | `{input}` | 仅在 Input 组件提交时有效，展开为用户输入的原始字符串。 |
 | `{window}` | 当前焦点窗口的名称。 |
 | `{width}` / `{height}`| 在 `--view` 中：View 内部尺寸。在 `--bind` 中：终端总尺寸。 |
+| `{event}` | 触发该绑定的信号名称（如 `select`, `click`）。 |
 
 ### 5.2 执行模式
 
 *   **默认模式（全屏）**：`--bind "enter=vi {path}"`。引擎暂停 TUI，释放 TTY 给子进程，子进程退出后引擎重绘并触发 `trigger_reload`。
 *   **静默模式（`@` 前缀）**：`--bind "ctrl-t=@switch-view.sh"`。引擎保留 TUI，子进程以 `null` 标准流后台执行。**不会自动重载**，业务脚本需通过 IPC 推送更新。
 
+### 5.3 内置信号路由
+
+除了物理按键，引擎支持将特定事件绑定到外部命令（支持局部作用域 `Window:signal`）：
+
+*   **`select`**：选中项变化时触发（内置 200ms 防抖）。
+*   **`click`**：鼠标单击节点时触发（需 Tree 开启 `click:` 前缀）。
+*   **`focus`**：窗口获得焦点时触发（需 Tree 开启 `focus:` 前缀）。
+*   **`confirm`**：双击节点或按 Enter 时触发。
+*   **`load`**：树重载数据完毕时触发。
+
 ---
 
-## 6. IPC 协议与特殊指令
+## 6. 样式与主题引擎
 
-### 6.1 二进制帧格式
+所有颜色参数均支持 **TrueColor** 十六进制格式，兼容 6 位标准（`#a9b5d5`）和 3 位简写（`#fff`）。
+
+### 6.1 数据状态颜色 (`--status-col`)
+
+```bash
+--status-col "pattern1=style1,pattern2=style2,..."
+```
+
+*   **匹配语义**：引擎按逗号拆分节点的第 4 列。对于每条规则，检查标签集中是否**有任何一个**标签匹配该模式。
+*   **优先级**：颜色覆盖（后匹配的规则覆盖先匹配的），加粗累加（任意规则命中 `bold` 即生效）。
+*   **模式**：支持精确字符串（`live`）和正则表达式（`^fail.*`）。
+*   **保留标签**：`__selected__` (选中行), `__marked__` (标记行)。
+
+### 6.2 UI 框架颜色 (`--ui-colors`)
+
+控制非数据元素的视觉呈现，格式为 `key=value` 逗号分隔。
+
+```bash
+--ui-colors "border_focused=#a9b5d5,border_unfocused=#565d7e"
+```
+
+**可用键**：
+`border_focused`, `border_unfocused`, `view_focused`, `view_unfocused`, `statusbar_fg`, `input_prefix`, `input_buffer`, `selected_bg`, `error_fg`, `error_bg`, `empty_data_fg`
+
+---
+
+## 7. IPC 协议与特殊指令
+
+### 7.1 二进制帧格式
 
 Socket 路径通过 `$STREE_SOCK` 暴露。帧结构（大端序）：
 `[4B target_len][8B data_len][target (UTF-8)][data (UTF-8)]`
 
-### 6.2 常规更新
+### 7.2 常规更新
 
 ```bash
 ./generate-data.sh | stree update MainTree   # 更新 Tree
 echo "Loading..." | stree update Preview     # 更新 View
 ```
 
-### 6.3 布局控制特殊指令
+### 7.3 布局控制特殊指令
 
 引擎拦截以 `@` 开头的特定 Target，不将其视为组件名：
 
@@ -193,18 +233,6 @@ echo "Loading..." | stree update Preview     # 更新 View
     清空所有因鼠标拖拽产生的 `Absolute` 尺寸锁定，使所有窗口恢复为 `--layout` 声明的初始 `Percent` 比例。
 *   **`stree update @layout-reset <WindowName>`**
     仅清空指定窗口的尺寸锁定，使其恢复为声明式百分比。
-
----
-
-## 7. 样式引擎 (`--status-col`)
-
-```bash
---status-col "pattern1=style1,pattern2=style2,..."
-```
-
-*   **匹配语义**：引擎按逗号拆分节点的第 4 列（Tags）。对于每条规则，检查标签集中是否**有任何一个**标签匹配该模式。
-*   **优先级**：颜色覆盖（后匹配的规则覆盖先匹配的），加粗累加（任意规则命中 `bold` 即生效）。
-*   **模式**：支持精确字符串（`live`）和正则表达式（`^fail.*`）。
 
 ---
 
@@ -232,11 +260,3 @@ echo "User selected: $selected"
 | `$STREE_SOCK` | 子进程 | Unix Domain Socket 路径。 |
 | `$FORCE_COLOR` | 子进程 | 设为 `1`，强制子进程输出颜色。 |
 | `$TERM` | 子进程 | 设为 `xterm-256color`。 |
-```
-
-### 核心完善点说明：
-1. **明确了“搜索防幽灵”契约**：将之前讨论中确定的“Tags 绝对不参与搜索”写入文档，防止未来业务层产生误解。
-2. **完善了布局与拖拽契约**：详细解释了 `[drag]` 的行为，以及“拖拽即锁定（Absolute）”和 `@layout-reset` 的联动机制。
-3. **补充了多图层与浮动布局**：明确了 `@(x,y)` 和多次 `--layout` 的 Z 轴语义。
-4. **梳理了组件前缀与专属占位符**：将 `click:/focus:/nomark:` 以及 View/StatusBar 的特殊占位符独立成节，便于查阅。
-5. **规范了 IPC 特殊指令**：将 `@layout-reset` 作为引擎级拦截指令明确列出。

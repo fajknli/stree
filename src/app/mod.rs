@@ -13,10 +13,11 @@ pub use tree::TreeState;
 
 use crate::config::BindConfig;
 use crate::exec;
-use crate::layout::{self, Layout, WindowRect, BorderStyle};
+use crate::layout::{self, WindowRect, BorderStyle};
 use crate::protocol::Dataset;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
+use std::sync::mpsc::{Sender, Receiver};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Focus {
@@ -38,12 +39,6 @@ pub struct DragEdge {
     pub direction: layout::Direction,
     pub hit_rect: layout::WindowRect, // 鼠标碰撞检测的隐形矩形
     pub z_index: usize,       // 所属图层的 Z 轴
-}
-
-#[derive(Debug, Clone)]
-pub enum DragTarget {
-    /// (主窗口名, 邻居窗口名, 容器方向)
-    ResizeEdge(String, String, layout::Direction),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -78,6 +73,8 @@ pub enum InternalCommand {
     ToggleLayout(String),
     ShowLayout(String),
     HideLayout(String),
+    ScrollLeft,
+    ScrollRight,
 }
 
 impl InternalCommand {
@@ -102,27 +99,34 @@ impl InternalCommand {
             ("__TOGGLE_LAYOUT__", Some(name)) => Some(Self::ToggleLayout(name)),
             ("__SHOW_LAYOUT__", Some(name)) => Some(Self::ShowLayout(name)),
             ("__HIDE_LAYOUT__", Some(name)) => Some(Self::HideLayout(name)),
+            ("__SCROLL_LEFT__", None) => Some(Self::ScrollLeft),
+            ("__SCROLL_RIGHT__", None) => Some(Self::ScrollRight),
             _ => None,
         }
     }
 }
 
-/// 运行时布局层状态
 #[derive(Debug, Clone)]
-pub struct LayoutLayerState {
-    pub z_index: usize,
-    pub visible: bool,
-    pub layout: Layout,
+pub enum DragTarget {
+    /// (目标1 ID, 目标2 ID, 容器方向)
+    ResizeEdge(String, String, layout::Direction),
 }
 
 #[derive(Debug, Default)]
 pub struct DragState {
     pub active: bool,
-    pub mode: bool,
+    pub is_marking: bool,
     pub start_idx: Option<usize>,
     pub resize_target: Option<DragTarget>,
     pub cached_edges: Vec<DragEdge>,
     pub cached_intersections: Vec<(u16, u16)>,
+    pub start_col: u16,
+    pub start_row: u16,
+    pub last_col: u16,
+    pub last_row: u16,
+    pub initial_t1_rect: WindowRect, // 恢复
+    pub initial_t2_rect: WindowRect, // 恢复
+    pub is_restructured: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -147,7 +151,7 @@ pub struct SignalState {
 #[derive(Debug)]
 pub struct Engine {
     pub components: HashMap<String, Component>,
-    pub layout_layers: Vec<LayoutLayerState>,
+    pub layout_layers: Vec<layout::LayoutLayer>,
     pub window_rect_overrides: HashMap<String, layout::WindowSize>,
     pub key_bindings: BindConfig,
     pub border_chars: HashMap<String, String>,
@@ -158,13 +162,40 @@ pub struct Engine {
     pub focus: FocusState,
     pub mouse: MouseState,
     pub signals: SignalState,
+    pub is_initialized: bool,
+    pub max_lines: usize,
+    pub prev_rects: std::collections::HashMap<String, WindowRect>,
+    pub dirty_components: std::collections::HashSet<String>,
+    pub pending_selection_changed: Option<String>, // 上一轮优化的字段
+    pub async_view_tx: Sender<(String, Option<String>, String)>, // 新增
+    pub async_view_rx: Receiver<(String, Option<String>, String)>, // 新增
+    pub pending_view_reload: Option<String>, // 新增
+    pub prev_term_size: (u16, u16), // 【新增】记忆上一帧的终端尺寸
+    pub ui_theme: crate::style::UiTheme, // 【新增】UI 主题
 }
 
 fn parse_component_prefixes(cfg: &str) -> (bool, bool, bool, String) {
-    let (click, rest) = if cfg.starts_with("click:") { (true, &cfg[6..]) } else { (false, cfg) };
-    let (focus, rest) = if rest.starts_with("focus:") { (true, &rest[6..]) } else { (false, rest) };
-    let (nomark, rest) = if rest.starts_with("nomark:") { (true, &rest[7..]) } else { (false, rest) };
-    (click, focus, nomark, rest.to_string())
+    let mut click = false;
+    let mut focus = false;
+    let mut nomark = false;
+    let mut rest = cfg.to_string();
+
+    loop {
+        let current = rest.as_str();
+        if current.starts_with("click:") {
+            click = true;
+            rest = current[6..].to_string();
+        } else if current.starts_with("focus:") {
+            focus = true;
+            rest = current[6..].to_string();
+        } else if current.starts_with("nomark:") {
+            nomark = true;
+            rest = current[7..].to_string();
+        } else {
+            break;
+        }
+    }
+    (click, focus, nomark, rest)
 }
 
 impl Engine {
@@ -179,6 +210,8 @@ impl Engine {
         statusbars: Vec<String>,
         inputs: Vec<String>,
         relations_path: Option<String>,
+        max_lines: usize,
+        ui_colors: &str, // 【新增】接收 UI 颜色字符串
     ) -> Self {
         let mut border_chars_map = HashMap::new();
         for bc in &border_chars {
@@ -195,22 +228,8 @@ impl Engine {
         };
 
         // 解析多图层布局
-        let mut layout_layers = Vec::new();
-        for (i, s) in layout_strings.iter().enumerate() {
-            let parsed = layout::parse_layout(s);
-            layout_layers.push(LayoutLayerState {
-                z_index: i,
-                visible: true,
-                layout: parsed,
-            });
-        }
-        if layout_layers.is_empty() {
-            layout_layers.push(LayoutLayerState {
-                z_index: 0,
-                visible: true,
-                layout: layout::default_layout(),
-            });
-        }
+        let parsed_layout = layout::parse_layouts(&layout_strings);
+        let layout_layers = parsed_layout.layers;
 
         let mut init_error = None;
         let mut first_tree_name = None;
@@ -270,6 +289,8 @@ impl Engine {
                 click_to_fire,
                 focus_to_fire,
                 search_query: None,
+                h_scroll: 0,
+                v_scroll: 0,
             };
             tree_state.rebuild_visible_ids();
             if let Some(first_id) = tree_state.visible_ids.first().cloned() {
@@ -290,6 +311,8 @@ impl Engine {
                 max_offset: 0,
                 rect_width: 0,
                 rect_height: 0,
+                h_scroll: 0,
+                is_loading: false,
             }));
         }
 
@@ -311,11 +334,11 @@ impl Engine {
             components.insert(name, Component::Input(input_state));
         }
 
-        // overlays 参数已删除，不再处理
-
         let focused = first_tree_name.clone()
             .map(|n| Focus::Component(n))
             .unwrap_or(Focus::None);
+
+        let (tx, rx) = std::sync::mpsc::channel();
 
         let mut engine = Self {
             components,
@@ -335,31 +358,71 @@ impl Engine {
                 ..Default::default()
             },
             signals: SignalState::default(),
+            is_initialized: false,
+            max_lines,
+            prev_rects: std::collections::HashMap::new(),
+            dirty_components: std::collections::HashSet::new(),
+            pending_selection_changed: None,
+            async_view_tx: tx,
+            async_view_rx: rx,
+            pending_view_reload: None,
+            prev_term_size: (0, 0), // 初始化
+            ui_theme: crate::style::UiTheme::parse(ui_colors), // 【新增】解析并注入
         };
 
-        if let Focus::Component(name) = &engine.focus.current {
-            let name = name.clone();
-            engine.broadcast_selection_changed(&name, 0, 0);
-        }
-
-        engine.init_views();
-
+        engine.is_initialized = false;
         engine
+    }
+
+    pub fn mark_dirty(&mut self, name: &str) {
+        self.dirty_components.insert(name.to_string());
+        // StatusBar 模板里有 Tree 派生字段，连带标脏
+        if matches!(self.components.get(name), Some(Component::Tree(_))) {
+            for (n, c) in &self.components {
+                if matches!(c, Component::StatusBar(_)) {
+                    self.dirty_components.insert(n.clone());
+                }
+            }
+        }
+    }
+
+    pub fn mark_all_dirty(&mut self) {
+        // 【防闪烁修复】不再清空 prev_rects 触发全屏 ClearType::All
+        // 而是将所有组件标脏，让渲染器静默重绘内容，覆盖拖拽时的静态文本
+        for name in self.components.keys() {
+            self.dirty_components.insert(name.clone());
+        }
+    }
+
+    pub fn flush_pending_updates(&mut self, term_width: u16, term_height: u16) {
+        if let Some(tree_name) = self.pending_selection_changed.take() {
+            self.broadcast_selection_changed(&tree_name, term_width, term_height);
+            self.emit_select_if_changed(term_width, term_height);
+        }
+    }
+
+    pub fn scroll_left(&mut self) {
+        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
+        if let Some(Component::View(v)) = self.components.get_mut(&focused_name) {
+            v.h_scroll = v.h_scroll.saturating_sub(5);
+        } else if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
+            t.h_scroll = t.h_scroll.saturating_sub(5);
+        }
+    }
+
+    pub fn scroll_right(&mut self) {
+        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
+        if let Some(Component::View(v)) = self.components.get_mut(&focused_name) {
+            v.h_scroll = v.h_scroll.saturating_add(5);
+        } else if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
+            t.h_scroll = t.h_scroll.saturating_add(5);
+        }
     }
 
     // ================= 多图层布局计算 =================
 
     pub fn calc_all_rects(&self, term_width: u16, term_height: u16) -> Vec<(WindowRect, String, BorderStyle, usize)> {
-        let mut all_rects = Vec::new();
-        for layer in &self.layout_layers {
-            if !layer.visible { continue; }
-            // 纯净的 Flexbox 计算，window_rect_overrides 会作为 Absolute 约束传入
-            let rects = layout::calc_window_rects(&layer.layout, term_width, term_height, &self.window_rect_overrides);
-            for (rect, name, border, _z) in rects {
-                all_rects.push((rect, name, border, layer.z_index));
-            }
-        }
-        all_rects
+        layout::calc_window_rects(&self.layout_layers, term_width, term_height, &self.window_rect_overrides)
     }
 
     // ================= 布局层显隐控制 =================
@@ -369,7 +432,7 @@ impl Engine {
     pub fn toggle_layout_visible(&mut self, name: &str) {
         for layer in &mut self.layout_layers {
             // 检查该图层是否包含目标窗口名
-            let has_window = Self::layout_contains_window(&layer.layout, name);
+            let has_window = Self::layout_contains_window(layer, name);
             if has_window {
                 layer.visible = !layer.visible;
                 return;
@@ -385,7 +448,7 @@ impl Engine {
 
     pub fn set_layout_visible(&mut self, name: &str, visible: bool) {
         for layer in &mut self.layout_layers {
-            let has_window = Self::layout_contains_window(&layer.layout, name);
+            let has_window = Self::layout_contains_window(layer, name);
             if has_window {
                 layer.visible = visible;
                 return;
@@ -398,8 +461,8 @@ impl Engine {
         }
     }
 
-    /// 检查一个 Layout 是否包含指定名称的窗口节点
-    fn layout_contains_window(layout: &Layout, name: &str) -> bool {
+    /// 检查一个 LayoutLayer 是否包含指定名称的窗口节点
+    fn layout_contains_window(layer: &layout::LayoutLayer, name: &str) -> bool {
         fn check_node(node: &layout::LayoutNode, name: &str) -> bool {
             match node {
                 layout::LayoutNode::Window { name: n, .. } => n == name,
@@ -408,24 +471,19 @@ impl Engine {
                 }
             }
         }
-        for layer in &layout.layers {
-            if check_node(&layer.root, name) {
-                return true;
-            }
-        }
-        false
+        check_node(&layer.root, name)
     }
 
     // ================= 核心：统一事件发件箱 =================
 
     /// 统一的事件发射器 (The Unified Outbox)
-    pub fn emit(&mut self, signal: &str, term_width: u16, term_height: u16) {
+    pub fn emit(&mut self, signal: &str, term_width: u16, term_height: u16) -> bool {
         // 1. 时间防抖 (针对 select 等高频信号，200ms 内只发一次)
         if signal == "select" {
             let now = Instant::now();
             if let Some(last) = self.signals.last_emit.get(signal) {
                 if now.duration_since(*last).as_millis() < 200 {
-                    return;
+                    return false; // 被防抖拦截
                 }
             }
             self.signals.last_emit.insert(signal.to_string(), now);
@@ -479,18 +537,20 @@ impl Engine {
             );
 
             if !full_cmd_args.is_empty() && !(full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) {
-                // 【绝对防御】：状态信号强制静默执行，绝不交出 TTY！
                 let _ = exec::execute_command_silent(&full_cmd_args);
             }
         }
+        true // 【修复】返回 true 表示成功执行了（或尝试执行了）
     }
 
     /// 状态防抖：只有当 selected_id 真正改变时，才发射 select 信号
     pub fn emit_select_if_changed(&mut self, term_width: u16, term_height: u16) {
         let current_id = self.get_selected_entity().map(|e| e.id.clone());
         if current_id != self.signals.last_emitted_select_id {
-            self.signals.last_emitted_select_id = current_id;
-            self.emit("select", term_width, term_height);
+            // 【修复 Bug #3】只有当 emit 真正触发时，才更新 last_emitted_select_id
+            if self.emit("select", term_width, term_height) {
+                self.signals.last_emitted_select_id = current_id;
+            }
         }
     }
 
@@ -498,6 +558,7 @@ impl Engine {
 
     pub fn handle_tab(&mut self, term_width: u16, term_height: u16) {
         self.last_error = None;
+        let old_focus = self.focus.current.clone();
         let mut names: Vec<String> = self.components.iter()
             .filter(|(_, c)| !matches!(c, Component::StatusBar(_)))
             .map(|(k, _)| k.clone())
@@ -514,7 +575,19 @@ impl Engine {
         let next_name = names[next_idx].clone();
         self.focus.current = Focus::Component(next_name.clone());
 
-        // 【门禁检查】：新焦点的窗口是否签署了 focus: 协议？
+        // 标脏新旧焦点窗口，以便更新边框颜色
+        if let Focus::Component(old) = &old_focus {
+            self.mark_dirty(old);
+        }
+        self.mark_dirty(&next_name);
+
+        // 【修复】焦点变化时，状态栏也需要更新（因为 {stree_focus} 变了）
+        for (n, c) in &self.components {
+            if matches!(c, Component::StatusBar(_)) {
+                self.dirty_components.insert(n.clone());
+            }
+        }
+
         let should_emit_focus = if let Some(Component::Tree(t)) = self.components.get(&next_name) {
             t.focus_to_fire
         } else {
@@ -526,35 +599,13 @@ impl Engine {
         }
     }
 
-    pub fn move_up(&mut self, term_width: u16, term_height: u16) {
-        self.last_error = None;
-        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
-        if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
-            t.move_up();
-            self.broadcast_selection_changed(&focused_name, term_width, term_height);
-            self.emit_select_if_changed(term_width, term_height);
-        } else if let Some(Component::View(v)) = self.components.get_mut(&focused_name) {
-            v.scroll_offset = v.scroll_offset.saturating_sub(1);
-        }
-    }
-
-    pub fn move_down(&mut self, term_width: u16, term_height: u16) {
-        self.last_error = None;
-        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
-        if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
-            t.move_down();
-            self.broadcast_selection_changed(&focused_name, term_width, term_height);
-            self.emit_select_if_changed(term_width, term_height);
-        } else if let Some(Component::View(v)) = self.components.get_mut(&focused_name) {
-            v.scroll_offset = (v.scroll_offset + 1).min(v.max_offset);
-        }
-    }
 
     pub fn toggle_expand(&mut self) {
         self.last_error = None;
         let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
         if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
             t.toggle_expand();
+            self.mark_dirty(&focused_name);
         }
     }
 
@@ -563,41 +614,10 @@ impl Engine {
         let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
         if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
             t.toggle_mark();
+            self.mark_dirty(&focused_name);
         }
     }
 
-    pub fn jump_to_top(&mut self, term_width: u16, term_height: u16) {
-        self.last_error = None;
-        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
-        if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
-            t.jump_to_top();
-            self.broadcast_selection_changed(&focused_name, term_width, term_height);
-            self.emit_select_if_changed(term_width, term_height);
-        } else if let Some(Component::View(v)) = self.components.get_mut(&focused_name) {
-            v.scroll_offset = 0;
-        }
-    }
-
-    pub fn jump_to_bottom(&mut self, term_width: u16, term_height: u16) {
-        self.last_error = None;
-        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
-        if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
-            t.jump_to_bottom();
-            self.broadcast_selection_changed(&focused_name, term_width, term_height);
-            self.emit_select_if_changed(term_width, term_height);
-        } else if let Some(Component::View(v)) = self.components.get_mut(&focused_name) {
-            v.scroll_offset = v.max_offset;
-        }
-    }
-
-    pub fn select_id(&mut self, tree_name: &str, id: &str, term_width: u16, term_height: u16) {
-        self.last_error = None;
-        if let Some(Component::Tree(t)) = self.components.get_mut(tree_name) {
-            t.select_id(id);
-        }
-        self.broadcast_selection_changed(tree_name, term_width, term_height);
-        self.emit_select_if_changed(term_width, term_height);
-    }
 
     pub fn broadcast_selection_changed(&mut self, tree_name: &str, _term_width: u16, _term_height: u16) {
         let is_focused_tree = match &self.focus.current {
@@ -620,14 +640,23 @@ impl Engine {
             .unwrap_or_default();
 
         let window_name = tree_name.to_string();
+        let mut dirty_views = Vec::new();
 
-        for (_view_name, comp) in self.components.iter_mut() {
+        for (view_name, comp) in self.components.iter_mut() {
             if let Component::View(v) = comp {
                 let new_cached_id = selected_entity.as_ref().map(|e| e.id.clone());
                 if v.cached_entity_id == new_cached_id && !v.content_buffer.is_empty() {
                     continue;
                 }
-                v.cached_entity_id = new_cached_id;
+
+                // 如果正在加载，标记为 pending，等加载完毕后再触发
+                if v.is_loading {
+                    self.pending_view_reload = Some(view_name.clone());
+                    continue;
+                }
+
+                v.cached_entity_id = new_cached_id.clone();
+                v.is_loading = true;
 
                 let width_str = v.rect_width.to_string();
                 let height_str = v.rect_height.to_string();
@@ -647,27 +676,42 @@ impl Engine {
                 if full_cmd_args.is_empty() || (full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) {
                     v.content_buffer = String::new();
                     v.scroll_offset = 0;
+                    v.is_loading = false;
+                    dirty_views.push(view_name.clone());
                     continue;
                 }
 
-                match exec::execute_command_args(&full_cmd_args) {
-                    Ok((code, stdout)) => {
-                        if code != 0 && stdout.trim().is_empty() {
-                            v.content_buffer = format!("[ERR] Command exited with code {}", code);
-                        } else {
-                            v.content_buffer = stdout;
+                // 【异步核心】克隆参数，派发到后台线程执行
+                let tx = self.async_view_tx.clone();
+                let view_name_clone = view_name.clone();
+                let target_id_clone = new_cached_id.clone();
+                let max_lines = self.max_lines;
+
+                std::thread::spawn(move || {
+                    match crate::exec::execute_command_args(&full_cmd_args, max_lines) {
+                        Ok((code, stdout)) => {
+                            let content = if code != 0 && stdout.trim().is_empty() {
+                                format!("[ERR] Command exited with code {}", code)
+                            } else {
+                                stdout
+                            };
+                            let _ = tx.send((view_name_clone, target_id_clone, content));
                         }
-                        v.scroll_offset = 0;
+                        Err(e) => {
+                            let _ = tx.send((view_name_clone, target_id_clone, format!("[ERR] {}", e)));
+                        }
                     }
-                    Err(e) => {
-                        v.content_buffer = format!("[ERR] {}", e);
-                    }
-                }
+                });
             }
+        }
+
+        for name in dirty_views {
+            self.mark_dirty(&name);
         }
     }
 
     pub fn init_views(&mut self) {
+        self.mark_all_dirty();
         for (view_name, comp) in self.components.iter_mut() {
             if let Component::View(v) = comp {
                 let width_str = v.rect_width.to_string();
@@ -685,7 +729,7 @@ impl Engine {
                     continue;
                 }
 
-                match exec::execute_command_args(&full_cmd_args) {
+                match exec::execute_command_args(&full_cmd_args, self.max_lines) {
                     Ok((code, stdout)) => {
                         v.content_buffer = if code != 0 && stdout.trim().is_empty() {
                             format!("[ERR] Command exited with code {}", code)
@@ -785,10 +829,12 @@ impl Engine {
     pub fn handle_ipc_update(&mut self, target: &str, data: &str, term_width: u16, term_height: u16) {
         if target == "@layout-reset" {
             self.window_rect_overrides.clear();
+            self.mark_all_dirty();
             return;
         }
         if let Some(layer_name) = target.strip_prefix("@layout-reset ") {
             self.window_rect_overrides.remove(layer_name.trim());
+            self.mark_all_dirty();
             return;
         }
         if let Some(comp) = self.components.get_mut(target) {
@@ -818,14 +864,17 @@ impl Engine {
                         self.emit_select_if_changed(term_width, term_height);
                         self.emit("load", term_width, term_height);
                     }
+                    self.mark_dirty(target);
                 }
                 Component::View(v) => {
                     v.content_buffer = data.to_string();
                     v.scroll_offset = 0;
                     v.cached_entity_id = None;
+                    self.mark_dirty(target);
                 }
                 Component::StatusBar(s) => {
                     s.format_template = data.to_string();
+                    self.mark_dirty(target);
                 }
                 _ => {}
             }
@@ -833,6 +882,7 @@ impl Engine {
     }
 
     pub fn trigger_reload(&mut self, term_width: u16, term_height: u16) {
+        self.mark_all_dirty();
         let tree_names: Vec<String> = self.components.iter()
             .filter(|(_, c)| matches!(c, Component::Tree(_)))
             .map(|(k, _)| k.clone())
@@ -851,7 +901,10 @@ impl Engine {
                             self.handle_ipc_update(&name, &stdout, term_width, term_height);
                         }
                     }
-                    Err(_) => {}
+                    Err(e) => {
+                        // 【优化】记录重载失败错误，而不是默默忽略
+                        self.last_error = Some(format!("Reload failed for {}: {}", name, e));
+                    }
                 }
             }
         }
@@ -878,7 +931,68 @@ impl Engine {
         if let Some(Component::Tree(t)) = self.components.get(name) { Some(t) } else { None }
     }
 
-    pub fn move_up_n(&mut self, n: usize, term_width: u16, term_height: u16) {
+    pub fn move_up(&mut self) {
+        self.last_error = None;
+        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
+        if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
+            t.move_up();
+            self.pending_selection_changed = Some(focused_name.clone());
+            self.mark_dirty(&focused_name);
+        } else if let Some(Component::View(v)) = self.components.get_mut(&focused_name) {
+            v.scroll_offset = v.scroll_offset.saturating_sub(1);
+            self.mark_dirty(&focused_name);
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        self.last_error = None;
+        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
+        if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
+            t.move_down();
+            self.pending_selection_changed = Some(focused_name.clone());
+            self.mark_dirty(&focused_name);
+        } else if let Some(Component::View(v)) = self.components.get_mut(&focused_name) {
+            v.scroll_offset = (v.scroll_offset + 1).min(v.max_offset);
+            self.mark_dirty(&focused_name);
+        }
+    }
+
+    pub fn jump_to_top(&mut self) {
+        self.last_error = None;
+        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
+        if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
+            t.jump_to_top();
+            self.pending_selection_changed = Some(focused_name.clone());
+            self.mark_dirty(&focused_name);
+        } else if let Some(Component::View(v)) = self.components.get_mut(&focused_name) {
+            v.scroll_offset = 0;
+            self.mark_dirty(&focused_name);
+        }
+    }
+
+    pub fn jump_to_bottom(&mut self) {
+        self.last_error = None;
+        let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
+        if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
+            t.jump_to_bottom();
+            self.pending_selection_changed = Some(focused_name.clone());
+            self.mark_dirty(&focused_name);
+        } else if let Some(Component::View(v)) = self.components.get_mut(&focused_name) {
+            v.scroll_offset = v.max_offset;
+            self.mark_dirty(&focused_name);
+        }
+    }
+
+    pub fn select_id(&mut self, tree_name: &str, id: &str) {
+        self.last_error = None;
+        if let Some(Component::Tree(t)) = self.components.get_mut(tree_name) {
+            t.select_id(id);
+        }
+        self.pending_selection_changed = Some(tree_name.to_string());
+        self.mark_dirty(tree_name);
+    }
+
+    pub fn move_up_n(&mut self, n: usize) {
         self.last_error = None;
         let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
         if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
@@ -888,14 +1002,15 @@ impl Engine {
                     t.selected_id = Some(t.visible_ids[t.selected_idx].clone());
                 } else { break; }
             }
-            self.broadcast_selection_changed(&focused_name, term_width, term_height);
-            self.emit_select_if_changed(term_width, term_height);
+            self.pending_selection_changed = Some(focused_name.clone());
+            self.mark_dirty(&focused_name);
         } else if let Some(Component::View(v)) = self.components.get_mut(&focused_name) {
             v.scroll_offset = v.scroll_offset.saturating_sub(n);
+            self.mark_dirty(&focused_name);
         }
     }
 
-    pub fn move_down_n(&mut self, n: usize, term_width: u16, term_height: u16) {
+    pub fn move_down_n(&mut self, n: usize) {
         self.last_error = None;
         let focused_name = if let Focus::Component(name) = &self.focus.current { name.clone() } else { return; };
         if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
@@ -905,10 +1020,11 @@ impl Engine {
                     t.selected_id = Some(t.visible_ids[t.selected_idx].clone());
                 } else { break; }
             }
-            self.broadcast_selection_changed(&focused_name, term_width, term_height);
-            self.emit_select_if_changed(term_width, term_height);
+            self.pending_selection_changed = Some(focused_name.clone());
+            self.mark_dirty(&focused_name);
         } else if let Some(Component::View(v)) = self.components.get_mut(&focused_name) {
             v.scroll_offset = (v.scroll_offset + n).min(v.max_offset);
+            self.mark_dirty(&focused_name);
         }
     }
 
@@ -985,6 +1101,7 @@ impl Engine {
 
             self.broadcast_selection_changed(&focused_name, term_width, term_height);
             self.emit_select_if_changed(term_width, term_height);
+            self.mark_dirty(&focused_name);
         }
     }
 
@@ -999,7 +1116,7 @@ impl Engine {
     /// 查找两个相邻窗口在父容器中的“原始百分比总和”
     pub fn get_sibling_percent_sum(&self, name1: &str, name2: &str) -> Option<u16> {
         for layer in &self.layout_layers {
-            if let Some(sum) = Self::find_sibling_sum_in_node(&layer.layout.layers[0].root, name1, name2) {
+            if let Some(sum) = Self::find_sibling_sum_in_node(&layer.root, name1, name2) {
                 return Some(sum);
             }
         }
@@ -1058,13 +1175,14 @@ impl Engine {
         // 遍历所有图层，提取叶子之间的边
         for layer in &self.layout_layers {
             if !layer.visible { continue; }
-            Self::extract_edges_from_node(&layer.layout.layers[0].root, &w_map, layer.z_index, &mut self.drag.cached_edges);
+            Self::extract_edges_from_node(&layer.root, &w_map, layer.z_index, &mut self.drag.cached_edges);
         }
 
         // 【新增】计算横竖线的交点，用于命中剔除
         self.drag.cached_intersections.clear();
-        let v_edges: Vec<_> = self.drag.cached_edges.iter().filter(|e| e.direction == layout::Direction::Vertical).collect();
-        let h_edges: Vec<_> = self.drag.cached_edges.iter().filter(|e| e.direction == layout::Direction::Horizontal).collect();
+        // 【修复 Bug #1】Direction::Horizontal 是左右排列，产生的是竖线
+        let v_edges: Vec<_> = self.drag.cached_edges.iter().filter(|e| e.direction == layout::Direction::Horizontal).collect();
+        let h_edges: Vec<_> = self.drag.cached_edges.iter().filter(|e| e.direction == layout::Direction::Vertical).collect();
         for v in &v_edges {
             for h in &h_edges {
                 let v_x = v.hit_rect.start_col + 1; // 竖线所在列
@@ -1097,7 +1215,7 @@ impl Engine {
         // 2. 遍历所有图层，搜索目标节点
         for layer in &self.layout_layers {
             if let Some((rect, border)) = Self::search_bbox_in_node(
-                &layer.layout.layers[0].root,
+                &layer.root,
                 node_id,
                 &w_map,
                 &b_map,
@@ -1282,8 +1400,53 @@ impl Engine {
     /// 查找一个节点（Window 或 Container）的父容器 ID
     pub fn find_parent_container(&self, node_id: &str) -> Option<String> {
         for layer in &self.layout_layers {
-            if let Some(parent) = Self::search_parent_container(&layer.layout.layers[0].root, node_id) {
+            if let Some(parent) = Self::search_parent_container(&layer.root, node_id) {
                 return Some(parent);
+            }
+        }
+        None
+    }
+
+    /// 查找两个叶子窗口在指定方向上的直接父级兄弟节点 (Resize Targets)
+    pub fn find_resize_targets(&self, leaf1: &str, leaf2: &str, drag_dir: layout::Direction) -> Option<(String, String)> {
+        for layer in &self.layout_layers {
+            if let Some((t1, t2)) = Self::find_resize_targets_in_node(&layer.root, leaf1, leaf2, drag_dir) {
+                return Some((t1, t2));
+            }
+        }
+        None
+    }
+
+    fn find_resize_targets_in_node(node: &layout::LayoutNode, leaf1: &str, leaf2: &str, drag_dir: layout::Direction) -> Option<(String, String)> {
+        if let layout::LayoutNode::Container { direction, children, .. } = node {
+            let mut c1_idx = None;
+            let mut c2_idx = None;
+            for (i, child) in children.iter().enumerate() {
+                if Self::contains_node(child, leaf1) { c1_idx = Some(i); }
+                if Self::contains_node(child, leaf2) { c2_idx = Some(i); }
+            }
+
+            match (c1_idx, c2_idx) {
+                (Some(idx1), Some(idx2)) if idx1 != idx2 => {
+                    // 它们在不同的子节点中
+                    if *direction == drag_dir {
+                        let t1 = match &children[idx1] {
+                            layout::LayoutNode::Window { name, .. } => name.clone(),
+                            layout::LayoutNode::Container { id, .. } => id.clone(),
+                        };
+                        let t2 = match &children[idx2] {
+                            layout::LayoutNode::Window { name, .. } => name.clone(),
+                            layout::LayoutNode::Container { id, .. } => id.clone(),
+                        };
+                        return Some((t1, t2));
+                    }
+                    return None;
+                }
+                (Some(idx), Some(_)) => {
+                    // 它们在同一个子节点中，继续向下找
+                    return Self::find_resize_targets_in_node(&children[idx], leaf1, leaf2, drag_dir);
+                }
+                _ => return None
             }
         }
         None
@@ -1292,6 +1455,7 @@ impl Engine {
     // ================= 终极魔法：运行时树重组 =================
 
     /// 强制根据物理真相重算所有百分比，防止松手回弹
+    /// 【V2.1 升级】：使用万分比 (0-10000) 反算，配合最大余数法实现像素级完美互逆
     pub fn force_recalculate_percentages(
         &mut self,
         all_rects: &[(layout::WindowRect, String, layout::BorderStyle, usize)]
@@ -1302,175 +1466,7 @@ impl Engine {
         }
 
         for layer in &mut self.layout_layers {
-            let root = &mut layer.layout.layers[0].root;
-            Self::recalc_node_percentages_recursive(root, &rect_map);
-        }
-    }
-
-    /// 拖拽松手后，重组 Flexbox 树
-    pub fn restructure_tree_after_drag(
-        &mut self,
-        primary: &str,
-        neighbor: &str,
-        drag_dir: layout::Direction,
-        all_rects: &[(layout::WindowRect, String, layout::BorderStyle, usize)]
-    ) -> bool {
-        // 构建物理坐标索引
-        let mut rect_map: std::collections::HashMap<String, layout::WindowRect> = std::collections::HashMap::new();
-        for (rect, name, _, _) in all_rects {
-            rect_map.insert(name.clone(), *rect);
-        }
-
-        for layer in &mut self.layout_layers {
-            let root = &mut layer.layout.layers[0].root;
-            // 将 rect_map 传入手术刀函数
-            if Self::surgery_tree_node(root, primary, neighbor, drag_dir, &rect_map) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn surgery_tree_node(
-        node: &mut layout::LayoutNode,
-        primary: &str,
-        neighbor: &str,
-        drag_dir: layout::Direction,
-        rect_map: &std::collections::HashMap<String, layout::WindowRect>
-    ) -> bool {
-        if let layout::LayoutNode::Container { direction, children, .. } = node {
-            let mut p_child_idx = None;
-            let mut n_child_idx = None;
-            for (i, child) in children.iter().enumerate() {
-                if Self::contains_node(child, primary) { p_child_idx = Some(i); }
-                if Self::contains_node(child, neighbor) { n_child_idx = Some(i); }
-            }
-
-            if let (Some(idx_p), Some(idx_n)) = (p_child_idx, n_child_idx) {
-                if idx_p != idx_n {
-                    let p_is_direct = Self::is_node_id_match(&children[idx_p], primary);
-                    let n_is_direct = Self::is_node_id_match(&children[idx_n], neighbor);
-
-                    if p_is_direct && n_is_direct && *direction == drag_dir {
-                        return false;
-                    }
-
-                    let opposite_dir = match drag_dir {
-                        layout::Direction::Horizontal => layout::Direction::Vertical,
-                        layout::Direction::Vertical => layout::Direction::Horizontal,
-                    };
-
-                    let mut temp_children = std::mem::take(children);
-                    let mut p_child = temp_children.remove(idx_p);
-                    let n_idx_adjusted = if idx_n > idx_p { idx_n - 1 } else { idx_n };
-                    let mut n_child = temp_children.remove(n_idx_adjusted);
-
-                    let p_node = Self::extract_node_by_id(&p_child, primary).unwrap();
-                    let n_node = Self::extract_node_by_id(&n_child, neighbor).unwrap();
-
-                    let mut remaining_nodes = temp_children;
-                    if let Some(remaining) = Self::remove_node_and_collapse(&mut p_child, primary) {
-                        remaining_nodes.push(remaining);
-                    }
-                    if let Some(remaining) = Self::remove_node_and_collapse(&mut n_child, neighbor) {
-                        remaining_nodes.push(remaining);
-                    }
-
-                    let new_main_container = layout::LayoutNode::Container {
-                        id: crate::layout::generate_container_id_pub(),
-                        direction: drag_dir,
-                        percent: None,
-                        children: vec![p_node, n_node],
-                    };
-
-                    let new_remaining_container = if remaining_nodes.is_empty() {
-                        None
-                    } else if remaining_nodes.len() == 1 {
-                        Some(remaining_nodes.remove(0))
-                    } else {
-                        Some(layout::LayoutNode::Container {
-                            id: crate::layout::generate_container_id_pub(),
-                            direction: drag_dir,
-                            percent: None,
-                            children: remaining_nodes,
-                        })
-                    };
-
-                    // 【核心架构修复】：在构建 children 数组时，根据物理坐标决定先后顺序！
-                    // 保证树结构拓扑与屏幕物理位置绝对一致，彻底消灭 badc 现象！
-                    if let Some(rem_container) = new_remaining_container {
-                        let main_pos = Self::get_node_physical_rect(&new_main_container, rect_map).unwrap_or_default();
-                        let rem_pos = Self::get_node_physical_rect(&rem_container, rect_map).unwrap_or_default();
-
-                        let is_main_first = match opposite_dir {
-                            layout::Direction::Horizontal => main_pos.start_col <= rem_pos.start_col,
-                            layout::Direction::Vertical => main_pos.start_row <= rem_pos.start_row,
-                        };
-
-                        if is_main_first {
-                            *children = vec![new_main_container, rem_container];
-                        } else {
-                            *children = vec![rem_container, new_main_container];
-                        }
-                    } else {
-                        *children = vec![new_main_container];
-                    }
-
-                    *direction = opposite_dir;
-                    return true;
-                }
-            }
-
-            for child in children.iter_mut() {
-                if Self::surgery_tree_node(child, primary, neighbor, drag_dir, rect_map) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    fn remove_node_and_collapse(node: &mut layout::LayoutNode, target_id: &str) -> Option<layout::LayoutNode> {
-        match node {
-            layout::LayoutNode::Window { name, .. } => {
-                if name == target_id { None } else { Some(node.clone()) }
-            }
-            layout::LayoutNode::Container { children, .. } => {
-                let mut found = false;
-                if let Some(pos) = children.iter().position(|c| Self::is_node_id_match(c, target_id)) {
-                    children.remove(pos);
-                    found = true;
-                }
-
-                if !found {
-                    for child in children.iter_mut() {
-                        if let Some(modified) = Self::remove_node_and_collapse(child, target_id) {
-                            *child = modified;
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-
-                if found {
-                    if children.is_empty() {
-                        None
-                    } else if children.len() == 1 {
-                        Some(children.remove(0)) // 容器只剩一个子节点，解包
-                    } else {
-                        Some(node.clone())
-                    }
-                } else {
-                    Some(node.clone())
-                }
-            }
-        }
-    }
-
-    fn is_node_id_match(node: &layout::LayoutNode, id: &str) -> bool {
-        match node {
-            layout::LayoutNode::Window { name, .. } => name == id,
-            layout::LayoutNode::Container { id: node_id, .. } => node_id == id,
+            Self::recalc_node_percentages_recursive(&mut layer.root, &rect_map);
         }
     }
 
@@ -1479,7 +1475,7 @@ impl Engine {
         rect_map: &std::collections::HashMap<String, layout::WindowRect>
     ) {
         if let layout::LayoutNode::Container { direction, children, .. } = node {
-            let dir_val = *direction; // 【修复】：解引用拷贝，避免 move 错误
+            let dir_val = *direction;
 
             for child in children.iter_mut() {
                 Self::recalc_node_percentages_recursive(child, rect_map);
@@ -1487,8 +1483,11 @@ impl Engine {
 
             if children.len() < 2 { return; }
 
-            let mut total_content = 0u16;
+            // 【奥卡姆剃刀】：删除物理排序 sort_by_key！AST 顺序由五阶公式保证！
+
+            let mut total_flex_content = 0u16;
             let mut child_contents: Vec<u16> = Vec::with_capacity(children.len());
+            let mut is_absolute_flags: Vec<bool> = Vec::with_capacity(children.len());
 
             for child in children.iter() {
                 let phys = Self::get_node_physical_rect(child, rect_map).unwrap_or_default();
@@ -1501,31 +1500,265 @@ impl Engine {
                     layout::LayoutNode::Container { .. } => 0,
                 };
 
-                let size = match dir_val { // 这里用 dir_val
+                let size = match dir_val {
                     layout::Direction::Horizontal => phys.width.saturating_sub(overhead),
                     layout::Direction::Vertical => phys.height.saturating_sub(overhead),
                 };
 
+                let is_abs = match child {
+                    layout::LayoutNode::Window { size: Some(layout::WindowSize::Absolute(_)), .. } => true,
+                    _ => false,
+                };
+                is_absolute_flags.push(is_abs);
+
+                if !is_abs {
+                    total_flex_content = total_flex_content.saturating_add(size);
+                }
                 child_contents.push(size);
-                total_content = total_content.saturating_add(size);
             }
 
-            if total_content == 0 { return; }
+            // 1. 【修复回弹】：更新所有 Absolute 节点，将拖拽后的物理尺寸写回 AST！
+            for i in 0..children.len() {
+                if is_absolute_flags[i] {
+                    Self::set_node_percent(&mut children[i], Some(layout::WindowSize::Absolute(child_contents[i])));
+                }
+            }
 
-            // 【终极修复】：最后一个子节点补齐 100%，彻底消灭取整误差导致的抖动！
+            if total_flex_content == 0 { return; }
+
+            // 2. 万分比反算，仅针对 Flex 子节点分配
             let mut sum_pct = 0u16;
-            for i in 0..children.len().saturating_sub(1) {
-                let pct = (child_contents[i] as u32 * 100 / total_content as u32) as u16;
-                Self::set_node_percent(&mut children[i], Some(pct));
+            let mut flex_indices: Vec<usize> = Vec::new();
+            for (i, _) in children.iter().enumerate() {
+                if !is_absolute_flags[i] {
+                    flex_indices.push(i);
+                }
+            }
+
+            for &i in &flex_indices[..flex_indices.len().saturating_sub(1)] {
+                let pct = ((child_contents[i] as u32 * 10000 + total_flex_content as u32 / 2) / total_flex_content as u32) as u16;
+                Self::set_node_percent(&mut children[i], Some(layout::WindowSize::Percent(pct)));
                 sum_pct += pct;
             }
 
-            if !children.is_empty() {
-                let last_pct = 100u16.saturating_sub(sum_pct);
-                if let Some(last_child) = children.last_mut() {
-                    Self::set_node_percent(last_child, Some(last_pct));
+            // 3. 尾数补齐：最后一个 Flex 子节点强制设为 10000 - sum
+            if let Some(&last_idx) = flex_indices.last() {
+                let last_pct = 10000u16.saturating_sub(sum_pct);
+                Self::set_node_percent(&mut children[last_idx], Some(layout::WindowSize::Percent(last_pct)));
+            }
+        }
+    }
+
+    /// 拖拽松手后，重组 Flexbox 树 (局部封闭重组 V2.2)
+    pub fn restructure_tree_after_drag(
+        &mut self,
+        primary: &str,
+        neighbor: &str,
+        drag_dir: layout::Direction,
+        all_rects: &[(layout::WindowRect, String, layout::BorderStyle, usize)]
+    ) -> bool {
+        let mut rect_map: std::collections::HashMap<String, layout::WindowRect> = std::collections::HashMap::new();
+        for (rect, name, _, _) in all_rects {
+            rect_map.insert(name.clone(), *rect);
+        }
+
+        for layer in &mut self.layout_layers {
+            let root = &mut layer.root;
+            if Self::surgery_tree_node(root, primary, neighbor, drag_dir, &rect_map) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 辅助函数：黑盒切分直接子节点
+    fn split_node_by_child_containing(
+        node: &layout::LayoutNode,
+        target_id: &str,
+    ) -> (Vec<layout::LayoutNode>, Option<layout::LayoutNode>, Vec<layout::LayoutNode>) {
+        if Self::is_node_id_match(node, target_id) {
+            return (Vec::new(), Some(node.clone()), Vec::new());
+        }
+        if let layout::LayoutNode::Container { children, .. } = node {
+            if let Some(idx) = children.iter().position(|c| Self::contains_node(c, target_id)) {
+                let before = children[..idx].to_vec();
+                let middle = children[idx].clone();
+                let after = children[idx+1..].to_vec();
+                return (before, Some(middle), after);
+            }
+        }
+        (Vec::new(), None, Vec::new())
+    }
+
+
+    fn surgery_tree_node(
+        node: &mut layout::LayoutNode,
+        primary: &str,
+        neighbor: &str,
+        drag_dir: layout::Direction,
+        rect_map: &std::collections::HashMap<String, layout::WindowRect>
+    ) -> bool {
+        if let layout::LayoutNode::Container { direction, children, .. } = node {
+            let dir_val = *direction;
+
+            let mut p_child_idx = None;
+            let mut n_child_idx = None;
+            for (i, child) in children.iter().enumerate() {
+                if Self::contains_node(child, primary) { p_child_idx = Some(i); }
+                if Self::contains_node(child, neighbor) { n_child_idx = Some(i); }
+            }
+
+            if let (Some(idx_p), Some(idx_n)) = (p_child_idx, n_child_idx) {
+                if idx_p != idx_n {
+                    let c1 = &children[idx_p];
+                    let c2 = &children[idx_n];
+
+                    if dir_val == drag_dir {
+                        let p_is_direct = Self::is_node_id_match(c1, primary);
+                        let n_is_direct = Self::is_node_id_match(c2, neighbor);
+                        if p_is_direct && n_is_direct {
+                            return false;
+                        }
+                    }
+
+                    let c1_dir = match c1 {
+                        layout::LayoutNode::Container { direction, .. } => Some(*direction),
+                        _ => None,
+                    };
+                    let c2_dir = match c2 {
+                        layout::LayoutNode::Container { direction, .. } => Some(*direction),
+                        _ => None,
+                    };
+
+                    if let (Some(d1), Some(d2)) = (c1_dir, c2_dir) {
+                        if d1 != d2 { return false; }
+                    }
+
+                    let (before_p, p_node_opt, after_p) = Self::split_node_by_child_containing(c1, primary);
+                    let (before_n, n_node_opt, after_n) = Self::split_node_by_child_containing(c2, neighbor);
+
+                    if let (Some(p_node), Some(n_node)) = (p_node_opt, n_node_opt) {
+
+
+                        let p_pos = Self::get_node_physical_rect(&p_node, rect_map).unwrap_or_default();
+                        let n_pos = Self::get_node_physical_rect(&n_node, rect_map).unwrap_or_default();
+
+                        let before_packed = Self::project_and_pack(before_p, before_n, drag_dir, rect_map);
+                        let after_packed = Self::project_and_pack(after_p, after_n, drag_dir, rect_map);
+
+                        let is_p_first = match drag_dir {
+                            layout::Direction::Horizontal => p_pos.start_col <= n_pos.start_col,
+                            layout::Direction::Vertical => p_pos.start_row <= n_pos.start_row,
+                        };
+                        let new_core = layout::LayoutNode::Container {
+                            id: crate::layout::generate_container_id_pub(),
+                            direction: drag_dir,
+                            percent: None,
+                            children: if is_p_first { vec![p_node, n_node] } else { vec![n_node, p_node] },
+                        };
+
+                        let mut sequence = Vec::new();
+                        sequence.extend(before_packed);
+                        sequence.push(new_core);
+                        sequence.extend(after_packed);
+
+                        let wrap_dir = c1_dir.or(c2_dir).unwrap_or(dir_val);
+                        let c1_pct = match c1 {
+                            layout::LayoutNode::Container { percent, .. } => (*percent).unwrap_or(0),
+                            layout::LayoutNode::Window { size: Some(layout::WindowSize::Percent(p)), .. } => *p,
+                            _ => 0,
+                        };
+                        let c2_pct = match c2 {
+                            layout::LayoutNode::Container { percent, .. } => (*percent).unwrap_or(0),
+                            layout::LayoutNode::Window { size: Some(layout::WindowSize::Percent(p)), .. } => *p,
+                            _ => 0,
+                        };
+                        let total_pct = c1_pct.saturating_add(c2_pct);
+
+                        let replacement_node = if sequence.len() == 1 {
+                            sequence.remove(0)
+                        } else {
+                            layout::LayoutNode::Container {
+                                id: crate::layout::generate_container_id_pub(),
+                                direction: wrap_dir,
+                                percent: if total_pct > 0 { Some(total_pct) } else { None },
+                                children: sequence,
+                            }
+                        };
+
+                        let mut new_children = Vec::new();
+                        let insert_idx = idx_p.min(idx_n);
+                        for (i, child) in children.iter().enumerate() {
+                            if i == idx_p || i == idx_n {
+                                if i == insert_idx {
+                                    new_children.push(replacement_node.clone());
+                                }
+                            } else {
+                                new_children.push(child.clone());
+                            }
+                        }
+
+                        *children = new_children;
+                        return true;
+                    }
                 }
             }
+
+            for child in children.iter_mut() {
+                if Self::surgery_tree_node(child, primary, neighbor, drag_dir, rect_map) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn project_and_pack(
+        list_p: Vec<layout::LayoutNode>,
+        list_n: Vec<layout::LayoutNode>,
+        drag_dir: layout::Direction,
+        _rect_map: &std::collections::HashMap<String, layout::WindowRect>
+    ) -> Vec<layout::LayoutNode> {
+        let mut result_containers: Vec<layout::LayoutNode> = Vec::new();
+        if list_p.is_empty() && list_n.is_empty() { return result_containers; }
+
+        // 【修复】使用最大长度遍历，安全处理两个列表长度不一致的情况，避免越界 panic 或错误打包
+        let max_len = list_p.len().max(list_n.len());
+        for i in 0..max_len {
+            let p_clone = list_p.get(i).cloned();
+            let n_clone = list_n.get(i).cloned();
+
+            // combine_packed 已经完美处理了 Option 为 None 的情况
+            if let Some(c) = Self::combine_packed(p_clone, n_clone, drag_dir) {
+                result_containers.push(c);
+            }
+        }
+        result_containers
+    }
+
+    /// 辅助函数：组合打包块 (防呆 #5：零节点穿透)
+    fn combine_packed(
+        p: Option<layout::LayoutNode>,
+        n: Option<layout::LayoutNode>,
+        dir: layout::Direction
+    ) -> Option<layout::LayoutNode> {
+        match (p, n) {
+            (None, None) => None,
+            (Some(x), None) => Some(x),
+            (None, Some(y)) => Some(y),
+            (Some(x), Some(y)) => Some(layout::LayoutNode::Container {
+                id: crate::layout::generate_container_id_pub(),
+                direction: dir,
+                percent: None,
+                children: vec![x, y],
+            }),
+        }
+    }
+
+    fn is_node_id_match(node: &layout::LayoutNode, id: &str) -> bool {
+        match node {
+            layout::LayoutNode::Window { name, .. } => name == id,
+            layout::LayoutNode::Container { id: node_id, .. } => node_id == id,
         }
     }
 
@@ -1555,10 +1788,15 @@ impl Engine {
         }
     }
 
-    fn set_node_percent(node: &mut layout::LayoutNode, pct: Option<u16>) {
+    fn set_node_percent(node: &mut layout::LayoutNode, pct: Option<layout::WindowSize>) {
         match node {
-            layout::LayoutNode::Window { size, .. } => *size = pct.map(layout::WindowSize::Percent),
-            layout::LayoutNode::Container { percent, .. } => *percent = pct,
+            layout::LayoutNode::Window { size, .. } => *size = pct,
+            layout::LayoutNode::Container { percent, .. } => {
+                *percent = match pct {
+                    Some(layout::WindowSize::Percent(p)) => Some(p),
+                    _ => None,
+                };
+            }
         }
     }
 
@@ -1569,26 +1807,9 @@ impl Engine {
         }
     }
 
-    fn extract_node_by_id(node: &layout::LayoutNode, target_id: &str) -> Option<layout::LayoutNode> {
-        match node {
-            layout::LayoutNode::Window { name, .. } => {
-                if name == target_id { Some(node.clone()) } else { None }
-            }
-            layout::LayoutNode::Container { children, .. } => {
-                for child in children {
-                    if let Some(found) = Self::extract_node_by_id(child, target_id) {
-                        return Some(found);
-                    }
-                }
-                None
-            }
-        }
-    }
-
     fn search_parent_container(node: &layout::LayoutNode, target_id: &str) -> Option<String> {
         match node {
             layout::LayoutNode::Container { id, children, .. } => {
-                // 检查目标是否在直接子节点中
                 for child in children {
                     let child_id = match child {
                         layout::LayoutNode::Window { name, .. } => name.as_str(),
@@ -1598,7 +1819,6 @@ impl Engine {
                         return Some(id.clone());
                     }
                 }
-                // 递归搜索
                 for child in children {
                     if let Some(parent) = Self::search_parent_container(child, target_id) {
                         return Some(parent);
@@ -1609,4 +1829,5 @@ impl Engine {
             _ => None,
         }
     }
+
 }

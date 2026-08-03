@@ -4,7 +4,6 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use crate::protocol::Entity;
 
-const MAX_LINES: usize = 300;
 const MAX_LINE_CHARS: usize = 500;
 const MAX_TOTAL_BYTES: usize = 1024 * 1024;
 
@@ -41,7 +40,7 @@ pub fn replace_placeholders_in_args(
     }).collect()
 }
 
-pub fn execute_command_args(cmd_args: &[String]) -> std::io::Result<(i32, String)> {
+pub fn execute_command_args(cmd_args: &[String], max_lines: usize) -> std::io::Result<(i32, String)> {
     if cmd_args.is_empty() {
         return Ok((0, String::new()));
     }
@@ -55,12 +54,27 @@ pub fn execute_command_args(cmd_args: &[String]) -> std::io::Result<(i32, String
         .stderr(Stdio::piped())
         .spawn()?;
 
+    let child_stderr = child.stderr.take();
+
+    // 【修复 Bug #2】使用独立线程读取 stderr，防止管道死锁
+    let stderr_thread = std::thread::spawn(move || {
+        let mut stderr_buf = String::new();
+        if let Some(err) = child_stderr {
+            let reader = BufReader::new(err);
+            for line in reader.lines().flatten() {
+                stderr_buf.push_str(&line);
+                stderr_buf.push('\n');
+                if stderr_buf.len() > 1024 { break; }
+            }
+        }
+        stderr_buf
+    });
+
     let mut stdout_buf = String::new();
-    let mut stderr_buf = String::new();
     let mut line_count = 0;
-    let mut truncated_lines = 0;
     let mut total_bytes = 0;
     let mut killed_due_to_limit = false;
+    let mut truncated_lines = 0;
 
     if let Some(out) = child.stdout.take() {
         let reader = BufReader::new(out);
@@ -69,15 +83,15 @@ pub fn execute_command_args(cmd_args: &[String]) -> std::io::Result<(i32, String
             let line = line?;
 
             if total_bytes + line.len() > MAX_TOTAL_BYTES {
-                child.kill()?;
+                let _ = child.kill();
                 killed_due_to_limit = true;
                 break;
             }
 
             line_count += 1;
 
-            if line_count > MAX_LINES {
-                child.kill()?;
+            if line_count > max_lines {
+                let _ = child.kill();
                 killed_due_to_limit = true;
                 truncated_lines += 1;
                 break;
@@ -103,15 +117,7 @@ pub fn execute_command_args(cmd_args: &[String]) -> std::io::Result<(i32, String
         }
     }
 
-    if let Some(err) = child.stderr.take() {
-        let reader = BufReader::new(err);
-        for line in reader.lines() {
-            let line = line?;
-            stderr_buf.push_str(&line);
-            stderr_buf.push('\n');
-            if stderr_buf.len() > 1024 { break; }
-        }
-    }
+    let stderr_buf = stderr_thread.join().unwrap_or_default();
 
     if truncated_lines > 0 || killed_due_to_limit {
         stdout_buf.push_str(&format!("\n... [stree: output truncated due to limits] ...\n"));
