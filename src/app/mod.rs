@@ -423,12 +423,16 @@ impl Engine {
             let has_window = Self::layout_contains_window(layer, name);
             if has_window {
                 layer.visible = !layer.visible;
+                self.mark_all_dirty();
+                self.prev_rects.clear();
                 return;
             }
         }
         if let Ok(idx) = name.parse::<usize>() {
             if let Some(layer) = self.layout_layers.get_mut(idx) {
                 layer.visible = !layer.visible;
+                self.mark_all_dirty();
+                self.prev_rects.clear();
             }
         }
     }
@@ -437,13 +441,21 @@ impl Engine {
         for layer in &mut self.layout_layers {
             let has_window = Self::layout_contains_window(layer, name);
             if has_window {
-                layer.visible = visible;
+                if layer.visible != visible {
+                    layer.visible = visible;
+                    self.mark_all_dirty();
+                    self.prev_rects.clear(); // 【关键修复】
+                }
                 return;
             }
         }
         if let Ok(idx) = name.parse::<usize>() {
             if let Some(layer) = self.layout_layers.get_mut(idx) {
-                layer.visible = visible;
+                if layer.visible != visible {
+                    layer.visible = visible;
+                    self.mark_all_dirty();
+                    self.prev_rects.clear(); // 【关键修复】
+                }
             }
         }
     }

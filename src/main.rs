@@ -11,11 +11,12 @@ mod signal;
 mod style;
 mod tree;
 mod ui;
+mod runner;
 
 use clap::{Parser, Subcommand};
 use crossterm::{terminal, ExecutableCommand};
 use crossterm::event::{self, Event, KeyCode, EnableMouseCapture, DisableMouseCapture};
-use std::io::{self, stdout, Read, Write, IsTerminal};
+use std::io::{self, stdout, Read, IsTerminal};
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -43,7 +44,6 @@ struct Cli {
     statusbars: Vec<String>,
     #[arg(long = "input", action = clap::ArgAction::Append)]
     inputs: Vec<String>,
-    // --overlay 已彻底删除，改用 --layout "@(x,y) ..."
 
     #[arg(long = "bind", action = clap::ArgAction::Append)]
     binds: Vec<String>,
@@ -369,7 +369,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 match key_event.code {
                     _ => {
-                        if let Some((full_cmd_args, is_silent)) = engine.prepare_key_binding_args(&key_event, columns, rows) {
+                        if let Some((full_cmd_args, is_silent)) = engine.prepare_key_binding_args(key_event, columns, rows) {
                             if let Some(internal_cmd) = app::InternalCommand::from_args(&full_cmd_args) {
                                 match internal_cmd {
                                     app::InternalCommand::Exit => break 'main_loop,
@@ -413,7 +413,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app::InternalCommand::ScrollRight => engine.scroll_right(),
                                 }
                             } else {
-                                execute_binding(&mut engine, &full_cmd_args, is_silent, columns, rows);
+                                runner::execute_binding(&mut engine, &full_cmd_args, is_silent, columns, rows);
                             }
                         }
                     }
@@ -664,6 +664,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ==========================================
         // 3. 渲染 (渲染器只看 all_rects，不知道谁改了它)
         // ==========================================
+
+        // 【关键修复】事件可能改变了图层显隐状态，如果触发了全屏重绘(prev_rects被清空)，
+        // 必须重算 all_rects，确保渲染的是最新的布局真相，不留空白！
+        if engine.prev_rects.is_empty() {
+            all_rects = engine.calc_all_rects(columns, rows);
+        }
+
         // 【优化】在渲染前统一处理积压的状态变更
         engine.flush_pending_updates(columns, rows);
 
@@ -719,65 +726,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
-
-}
-
-fn drain_terminal_events() {
-    let mut drain_count = 0;
-    while crossterm::event::poll(Duration::ZERO).unwrap_or(false) && drain_count < 100 {
-        let _ = crossterm::event::read();
-        drain_count += 1;
-    }
-}
-
-fn execute_binding(
-    engine: &mut app::Engine,
-    full_cmd_args: &[String],
-    is_silent: bool,
-    columns: u16,
-    rows: u16,
-) {
-    if is_silent {
-        match exec::execute_command_silent(full_cmd_args) {
-            Ok(code) => {
-                if code != 0 {
-                    engine.last_error = Some(format!("Silent cmd exited with code {}", code));
-                }
-            }
-            Err(e) => {
-                engine.last_error = Some(e.to_string());
-            }
-        }
-        drain_terminal_events();
-    } else {
-        let _ = terminal::disable_raw_mode();
-        let _ = stdout().execute(DisableMouseCapture);
-        let _ = stdout().execute(terminal::LeaveAlternateScreen);
-        let _ = stdout().execute(crossterm::cursor::Show);
-        let _ = stdout().flush();
-
-        let mut cmd = std::process::Command::new(&full_cmd_args[0]);
-        cmd.args(&full_cmd_args[1..]);
-        if let Ok(tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
-            if let Ok(stdin_c) = tty.try_clone() { cmd.stdin(stdin_c); }
-            if let Ok(stdout_c) = tty.try_clone() { cmd.stdout(stdout_c); }
-            cmd.stderr(tty);
-        }
-
-        let status = cmd.status();
-        drain_terminal_events();
-
-        let _ = stdout().execute(crossterm::cursor::Hide);
-        let _ = stdout().execute(terminal::EnterAlternateScreen);
-        let _ = stdout().execute(EnableMouseCapture);
-        let _ = terminal::enable_raw_mode();
-
-        match status {
-            Ok(s) => {
-                if s.success() { engine.trigger_reload(columns, rows); }
-                else { engine.last_error = Some(format!("退出码: {}", s.code().unwrap_or(-1))); }
-            }
-            Err(e) => { engine.last_error = Some(e.to_string()); }
-        }
-    }
 }
