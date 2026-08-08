@@ -519,8 +519,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // 2. 处理鼠标事件
+            // 【优化2】将排序和收集移到循环外，避免每个鼠标事件都重复分配和排序
             let mut sorted_rects: Vec<_> = all_rects.iter().collect();
             sorted_rects.sort_by(|a, b| b.3.cmp(&a.3));
+
+            // 【修复借用冲突】使用 clone 截断对 engine 的不可变借用，允许循环内部对 engine 进行可变操作
+            let mut sorted_edges: Vec<_> = engine.drag.cached_edges.clone();
+            sorted_edges.sort_by(|a, b| b.z_index.cmp(&a.z_index));
 
             for mouse_event in &mouse_events {
                 if !engine.mouse.enabled { continue; }
@@ -637,20 +642,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // 2. 次优先检测：底层 Flexbox 边缘
-                let mut sorted_edges: Vec<_> = engine.drag.cached_edges.iter().collect();
-                sorted_edges.sort_by(|a, b| b.z_index.cmp(&a.z_index));
-
+                // 【优化2】去除了原本在这里的 sorted_edges 收集和排序，直接使用外部的 sorted_edges
                 let mut hit_edge = None;
                 // 【关键修复】如果鼠标点在了浮动窗口内部，直接跳过 Flexbox 边缘检测！
                 if !hit_floating_inside {
-                    for edge in sorted_edges {
+                    for edge in &sorted_edges {
                         let in_x = mouse_event.column >= edge.hit_rect.start_col
                             && mouse_event.column < edge.hit_rect.start_col + edge.hit_rect.width;
                         let in_y = mouse_event.row >= edge.hit_rect.start_row
                             && mouse_event.row < edge.hit_rect.start_row + edge.hit_rect.height;
 
                         if in_x && in_y {
-                            hit_edge = Some(edge);
+                            hit_edge = Some(edge.clone());
                             break;
                         }
                     }
@@ -890,7 +893,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // 如果之前有因加载中而被挂起的更新，现在重新触发
-        if let Some(_view_name) = engine.pending_view_reload.take() {
+        if !engine.pending_view_reload.is_empty() {
+            engine.pending_view_reload.clear();
             if let app::Focus::Component(tree_name) = &engine.focus.current {
                 let tree_name = tree_name.clone(); // 【修复】提前 clone，释放不可变借用
                 engine.broadcast_selection_changed(&tree_name, columns, rows);

@@ -4,6 +4,7 @@ use crate::app::Engine;
 use crate::exec;
 use crossterm::{terminal, ExecutableCommand, cursor, event::{EnableMouseCapture, DisableMouseCapture}};
 use std::io::{stdout, Write};
+use std::process::Command;
 use std::time::Duration;
 
 pub fn drain_terminal_events() {
@@ -24,53 +25,84 @@ pub fn execute_binding(
     if is_silent {
         match exec::execute_command_silent(full_cmd_args) {
             Ok(code) => {
-                if code != 0 {
-                    engine.last_error = Some(format!("Silent cmd exited with code {}", code));
-                } else {
-                    // 【修复死锁】静默命令成功后，由引擎自动触发重载！
-                    // 彻底废弃在脚本中调用 stree update MainTree 的做法。
+                if code == 0 {
+                    // 1. 重新加载所有 Tree 组件的数据
                     engine.trigger_reload(columns, rows);
+
+                    // 2. 静默命令可能修改了文件内容，清空 View 缓存强制刷新
+                    for comp in engine.components.values_mut() {
+                        if let crate::app::Component::View(v) = comp {
+                            v.cached_entity_id = None;
+                        }
+                    }
+                    if let crate::app::Focus::Component(name) = &engine.focus.current.clone() {
+                        let name = name.clone();
+                        engine.broadcast_selection_changed(&name, columns, rows);
+                    }
+                } else {
+                    engine.last_error = Some(format!("Command failed with code {}", code));
                 }
             }
             Err(e) => {
-                engine.last_error = Some(e.to_string());
+                engine.last_error = Some(format!("Failed to execute: {}", e));
             }
         }
-        drain_terminal_events();
+        drain_terminal_events()
     } else {
+        // 【终极修复】非静默命令（如 vi, less 等）通常是交互式 TUI 程序。
+        // 它们必须直接接管终端的 stdin/stdout/stderr。
+        // 绝不能使用 exec::execute_command_args（它会 pipe stdout），
+        // 否则子进程会发现 stdout 不是 TTY，导致 vi 无法渲染界面并死锁卡死！
+
+        let mut out = stdout();
+
+        // 1. 挂起 stree 的 TUI 接管状态，把终端还原给普通 Shell
         let _ = terminal::disable_raw_mode();
-        let _ = stdout().execute(DisableMouseCapture);
-        let _ = stdout().execute(terminal::LeaveAlternateScreen);
-        let _ = stdout().execute(cursor::Show);
-        let _ = stdout().flush();
+        let _ = out.execute(DisableMouseCapture);
+        let _ = out.execute(terminal::LeaveAlternateScreen);
+        let _ = out.execute(cursor::Show);
+        let _ = out.flush();
 
-        let mut cmd = std::process::Command::new(&full_cmd_args[0]);
-        cmd.args(&full_cmd_args[1..]);
-        if let Ok(tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
-            if let Ok(stdin_c) = tty.try_clone() { cmd.stdin(stdin_c); }
-            if let Ok(stdout_c) = tty.try_clone() { cmd.stdout(stdout_c); }
-            cmd.stderr(tty);
-        }
+        // 2. 直接继承终端执行命令，不捕获 stdout
+        let status = Command::new(&full_cmd_args[0])
+            .args(&full_cmd_args[1..])
+            .status();
 
-        let status = cmd.status();
-        drain_terminal_events();
-
-        let _ = stdout().execute(cursor::Hide);
-        let _ = stdout().execute(terminal::EnterAlternateScreen);
-        let _ = stdout().execute(EnableMouseCapture);
+        // 3. 命令结束后，立刻恢复 stree 的 TUI 接管状态
+        let _ = out.execute(terminal::EnterAlternateScreen);
+        let _ = out.execute(EnableMouseCapture);
+        let _ = out.execute(cursor::Hide);
         let _ = terminal::enable_raw_mode();
+        let _ = out.flush();
 
-        // 【关键修复】重新进入 Alternate Screen 后，终端物理屏幕已被清空。
-        // 必须清空 prev_rects 强制触发全量重绘，否则 diff 引擎会认为画面没变，导致白屏！
-        engine.prev_rects.clear();
-        engine.mark_all_dirty();
-
+        // 4. 处理返回结果
         match status {
             Ok(s) => {
-                if s.success() { engine.trigger_reload(columns, rows); }
-                else { engine.last_error = Some(format!("退出码: {}", s.code().unwrap_or(-1))); }
+                if !s.success() {
+                    engine.last_error = Some(format!("Command exited with code {}", s.code().unwrap_or(-1)));
+                }
             }
-            Err(e) => { engine.last_error = Some(e.to_string()); }
+            Err(e) => {
+                engine.last_error = Some(format!("Failed to execute: {}", e));
+            }
         }
+
+        // 【关键修复】交互式命令（如 nvim 修改文件后），也必须强制刷新数据和预览！
+        // 否则退回 stree 后 Preview 依然是旧内容。
+        engine.trigger_reload(columns, rows);
+        for comp in engine.components.values_mut() {
+            if let crate::app::Component::View(v) = comp {
+                v.cached_entity_id = None;
+            }
+        }
+        if let crate::app::Focus::Component(name) = &engine.focus.current.clone() {
+            let name = name.clone();
+            engine.broadcast_selection_changed(&name, columns, rows);
+        }
+
+        // 5. 清理在阻塞期间积压的终端事件，并强制下一帧全屏重绘
+        drain_terminal_events();
+        engine.mark_all_dirty();
+        engine.prev_rects.clear();
     }
 }

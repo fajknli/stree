@@ -2,8 +2,11 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::time::Duration;
 
 const MAX_DATA_SIZE: usize = 512 * 1024; // 512KB 硬上限
+const IPC_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const IPC_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct IpcServer {
     pub socket_path: String,
@@ -31,6 +34,10 @@ impl IpcServer {
         loop {
             match self.listener.accept() {
                 Ok((mut stream, _)) => {
+                    // 【防御性优化】为已接受的连接设置读写超时，防止恶意或卡死的客户端阻塞主渲染循环
+                    let _ = stream.set_read_timeout(Some(IPC_READ_TIMEOUT));
+                    let _ = stream.set_write_timeout(Some(IPC_WRITE_TIMEOUT));
+
                     if let Err(e) = handle_connection(&mut stream, &mut handler) {
                         eprintln!("[stree-engine] IPC 处理错误: {}", e);
                     }
@@ -102,7 +109,8 @@ pub fn run_ctrl_command(target: &str) -> Result<(), Box<dyn std::error::Error>> 
     };
 
     let mut data = String::new();
-    std::io::stdin().read_to_string(&mut data)?;
+    // 【安全加固】限制 stdin 读取上限，复用服务端的 MAX_DATA_SIZE 硬限制，防止 OOM
+    std::io::stdin().take(MAX_DATA_SIZE as u64).read_to_string(&mut data)?;
 
     let target_bytes = target.as_bytes();
     let target_len = target_bytes.len() as u32;

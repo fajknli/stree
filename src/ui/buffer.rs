@@ -32,6 +32,13 @@ impl Buffer {
         }
     }
 
+    // 【新增】清空缓冲区，复用底层内存，避免每帧重新分配 Vec
+    pub fn clear(&mut self) {
+        for cell in self.cells.iter_mut() {
+            *cell = Cell::default();
+        }
+    }
+
     pub fn set_cell(&mut self, x: usize, y: usize, symbol: char, fg: Color, bg: Option<Color>, bold: bool) {
         if x < self.width && y < self.height {
             let idx = y * self.width + x;

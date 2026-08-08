@@ -25,7 +25,7 @@ impl Engine {
             if let Component::View(v) = comp {
                 let new_cached_id = selected_entity.as_ref().map(|e| e.id.clone());
                 if v.cached_entity_id == new_cached_id && !v.content_buffer.is_empty() { continue; }
-                if v.is_loading { self.pending_view_reload = Some(view_name.clone()); continue; }
+                if v.is_loading { self.pending_view_reload.insert(view_name.clone()); continue; }
 
                 let width_str = v.rect_width.to_string();
                 let height_str = v.rect_height.to_string();
@@ -169,9 +169,9 @@ impl Engine {
             if let Some(cmd) = source_cmd {
                 match crate::exec::execute_reload_hook(Some(&cmd)) {
                     Ok(stdout) => {
-                        if !stdout.trim().is_empty() {
-                            self.handle_ipc_update(&name, &stdout, term_width, term_height);
-                        }
+                        // 【修复】去掉非空判断！只要命令执行成功，无论是否有数据，
+                        // 都必须传递给 handle_ipc_update，以便清空旧的幽灵节点！
+                        self.handle_ipc_update(&name, &stdout, term_width, term_height);
                     }
                     Err(e) => {
                         self.last_error = Some(format!("Reload failed for {}: {}", name, e));
