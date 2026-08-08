@@ -8,6 +8,7 @@ pub struct InputState {
     pub prefix: String,         // "/" 或 ":" 等
     pub last_rendered: String,
     pub on_submit: Option<String>, // 提交时执行的命令模板
+    pub on_submit_is_silent: bool,
 }
 
 impl InputState {
@@ -18,6 +19,7 @@ impl InputState {
             is_active: false,
             prefix: prefix.to_string(),
             on_submit: None,
+            on_submit_is_silent: false,
             last_rendered: String::new(),
         }
     }
@@ -38,20 +40,13 @@ impl InputState {
         }
     }
 
-    pub fn move_left(&mut self) {
-        if self.cursor > 0 { self.cursor -= 1; }
-    }
-
+    pub fn move_left(&mut self) { if self.cursor > 0 { self.cursor -= 1; } }
     pub fn move_right(&mut self) {
         let char_count = self.buffer.chars().count();
         if self.cursor < char_count { self.cursor += 1; }
     }
-
     pub fn move_home(&mut self) { self.cursor = 0; }
-
-    pub fn move_end(&mut self) {
-        self.cursor = self.buffer.chars().count();
-    }
+    pub fn move_end(&mut self) { self.cursor = self.buffer.chars().count(); }
 
     pub fn clear(&mut self) {
         self.buffer.clear();

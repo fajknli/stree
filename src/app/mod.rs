@@ -75,6 +75,12 @@ pub enum InternalCommand {
     HideLayout(String),
     ScrollLeft,
     ScrollRight,
+    // 【新增】
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
+    CycleLayer,
 }
 
 impl InternalCommand {
@@ -101,6 +107,12 @@ impl InternalCommand {
             ("__HIDE_LAYOUT__", Some(name)) => Some(Self::HideLayout(name)),
             ("__SCROLL_LEFT__", None) => Some(Self::ScrollLeft),
             ("__SCROLL_RIGHT__", None) => Some(Self::ScrollRight),
+            // 【新增映射】
+            ("__FOCUS_LEFT__", None) => Some(Self::FocusLeft),
+            ("__FOCUS_RIGHT__", None) => Some(Self::FocusRight),
+            ("__FOCUS_UP__", None) => Some(Self::FocusUp),
+            ("__FOCUS_DOWN__", None) => Some(Self::FocusDown),
+            ("__CYCLE_LAYER__", None) => Some(Self::CycleLayer),
             _ => None,
         }
     }
@@ -109,6 +121,8 @@ impl InternalCommand {
 #[derive(Debug, Clone)]
 pub enum DragTarget {
     ResizeEdge(String, String, layout::Direction),
+    // 【新增】拖拽浮动窗口边缘 (图层名称, 位掩码: 1=Left, 2=Right, 4=Top, 8=Bottom)
+    ResizeFloating(String, u8),
 }
 
 #[derive(Debug, Default)]
@@ -126,6 +140,11 @@ pub struct DragState {
     pub initial_t1_rect: WindowRect,
     pub initial_t2_rect: WindowRect,
     pub is_restructured: bool,
+    // 【新增】浮动窗口拖拽专用：记录初始状态
+    pub initial_width: u16,
+    pub initial_height: u16,
+    pub initial_anchor_x: u16,
+    pub initial_anchor_y: u16,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -143,7 +162,7 @@ pub struct MouseState {
 
 #[derive(Debug, Default)]
 pub struct SignalState {
-    pub last_emit: HashMap<String, Instant>,
+    pub last_emit: std::collections::HashMap<&'static str, Instant>,
     pub last_emitted_select_id: Option<String>,
 }
 
@@ -171,25 +190,25 @@ pub struct Engine {
     pub pending_view_reload: Option<String>,
     pub prev_term_size: (u16, u16),
     pub ui_theme: crate::style::UiTheme,
+    pub focus_history: Vec<String>,
 }
 
-fn parse_component_prefixes(cfg: &str) -> (bool, bool, bool, String) {
+fn parse_component_prefixes(cfg: &str) -> (bool, bool, bool, &str) {
     let mut click = false;
     let mut focus = false;
     let mut nomark = false;
-    let mut rest = cfg.to_string();
+    let mut rest = cfg.trim();
 
     loop {
-        let current = rest.as_str();
-        if current.starts_with("click:") {
+        if let Some(stripped) = rest.strip_prefix("click:") {
             click = true;
-            rest = current[6..].to_string();
-        } else if current.starts_with("focus:") {
+            rest = stripped.trim();
+        } else if let Some(stripped) = rest.strip_prefix("focus:") {
             focus = true;
-            rest = current[6..].to_string();
-        } else if current.starts_with("nomark:") {
+            rest = stripped.trim();
+        } else if let Some(stripped) = rest.strip_prefix("nomark:") {
             nomark = true;
-            rest = current[7..].to_string();
+            rest = stripped.trim();
         } else {
             break;
         }
@@ -233,7 +252,8 @@ impl Engine {
         let mut first_tree_name = None;
 
         for t_cfg in trees {
-            let (click_to_fire, focus_to_fire, markable, rest) = parse_component_prefixes(&t_cfg);
+            let (click_to_fire, focus_to_fire, nomark, rest) = parse_component_prefixes(&t_cfg);
+            let markable = !nomark; // 【修复】反转逻辑：没有声明 nomark 的树，默认都是可标记的
             let parts: Vec<&str> = rest.splitn(2, ':').collect();
             let name = parts[0].to_string();
             let source_cmd = parts.get(1).map(|s| s.to_string());
@@ -325,10 +345,22 @@ impl Engine {
             let parts: Vec<&str> = i_cfg.splitn(3, ':').collect();
             let name = parts[0].to_string();
             let prefix = parts.get(1).filter(|s| !s.is_empty()).map(|s| s.to_string()).unwrap_or_else(|| ":".to_string());
-            let on_submit = parts.get(2).map(|s| s.to_string());
+            let on_submit_raw = parts.get(2).map(|s| s.to_string());
+
+            // 【修复】统一返回 Option<String>
+            let (is_silent, on_submit) = if let Some(ref cmd) = on_submit_raw {
+                if cmd.starts_with('@') {
+                    (true, Some(cmd[1..].to_string()))
+                } else {
+                    (false, Some(cmd.clone()))
+                }
+            } else {
+                (false, None)
+            };
 
             let mut input_state = InputState::new(&prefix);
             input_state.on_submit = on_submit;
+            input_state.on_submit_is_silent = is_silent;
             components.insert(name, Component::Input(input_state));
         }
 
@@ -366,6 +398,7 @@ impl Engine {
             pending_view_reload: None,
             prev_term_size: (0, 0),
             ui_theme: crate::style::UiTheme::parse(ui_colors),
+            focus_history: Vec::new(),
         };
 
         engine.is_initialized = false;
@@ -423,6 +456,35 @@ impl Engine {
             let has_window = Self::layout_contains_window(layer, name);
             if has_window {
                 layer.visible = !layer.visible;
+
+                if layer.visible {
+                    // 打开图层：获取焦点
+                    if let Some(win_name) = Self::get_first_window_name(&layer.root) {
+                        self.set_focus(&win_name);
+                    }
+                } else {
+                    // 关闭图层：如果关的是当前焦点，从历史栈找上一个可见的
+                    if let Focus::Component(curr_name) = &self.focus.current {
+                        if Self::layout_contains_window(layer, curr_name) {
+                            let mut restored = false;
+                            while let Some(prev_name) = self.focus_history.pop() {
+                                let is_visible = self.layout_layers.iter().any(|l| l.visible && Self::layout_contains_window(l, &prev_name));
+                                if is_visible {
+                                    self.focus.current = Focus::Component(prev_name.clone());
+                                    self.mark_dirty(&prev_name);
+                                    restored = true;
+                                    break;
+                                }
+                            }
+                            if !restored {
+                                if let Some(main_tree) = self.focus.main_tree_name.clone() {
+                                    self.set_focus(&main_tree);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 self.mark_all_dirty();
                 self.prev_rects.clear();
                 return;
@@ -431,6 +493,21 @@ impl Engine {
         if let Ok(idx) = name.parse::<usize>() {
             if let Some(layer) = self.layout_layers.get_mut(idx) {
                 layer.visible = !layer.visible;
+
+                if layer.visible {
+                    if let Some(win_name) = Self::get_first_window_name(&layer.root) {
+                        self.set_focus(&win_name);
+                    }
+                } else {
+                    if let Focus::Component(curr_name) = &self.focus.current {
+                        if Self::layout_contains_window(layer, curr_name) {
+                            if let Some(main_tree) = self.focus.main_tree_name.clone() {
+                                self.set_focus(&main_tree);
+                            }
+                        }
+                    }
+                }
+
                 self.mark_all_dirty();
                 self.prev_rects.clear();
             }
@@ -443,8 +520,35 @@ impl Engine {
             if has_window {
                 if layer.visible != visible {
                     layer.visible = visible;
+
+                    if visible {
+                        if let Some(win_name) = Self::get_first_window_name(&layer.root) {
+                            self.set_focus(&win_name);
+                        }
+                    } else {
+                        if let Focus::Component(curr_name) = &self.focus.current {
+                            if Self::layout_contains_window(layer, curr_name) {
+                                let mut restored = false;
+                                while let Some(prev_name) = self.focus_history.pop() {
+                                    let is_visible = self.layout_layers.iter().any(|l| l.visible && Self::layout_contains_window(l, &prev_name));
+                                    if is_visible {
+                                        self.focus.current = Focus::Component(prev_name.clone());
+                                        self.mark_dirty(&prev_name);
+                                        restored = true;
+                                        break;
+                                    }
+                                }
+                                if !restored {
+                                    if let Some(main_tree) = self.focus.main_tree_name.clone() {
+                                        self.set_focus(&main_tree);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     self.mark_all_dirty();
-                    self.prev_rects.clear(); // 【关键修复】
+                    self.prev_rects.clear();
                 }
                 return;
             }
@@ -453,8 +557,23 @@ impl Engine {
             if let Some(layer) = self.layout_layers.get_mut(idx) {
                 if layer.visible != visible {
                     layer.visible = visible;
+
+                    if visible {
+                        if let Some(win_name) = Self::get_first_window_name(&layer.root) {
+                            self.set_focus(&win_name);
+                        }
+                    } else {
+                        if let Focus::Component(curr_name) = &self.focus.current {
+                            if Self::layout_contains_window(layer, curr_name) {
+                                if let Some(main_tree) = self.focus.main_tree_name.clone() {
+                                    self.set_focus(&main_tree);
+                                }
+                            }
+                        }
+                    }
+
                     self.mark_all_dirty();
-                    self.prev_rects.clear(); // 【关键修复】
+                    self.prev_rects.clear();
                 }
             }
         }
@@ -472,22 +591,118 @@ impl Engine {
         check_node(&layer.root, name)
     }
 
-    pub fn emit(&mut self, signal: &str, term_width: u16, term_height: u16) -> bool {
+    // 【新增】获取图层中的第一个窗口名称，用于自动获取焦点
+    fn get_first_window_name(node: &layout::LayoutNode) -> Option<String> {
+        match node {
+            layout::LayoutNode::Window { name, .. } => Some(name.clone()),
+            layout::LayoutNode::Container { children, .. } => {
+                for c in children {
+                    if let Some(n) = Self::get_first_window_name(c) {
+                        return Some(n);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    pub fn build_exec_context(
+        selected_entity: Option<&crate::protocol::Entity>,
+        ids_str: &str,
+        paths_str: &str,
+        window_name: &str,
+        width: &str,
+        height: &str,
+        event: &str,
+        extra: Option<&[(&str, &str)]>,
+    ) -> HashMap<String, String> {
+        let mut ctx = HashMap::new();
+
+        if let Some(entity) = selected_entity {
+            ctx.insert("id".to_string(), entity.id.clone());
+            ctx.insert("path".to_string(), entity.path.clone());
+            ctx.insert("display".to_string(), entity.display.clone());
+            ctx.insert("tags".to_string(), entity.tags.clone());
+        } else {
+            ctx.insert("id".to_string(), String::new());
+            ctx.insert("path".to_string(), String::new());
+            ctx.insert("display".to_string(), String::new());
+            ctx.insert("tags".to_string(), String::new());
+        }
+
+        ctx.insert("ids".to_string(), ids_str.to_string());
+        ctx.insert("paths".to_string(), paths_str.to_string());
+        ctx.insert("window".to_string(), window_name.to_string());
+        ctx.insert("width".to_string(), width.to_string());
+        ctx.insert("height".to_string(), height.to_string());
+        ctx.insert("event".to_string(), event.to_string());
+
+        if let Some(extra_pairs) = extra {
+            for (k, v) in extra_pairs {
+                ctx.insert(k.to_string(), v.to_string());
+            }
+        }
+        ctx
+    }
+
+    // 【新增】统一的输入提交执行器
+    pub fn submit_input(&mut self, input_name: &str, text: &str, term_width: u16, term_height: u16) {
+        let (template_opt, is_silent) = if let Some(Component::Input(input)) = self.components.get(input_name) {
+            (input.on_submit.clone(), input.on_submit_is_silent)
+        } else { return };
+
+        if let Some(template) = template_opt {
+            let args = crate::config::split_args(&template);
+
+            let tree_name = match &self.focus.current {
+                Focus::Component(n) if matches!(self.components.get(n), Some(Component::Tree(_))) => n.clone(),
+                _ => self.focus.main_tree_name.clone().unwrap_or_default(),
+            };
+
+            let (selected_entity, ids_str, paths_str) = if let Some(Component::Tree(t)) = self.components.get(&tree_name) {
+                let sel = t.get_selected_entity().cloned();
+                let marked = t.get_marked_entities();
+                let entities: Vec<&crate::protocol::Entity> = if !marked.is_empty() {
+                    marked.iter().cloned().collect()
+                } else {
+                    sel.as_ref().map(|e| vec![e]).unwrap_or_default()
+                };
+                let ids = entities.iter().map(|e| e.id.as_str()).collect::<Vec<_>>().join(" ");
+                let paths = entities.iter()
+                    .map(|e| format!("\"{}\"", e.path.replace("\"", "\\\"")))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (sel, ids, paths)
+            } else {
+                (None, String::new(), String::new())
+            };
+
+            let window_name = match &self.focus.current { Focus::Component(n) => n.clone(), _ => String::new() };
+
+            let ctx = Self::build_exec_context(
+                selected_entity.as_ref(), &ids_str, &paths_str, &window_name,
+                &term_width.to_string(), &term_height.to_string(), "",
+                Some(&[("input", text)])
+            );
+
+            let full_cmd_args = exec::replace_placeholders_in_args(&args, &ctx);
+            if !full_cmd_args.is_empty() {
+                crate::runner::execute_binding(self, &full_cmd_args, is_silent, term_width, term_height);
+            }
+        }
+    }
+
+    pub fn emit(&mut self, signal: &'static str, term_width: u16, term_height: u16) -> bool {
+        // ... (保留防抖与实体获取逻辑)
         if signal == "select" {
             let now = Instant::now();
             if let Some(last) = self.signals.last_emit.get(signal) {
-                if now.duration_since(*last).as_millis() < 200 {
-                    return false;
-                }
+                if now.duration_since(*last).as_millis() < 200 { return false; }
             }
-            self.signals.last_emit.insert(signal.to_string(), now);
+            self.signals.last_emit.insert(signal, now);
         }
 
-        let current_window = match &self.focus.current {
-            Focus::Component(n) => Some(n.as_str()),
-            Focus::None => None,
-        };
-
+        let current_window = match &self.focus.current { Focus::Component(n) => Some(n.as_str()), Focus::None => None };
         let binding = self.key_bindings.get_signal_binding(current_window, signal);
 
         if let Some((cmd_template_args, _is_silent)) = binding {
@@ -501,32 +716,19 @@ impl Engine {
                 let marked = t.get_marked_entities();
                 let entities: Vec<&crate::protocol::Entity> = if !marked.is_empty() {
                     marked.iter().cloned().collect()
-                } else {
-                    sel.map(|e| vec![e]).unwrap_or_default()
-                };
+                } else { sel.map(|e| vec![e]).unwrap_or_default() };
                 let ids = entities.iter().map(|e| e.id.as_str()).collect::<Vec<_>>().join(" ");
-                let paths = entities.iter()
-                    .map(|e| format!("\"{}\"", e.path.replace("\"", "\\\"")))
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let paths = entities.iter().map(|e| format!("\"{}\"", e.path.replace("\"", "\\\""))).collect::<Vec<_>>().join(" ");
                 (sel.cloned(), ids, paths)
-            } else {
-                (None, String::new(), String::new())
-            };
+            } else { (None, String::new(), String::new()) };
 
             let window_name = current_window.unwrap_or("").to_string();
-
-            let full_cmd_args = exec::replace_placeholders_in_args(
-                cmd_template_args,
-                selected_entity.as_ref(),
-                &ids_str,
-                &paths_str,
-                &window_name,
-                &term_width.to_string(),
-                &term_height.to_string(),
-                signal,
+            let ctx = Self::build_exec_context(
+                selected_entity.as_ref(), &ids_str, &paths_str, &window_name,
+                &term_width.to_string(), &term_height.to_string(), signal, None
             );
 
+            let full_cmd_args = exec::replace_placeholders_in_args(cmd_template_args, &ctx);
             if !full_cmd_args.is_empty() && !(full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) {
                 let _ = exec::execute_command_silent(&full_cmd_args);
             }
@@ -569,58 +771,32 @@ impl Engine {
         let (cmd_template_args, is_silent) = self.key_bindings.get(key)?;
 
         let tree_name = match &self.focus.current {
-            Focus::Component(n) => {
-                if matches!(self.components.get(n), Some(Component::Tree(_))) {
-                    n.clone()
-                } else {
-                    self.focus.main_tree_name.as_ref()?.clone()
-                }
-            }
+            Focus::Component(n) if matches!(self.components.get(n), Some(Component::Tree(_))) => n.clone(),
             Focus::None => self.focus.main_tree_name.as_ref()?.clone(),
+            _ => self.focus.main_tree_name.as_ref()?.clone(),
         };
 
-        let tree_state = if let Some(Component::Tree(t)) = self.components.get(&tree_name) {
-            t
-        } else {
-            return None;
-        };
-
+        let tree_state = if let Some(Component::Tree(t)) = self.components.get(&tree_name) { t } else { return None; };
         let selected_entity = tree_state.get_selected_entity();
         let marked_entities = tree_state.get_marked_entities();
 
         let entities: Vec<&crate::protocol::Entity> = if !marked_entities.is_empty() {
             marked_entities.iter().cloned().collect()
-        } else {
-            selected_entity.map(|e| vec![e]).unwrap_or_default()
-        };
+        } else { selected_entity.map(|e| vec![e]).unwrap_or_default() };
 
         let ids_str = entities.iter().map(|e| e.id.as_str()).collect::<Vec<_>>().join(" ");
-        let paths_str = entities.iter()
-            .map(|e| format!("\"{}\"", e.path.replace("\"", "\\\"")))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let paths_str = entities.iter().map(|e| format!("\"{}\"", e.path.replace("\"", "\\\""))).collect::<Vec<_>>().join(" ");
 
-        let window_name = match &self.focus.current {
-            Focus::Component(n) => n.clone(),
-            Focus::None => String::new(),
-        };
-
-        let full_cmd_args = exec::replace_placeholders_in_args(
-            cmd_template_args,
-            selected_entity,
-            &ids_str,
-            &paths_str,
-            &window_name,
-            &term_width.to_string(),
-            &term_height.to_string(),
-            "",
+        let window_name = match &self.focus.current { Focus::Component(n) => n.clone(), Focus::None => String::new() };
+        let ctx = Self::build_exec_context(
+            selected_entity, &ids_str, &paths_str, &window_name,
+            &term_width.to_string(), &term_height.to_string(), "", None
         );
 
+        let full_cmd_args = exec::replace_placeholders_in_args(cmd_template_args, &ctx);
         if full_cmd_args.is_empty() || (full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) {
             None
-        } else {
-            Some((full_cmd_args, *is_silent))
-        }
+        } else { Some((full_cmd_args, *is_silent)) }
     }
 
     pub fn update_view_rects(&mut self, view_rects: HashMap<String, (usize, u16, u16)>) {

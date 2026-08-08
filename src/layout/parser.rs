@@ -272,15 +272,21 @@ fn parse_window(s: &str) -> Option<LayoutNode> {
     let (rest_after_size, size) = if rest.starts_with('(') {
         let close = rest.find(')')?;
         let size_str = rest[1..close].trim();
-        let sz = if let Some(p_str) = size_str.strip_suffix('%') {
+        let sz = if let Some(comma_pos) = size_str.find(',') {
+            // 【修复】优先处理包含逗号的二维尺寸
+            let w_str = size_str[..comma_pos].trim();
+            let h_str = size_str[comma_pos+1..].trim();
+            if let (Some(w_pct), Some(h_pct)) = (w_str.strip_suffix('%'), h_str.strip_suffix('%')) {
+                Some(WindowSize::Percent2D(parse_percent_to_mille(w_pct)?, parse_percent_to_mille(h_pct)?))
+            } else {
+                let w = w_str.parse::<u16>().ok()?;
+                let h = h_str.parse::<u16>().ok()?;
+                Some(WindowSize::Absolute2D(w, h))
+            }
+        } else if let Some(p_str) = size_str.strip_suffix('%') {
             Some(WindowSize::Percent(parse_percent_to_mille(p_str)?))
         } else if size_str.is_empty() {
             None
-        } else if let Some(comma_pos) = size_str.find(',') {
-            // 【新增】解析 "40,15" 这样的二维尺寸
-            let w = size_str[..comma_pos].trim().parse::<u16>().ok()?;
-            let h = size_str[comma_pos+1..].trim().parse::<u16>().ok()?;
-            Some(WindowSize::Absolute2D(w, h))
         } else {
             Some(WindowSize::Absolute(size_str.parse::<u16>().ok()?))
         };
@@ -312,8 +318,8 @@ fn parse_window(s: &str) -> Option<LayoutNode> {
         format!("area_{}", match &size {
             Some(WindowSize::Percent(p)) => format!("{}pct", p),
             Some(WindowSize::Absolute(n)) => format!("{}abs", n),
-            // 【新增】为二维尺寸生成默认名
             Some(WindowSize::Absolute2D(w, h)) => format!("{}x{}", w, h),
+            Some(WindowSize::Percent2D(w, h)) => format!("{}x{}pct", w, h), // 【补丁】防止编译报错
             None => "unnamed".to_string(),
         })
     };

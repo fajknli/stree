@@ -30,7 +30,7 @@ impl StyleEngine {
             color_map: Self::build_color_map(),
         };
 
-        engine.add_rule("__marked__", "yellow,bold");
+        engine.add_rule("__marked__", "red,bold");
 
         if input.trim().is_empty() {
             return engine;
@@ -69,24 +69,21 @@ impl StyleEngine {
     /// 后命中的规则覆盖先命中的规则，实现"配置顺序即优先级"。
     /// 这样多标签可以叠加样式，最后写的规则优先级最高。
     pub fn get_style(&self, tags_str: &str) -> (Option<Color>, bool) {
-        // 拆分标签集，空字符串当单标签处理（向后兼容旧的单值 status）
-        let tags: Vec<&str> = tags_str
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-
         let mut final_color: Option<Color> = None;
         let mut final_bold = false;
 
         for rule in &self.rules {
-            let matched = tags.iter().any(|tag| match &rule.matcher {
-                RuleMatcher::Exact(s) => s == tag,
-                RuleMatcher::Regex(r) => r.is_match(tag),
-            });
+            // 【优化】直接使用迭代器，不 collect 成 Vec，零内存分配
+            let matched = tags_str
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .any(|tag| match &rule.matcher {
+                    RuleMatcher::Exact(s) => s == tag,
+                    RuleMatcher::Regex(r) => r.is_match(tag),
+                });
 
             if matched {
-                // 后命中覆盖先命中
                 if rule.fg_color.is_some() {
                     final_color = rule.fg_color;
                 }

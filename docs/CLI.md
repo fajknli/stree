@@ -1,10 +1,12 @@
-# stree 引擎契约与 CLI 参考手册
+# stree 引擎契约与 CLI 参考手册 (V3.0)
 
-本文档是 `stree` 引擎与外部业务层（胶水脚本）之间的严格契约。任何偏离这些规范的行为都可能导致未定义的结果。
+本文档是 `stree` 引擎与外部业务层（胶水脚本）之间的严格契约。`stree` 不是一个单纯的渲染器，而是一个采用 **混合保留模式** 的 TUI 应用底座：内部通过 Rust 严格管理高频 UI 状态以实现零延迟交互，外部通过 Unix 管道与声明式配置驱动业务逻辑。
+
+任何偏离这些规范的行为都可能导致未定义的结果。
 
 ---
 
-## 1. 数据协议
+## 1. 数据协议：四列 TSV 契约
 
 ### 1.1 实体数据流 (stdin / IPC)
 
@@ -19,28 +21,24 @@ ID \t Display \t Path \t Tags
 | 字段 | 约束条件 | 引擎行为 |
 | :--- | :--- | :--- |
 | **ID** | 非空字符串。在流内必须全局唯一。 | 用作树形关联、选中状态记忆和 IPC 定位的主键。重复的 ID 会被去重（保留最后一次出现的）。 |
-| **Display** | 任意 UTF-8 字符串。 | 在树形列表中逐字渲染。引擎不解析也不解释其内容。 |
-| **Path** | 任意 UTF-8 字符串。 | 视为不透明的业务负载。通过 `{path}` 占位符原样传递给外部命令。当展开为 `{paths}` 时，路径内部的双引号会被自动转义。 |
-| **Tags** | 逗号分隔的标签列表（如 `live,note,inbox`）。 | 按 `,` 拆分，去除首尾空白，并过滤掉空标签。**仅供样式引擎匹配使用，绝对不参与搜索匹配**（见第 4 节）。 |
+| **Display** | 任意 UTF-8 字符串。 | 在树形列表中逐字渲染。支持 ANSI 颜色码透传。引擎不解析其业务语义。 |
+| **Path** | 任意 UTF-8 字符串。 | 视为不透明的业务负载。通过 `{path}` 占位符原样传递给外部命令。展开为 `{paths}` 时，路径内部的双引号会被自动转义。 |
+| **Tags** | 逗号分隔的标签集（如 `live,note,inbox`）。 | 按 `,` 拆分并去除首尾空白。**仅供样式引擎匹配使用，绝对不参与搜索匹配**。 |
 
 #### 防御性解析规则
-
-1.  **强制 Trim**：每个字段的前导/尾随空白符和回车符（`\r`）会被剥离。
-2.  **空 ID 拒绝**：`ID` 字段为空的行会被静默跳过（并向 stderr 输出警告）。
-3.  **字段数检查**：少于 4 个字段的行会被静默跳过。
-4.  **版本头（可选）**：如果第一行的第一个字段以 `VERSION:` 开头，引擎会解析版本号，并从第二个字段开始作为 ID 处理。
+1.  **强制 Trim**：剥离每个字段的首尾空白符和回车符（`\r`）。
+2.  **空 ID 拒绝**：`ID` 为空的行会被静默跳过（输出警告至 stderr）。
+3.  **版本头（可选）**：若第一行首字段以 `VERSION:` 开头，引擎会解析版本号并从第二字段开始处理。
 
 ### 1.2 关联表 (`--relations <file>`)
 
-一个 2 列的 TSV 文件，用于定义父子关系：`Parent_ID \t Child_ID`。
-
-*   **树构建**：引擎在内存中构建离散的树形拓扑。任何未在任何关系中作为子节点出现的 ID，都会自动成为根节点。
-*   **排序**：根节点按字母顺序排序。节点内部的子节点保留其在关联文件中出现的顺序。
-*   **重载规则**：执行初始启动、IPC `stree update <TreeName>`、SIGUSR1 重载时，若启动参数携带 `--relations`，引擎会重新读取该磁盘文件；若未携带，则复用内存中的关系拓扑。
+一个 2 列的 TSV 文件，定义父子关系：`Parent_ID \t Child_ID`。
+*   **拓扑构建**：未在任何关系中作为子节点出现的 ID，自动成为根节点。根节点按字母序排列。
+*   **重载规则**：执行初始启动、IPC 更新或 SIGUSR1 重载时，若携带 `--relations` 参数，引擎重新读取该磁盘文件；否则复用内存中的关系拓扑。
 
 ---
 
-## 2. 组件声明与前缀
+## 2. 组件声明与前缀机制
 
 ### 2.1 Tree 组件 (`--tree`)
 
@@ -48,11 +46,11 @@ ID \t Display \t Path \t Tags
 --tree "[click:][focus:][nomark:]Name:SourceCmd"
 ```
 
-*   **前缀组合**：`click:`, `focus:`, `nomark:` 可以无序组合使用。
+*   **前缀组合**：`click:`, `focus:`, `nomark:` 可无序组合。
 *   **`click:`**：单击节点即触发 `click` 信号（默认需双击或 Enter 触发 `confirm`）。
 *   **`focus:`**：当焦点切换到该 Tree 时，触发 `focus` 信号。
-*   **`nomark:`**：禁用该 Tree 的右键拖拽标记功能。
-*   **`SourceCmd`**：启动时及重载时执行的命令，其 stdout 必须为合法的 TSV 流。
+*   **`nomark:`**：禁用该 Tree 的标记功能（`Space` 键和鼠标右键拖拽均无效）。**未声明此前缀的 Tree 默认是可标记的。**
+*   **`SourceCmd`**：启动及重载时执行的命令，其 stdout 必须为合法的 TSV 流。
 
 ### 2.2 View 组件 (`--view`)
 
@@ -60,8 +58,9 @@ ID \t Display \t Path \t Tags
 --view "Name:RenderCmdTemplate"
 ```
 
-*   当 Tree 选中状态改变时，引擎使用当前选中节点的上下文展开 `RenderCmdTemplate` 并**异步**执行，其 stdout 渲染到 View 窗口。
-*   **特殊占位符**：在 View 的模板中，`{width}` 和 `{height}` 展开为 **View 窗口的内部内容区尺寸**（而非终端总尺寸），常用于传递给 `bat --terminal-width` 或 `ffmpeg` 等工具。
+*   **异步执行**：当 Tree 选中项改变时，引擎展开模板并**在后台线程异步执行**，避免预览大文件时阻塞 UI。
+*   **防抖机制**：View 内置 `cached_entity_id`。快速按 `j/k` 滚动时，若选中的 ID 与缓存一致，引擎直接复用内存缓冲区，**零 I/O 零 fork**。
+*   **尺寸占位符**：`{width}` 和 `{height}` 展开为 **View 窗口的内部内容区尺寸**，常用于传递给 `bat --terminal-width` 等工具。
 
 ### 2.3 StatusBar 组件 (`--statusbar`)
 
@@ -69,26 +68,24 @@ ID \t Display \t Path \t Tags
 --statusbar "Name:FormatTemplate"
 ```
 
-除了常规占位符，StatusBar 专属以下引擎状态占位符：
+专属状态占位符：
 *   `{stree_focus}`：当前焦点窗口名。
-*   `{stree_visible}`：当前 Tree 可见节点数。
-*   `{stree_total}`：当前 Tree 总节点数。
-*   `{stree_marked}`：当前 Tree 被标记的节点数。
-*   `{stree_id}`：当前选中节点的 ID。
+*   `{stree_visible}` / `{stree_total}`：当前 Tree 的可见节点数 / 总节点数。
+*   `{stree_marked}` / `{stree_id}`：被标记的节点数 / 当前选中节点 ID。
 
 ### 2.4 Input 组件 (`--input`)
 
 ```bash
---input "Name:Prefix:OnSubmitTemplate"
+--input "Name:Prefix:[@]OnSubmitTemplate"
 ```
 
 *   **`Prefix`**：激活时显示的前缀（如 `/` 或 `:`）。
-*   **`OnSubmitTemplate`**：用户按下 Enter 后执行的命令模板。用户输入的文本通过 `{input}` 占位符展开。
-*   **特殊行为**：如果 `Prefix` 为 `/`，引擎将拦截输入并执行**内部搜索过滤**（见第 4 节），而不会执行 `OnSubmitTemplate`。
+*   **`@` 静默执行前缀**：若模板以 `@` 开头，提交时将在后台静默执行（不挂起 TUI，不触发全局重载）。
+*   **特殊行为**：如果 `Prefix` 为 `/`，引擎将拦截输入执行**内部实时模糊搜索**，而不会执行 `OnSubmitTemplate`。
 
 ---
 
-## 3. 布局引擎与多图层
+## 3. 布局引擎：正交 Flexbox 与 AST 动态手术
 
 ### 3.1 节点语法
 
@@ -96,28 +93,29 @@ ID \t Display \t Path \t Tags
 area(size)[border,drag]:Name
 ```
 
-*   **`size`**：`50%`（百分比，支持两位小数精度）、`3`（绝对尺寸）、*(留空)*（均分剩余空间）。
+*   **`size`**：`50%`（百分比，支持两位小数）、`3`（绝对尺寸）、`40,15`（二维绝对尺寸，仅用于浮动层）、*(留空)*（均分剩余空间）。
 *   **`border`**：`box`（默认）、`line`（单顶线）、`none`。
 *   **`drag`**：允许该边框被鼠标拖拽调整大小。
 
 ### 3.2 多图层与 Z 轴
 
-多次声明 `--layout` 参数，声明顺序即为 Z 轴渲染顺序（后声明的在上层）。
+多次声明 `--layout` 即可创建多图层，声明顺序即为 Z 轴渲染顺序（后声明的在上层）。
 
 ```bash
 --layout "horizontal(area(30%):Tree, area(70%):Preview)" \
---layout "@(10,5) area(40,15)[box,drag]:Popup"
+--layout "|@(10,5) area(40,15)[box,drag]:Popup"
 ```
 
-*   **全屏层**：无前缀，自动铺满终端 (Z=0, 1, ...)。
-*   **浮动层**：`@(x,y)` 前缀，相对于终端屏幕的绝对坐标偏移。
+*   **全屏层**：无前缀，自动铺满终端。
+*   **浮动层**：`@(x,y)` 前缀，相对于终端屏幕的绝对坐标偏移。`|` 前缀表示初始隐藏。
 
-### 3.3 鼠标拖拽与状态锁定
+### 3.3 鼠标拖拽与 AST 动态手术
 
-当带有 `[drag]` 标记的边框被鼠标拖拽时：
-1.  **拖拽中**：引擎写入 `Absolute` 像素值，保证物理像素守恒，相邻窗口此消彼长，**其他无关窗口绝对不动**。
-2.  **松手后**：引擎**保持 `Absolute` 锁定**（拖拽即锁定）。终端 Resize 时，未拖拽的窗口（`Percent`）自适应缩放，拖拽过的窗口保持像素不变。
-3.  **重置**：通过 IPC 发送 `@layout-reset` 可清空所有锁定，恢复初始的 `Percent` 声明。
+当带有 `[drag]` 标记的边框被拖拽时，引擎不仅改变物理尺寸，更会在运行时**重组布局抽象语法树（AST）**：
+1.  **AST 树旋转**：将嵌套的叶子节点拉平为兄弟节点，改变拓扑结构。
+2.  **像素反算**：用拖拽时的旧物理坐标，反算出新 AST 节点的百分比，杜绝拓扑突变带来的视觉跳跃。
+3.  **覆盖注入**：拖拽过程中注入 `Absolute` 尺寸覆盖，保证物理像素守恒，相邻窗口此消彼长，**其他无关窗口绝对不动**。
+4.  **重置**：通过 IPC 发送 `@layout-reset` 可清空所有锁定与 AST 重组，恢复初始声明。
 
 ---
 
@@ -125,55 +123,60 @@ area(size)[border,drag]:Name
 
 ### 4.1 搜索防幽灵契约
 
-当通过 `/` 激活 Input 并输入搜索词时，引擎执行模糊匹配。
+当通过 `/` 激活搜索时，引擎执行实时模糊匹配。
 **严格契约**：引擎**仅搜索内容层**（`ID`, `Display`, `Path`），**绝对不搜索元数据层**（`Tags`）。
-*   *设计意图*：防止搜索 "li" 时，因为隐藏的 "live" 标签导致所有节点全亮（幽灵匹配）。业务层若希望某些标签被搜索到，应将其拼接到 `Display` 字段中。
+*设计意图*：防止搜索 "li" 时，因隐藏的 "live" 标签导致所有节点全亮（幽灵匹配）。
 
-### 4.2 默认快捷键
+### 4.2 默认快捷键与焦点回退
 
 | 按键 | 动作 | 按键 | 动作 |
 | :--- | :--- | :--- | :--- |
 | `j` / `Down` | 向下移动 | `k` / `Up` | 向上移动 |
-| `h` / `Left` | 折叠/父节点 | `l` / `Right` | 展开/子节点 |
-| `Enter` | 展开并触发 `confirm` | `Space` | 切换标记 (Mark) |
-| `g` / `G` | 跳转顶部/底部 | `Tab` | 切换焦点窗口 |
-| `H` / `L` | 左右滚动 5 字符 | `/` / `:` | 激活搜索/命令输入 |
-| `Esc` | 取消输入/退出 | `q` | 退出并输出选中 ID |
+| `h` / `Left` | 折叠/跳到父节点 | `l` / `Right` | 展开/跳到子节点 |
+| `Enter` | 展开并触发 `confirm` | `Space` | 切换标记 |
+| `g` / `G` | 跳转顶部/底部 | `Tab` | 循环切换焦点窗口 |
+| `Ctrl-H/J/K/L` | 焦点左/下/上/右移动 | `H` / `L` | 左右滚动 5 字符 |
+| `/` / `:` | 激活搜索/命令输入 | `Esc` | 取消输入/退出搜索 |
+
+**焦点回退机制**：如果当前焦点在只读面板（如 View 或 HelpMenu）上，按下 `j/k/Space` 等数据操作键时，引擎会自动将操作目标**回退到主 Tree**，确保交互不停顿。
 
 ### 4.3 鼠标行为
 
 *   **左键单击**：选中节点 / 切换焦点。
 *   **左键双击**：展开/折叠节点并触发 `confirm`。
-*   **右键拖拽**：框选标记/取消标记节点（若未禁用 `nomark:`）。
+*   **右键拖拽**：框选标记/取消标记节点。
 *   **滚轮**：上下滚动当前焦点窗口。
-*   **边框拖拽**：按住带有 `[drag]` 标记的边框拖动，实时调整窗口大小。
+*   **边框拖拽**：实时调整窗口大小并重组 AST。
 
 ---
 
-## 5. 执行模型与信号绑定 (`--bind`)
+## 5. 执行模型：统一上下文与双轨制
 
-### 5.1 占位符展开
+### 5.1 统一执行上下文
 
-占位符在命令被拆分为参数**之前**进行展开。
+占位符不再是硬编码的参数传递。引擎将所有变量收集到一个 `HashMap<String, String>` 中，并在拆分命令参数**之前**进行展开。
+
+*   **空格安全**：因为 `split_args` 发生在替换之前，无论业务变量（如 `{input}`）包含多少空格，都会被安全地视为单个参数，彻底杜绝参数截断 Bug。
+*   **确定性替换**：引擎对 Context Keys 进行排序后再替换，确保嵌套占位符的替换顺序绝对确定。
 
 | 占位符 | 展开规则 |
 | :--- | :--- |
 | `{id}` / `{path}` | 选中节点的 ID/Path。若无则空字符串。 |
 | `{ids}` | 所有被标记节点的 ID 列表（空格分隔）。若无标记则回退到 `{id}`。 |
-| `{paths}` | 所有被标记节点的 Path 列表，每个 Path 用双引号包裹，内部引号被转义。 |
-| `{input}` | 仅在 Input 组件提交时有效，展开为用户输入的原始字符串。 |
+| `{paths}` | 所有被标记节点的 Path 列表，每个 Path 用双引号包裹，内部引号转义。 |
+| `{input}` | Input 组件提交时，用户输入的原始字符串。 |
 | `{window}` | 当前焦点窗口的名称。 |
 | `{width}` / `{height}`| 在 `--view` 中：View 内部尺寸。在 `--bind` 中：终端总尺寸。 |
 | `{event}` | 触发该绑定的信号名称（如 `select`, `click`）。 |
 
-### 5.2 执行模式
+### 5.2 双轨制执行模式
 
-*   **默认模式（全屏）**：`--bind "enter=vi {path}"`。引擎暂停 TUI，释放 TTY 给子进程，子进程退出后引擎重绘并触发 `trigger_reload`。
+*   **默认模式（全屏挂起）**：`--bind "enter=vi {path}"`。引擎暂停 TUI，释放 TTY 给子进程，子进程退出后引擎重绘并触发全局重载。
 *   **静默模式（`@` 前缀）**：`--bind "ctrl-t=@switch-view.sh"`。引擎保留 TUI，子进程以 `null` 标准流后台执行。**不会自动重载**，业务脚本需通过 IPC 推送更新。
 
 ### 5.3 内置信号路由
 
-除了物理按键，引擎支持将特定事件绑定到外部命令（支持局部作用域 `Window:signal`）：
+支持将特定事件绑定到外部命令（支持局部作用域 `Window:signal`）：
 
 *   **`select`**：选中项变化时触发（内置 200ms 防抖）。
 *   **`click`**：鼠标单击节点时触发（需 Tree 开启 `click:` 前缀）。
@@ -185,7 +188,7 @@ area(size)[border,drag]:Name
 
 ## 6. 样式与主题引擎
 
-所有颜色参数均支持 **TrueColor** 十六进制格式，兼容 6 位标准（`#a9b5d5`）和 3 位简写（`#fff`）。
+支持 TrueColor 十六进制格式（`#a9b5d5` 或 `#fff`）。
 
 ### 6.1 数据状态颜色 (`--status-col`)
 
@@ -193,7 +196,7 @@ area(size)[border,drag]:Name
 --status-col "pattern1=style1,pattern2=style2,..."
 ```
 
-*   **匹配语义**：引擎按逗号拆分节点的第 4 列。对于每条规则，检查标签集中是否**有任何一个**标签匹配该模式。
+*   **匹配语义**：按逗号拆分节点的第 4 列。对于每条规则，检查标签集中是否**有任何一个**标签匹配该模式。
 *   **优先级**：颜色覆盖（后匹配的规则覆盖先匹配的），加粗累加（任意规则命中 `bold` 即生效）。
 *   **模式**：支持精确字符串（`live`）和正则表达式（`^fail.*`）。
 *   **保留标签**：`__selected__` (选中行), `__marked__` (标记行)。
@@ -201,38 +204,30 @@ area(size)[border,drag]:Name
 ### 6.2 UI 框架颜色 (`--ui-colors`)
 
 控制非数据元素的视觉呈现，格式为 `key=value` 逗号分隔。
-
-```bash
---ui-colors "border_focused=#a9b5d5,border_unfocused=#565d7e"
-```
-
-**可用键**：
-`border_focused`, `border_unfocused`, `view_focused`, `view_unfocused`, `statusbar_fg`, `input_prefix`, `input_buffer`, `selected_bg`, `error_fg`, `error_bg`, `empty_data_fg`
+**可用键**：`border_focused`, `border_unfocused`, `view_focused`, `view_unfocused`, `statusbar_fg`, `input_prefix`, `input_buffer`, `selected_bg`, `error_fg`, `error_bg`, `empty_data_fg`
 
 ---
 
-## 7. IPC 协议与特殊指令
+## 7. IPC 协议与局部刷新
 
 ### 7.1 二进制帧格式
 
 Socket 路径通过 `$STREE_SOCK` 暴露。帧结构（大端序）：
 `[4B target_len][8B data_len][target (UTF-8)][data (UTF-8)]`
 
-### 7.2 常规更新
+### 7.2 定向局部刷新
 
 ```bash
-./generate-data.sh | stree update MainTree   # 更新 Tree
-echo "Loading..." | stree update Preview     # 更新 View
+./generate-data.sh | stree update MainTree   # 重建 Tree 内存结构并重绘
+echo "Loading..." | stree update Preview     # 直接替换 View 缓冲区并重绘
 ```
+其他组件完全不受影响，实现"指哪打哪"的零延迟交互。
 
 ### 7.3 布局控制特殊指令
 
-引擎拦截以 `@` 开头的特定 Target，不将其视为组件名：
-
-*   **`stree update @layout-reset`**
-    清空所有因鼠标拖拽产生的 `Absolute` 尺寸锁定，使所有窗口恢复为 `--layout` 声明的初始 `Percent` 比例。
-*   **`stree update @layout-reset <WindowName>`**
-    仅清空指定窗口的尺寸锁定，使其恢复为声明式百分比。
+引擎拦截以 `@` 开头的 Target：
+*   **`stree update @layout-reset`**：清空所有因鼠标拖拽产生的 `Absolute` 锁定与 AST 重组，恢复初始 `Percent` 声明。
+*   **`stree update @layout-reset <WindowName>`**：仅重置指定窗口。
 
 ---
 
@@ -242,7 +237,7 @@ echo "Loading..." | stree update Preview     # 更新 View
 
 | 信号 | 行为 |
 | :--- | :--- |
-| `SIGUSR1` | 触发 `trigger_reload`：重新执行每个 `--tree` 的数据源命令，并重新读取 `--relations` 文件。 |
+| `SIGUSR1` | 触发全局重载：重新执行每个 `--tree` 的数据源命令，重新读取 `--relations`。 |
 | `SIGINT` | 优雅关闭。清理 socket，恢复终端状态。 |
 
 ### 8.2 退出行为
@@ -257,6 +252,6 @@ echo "User selected: $selected"
 
 | 变量 | 作用域 | 描述 |
 | :--- | :--- | :--- |
-| `$STREE_SOCK` | 子进程 | Unix Domain Socket 路径。 |
+| `$STREE_SOCK` | 子进程 | Unix Domain Socket 路径，用于 IPC 通信。 |
 | `$FORCE_COLOR` | 子进程 | 设为 `1`，强制子进程输出颜色。 |
-| `$TERM` | 子进程 | 设为 `xterm-256color`。 |
+| `$TERM` | 子进程 | 设为 `xterm-256color`，确保兼容性。 |

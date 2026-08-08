@@ -46,6 +46,8 @@ impl Dataset {
 /// 解析 stdin 全部内容为 Dataset
 pub fn parse_entities<R: BufRead>(reader: R) -> anyhow::Result<Dataset> {
     let mut dataset = Dataset::new();
+    let mut id_to_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
 
     for (line_num, line) in reader.lines().enumerate() {
         let line = line?;
@@ -96,12 +98,11 @@ pub fn parse_entities<R: BufRead>(reader: R) -> anyhow::Result<Dataset> {
             tags,
         };
 
-        // 【防御性增强】去重时保留最后一个，防止 Vec 膨胀污染后续搜索
-        if dataset.entity_map.contains_key(&id) {
-            if let Some(pos) = dataset.entities.iter().position(|e| e.id == id) {
-                dataset.entities[pos] = entity.clone();
-            }
+        // O(1) 复杂度去重，彻底消灭 O(N) 的 position 查找
+        if let Some(&idx) = id_to_index.get(&id) {
+            dataset.entities[idx] = entity.clone();
         } else {
+            id_to_index.insert(id.clone(), dataset.entities.len());
             dataset.entities.push(entity.clone());
         }
         dataset.entity_map.insert(id, entity);

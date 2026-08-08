@@ -16,8 +16,8 @@ mod runner;
 use clap::{Parser, Subcommand};
 use crossterm::{terminal, ExecutableCommand};
 use crossterm::event::{self, Event, KeyCode, EnableMouseCapture, DisableMouseCapture};
-use std::io::{self, stdout, Read, IsTerminal};
 use std::time::Duration;
+use std::io::{self, stdout, Read, Write, IsTerminal};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -150,6 +150,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut key_events: Vec<crossterm::event::KeyEvent> = Vec::with_capacity(16);
     let mut mouse_events: Vec<crossterm::event::MouseEvent> = Vec::with_capacity(16);
 
+    // 【优化1】将 BufWriter 移出主循环，避免每帧重复分配和析构
+    let mut out = std::io::BufWriter::new(stdout());
+
     'main_loop: loop {
         if signal::check_and_clear_quit() { break 'main_loop; }
 
@@ -165,6 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if (columns, rows) != engine.prev_term_size {
             engine.window_rect_overrides.clear();
             engine.prev_term_size = (columns, rows);
+            engine.prev_rects.clear(); // 【修复】清空上一帧的物理快照，强制触发 force_full 全屏重绘！
             engine.mark_all_dirty();
         }
         let term_size = ui::TermSize { columns, rows };
@@ -189,8 +193,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 【终极架构】拖拽时注入 Absolute 覆盖，让布局引擎自然计算，彻底消灭 AST 突变与布局偏移
         if engine.drag.active {
             // 【修复借用冲突】加上 .clone()，避免 engine 被同时可变与不可变借用
-            if let Some(app::DragTarget::ResizeEdge(primary, neighbor, dir)) = engine.drag.resize_target.clone() {
+            if let Some(app::DragTarget::ResizeFloating(layer_name, edge_mask)) = engine.drag.resize_target.clone() {
+                let dx = engine.drag.last_col as i32 - engine.drag.start_col as i32;
+                let dy = engine.drag.last_row as i32 - engine.drag.start_row as i32;
 
+                let mut new_w = engine.drag.initial_width as i32;
+                let mut new_h = engine.drag.initial_height as i32;
+                let mut new_x = engine.drag.initial_anchor_x as i32;
+                let mut new_y = engine.drag.initial_anchor_y as i32;
+
+                // 【核心魔法】根据拖拽的边，计算新尺寸和新坐标，保证对侧不动
+                if edge_mask & 2 != 0 { new_w = engine.drag.initial_width as i32 + dx; }
+                if edge_mask & 1 != 0 { new_w = engine.drag.initial_width as i32 - dx; new_x = engine.drag.initial_anchor_x as i32 + dx; }
+                if edge_mask & 8 != 0 { new_h = engine.drag.initial_height as i32 + dy; }
+                if edge_mask & 4 != 0 { new_h = engine.drag.initial_height as i32 - dy; new_y = engine.drag.initial_anchor_y as i32 + dy; }
+
+                // only keep border
+                let min_w = 2;
+                let min_h = 2;
+                if new_w < min_w {
+                    if edge_mask & 1 != 0 { new_x -= min_w - new_w; }
+                    new_w = min_w;
+                }
+                if new_h < min_h {
+                    if edge_mask & 4 != 0 { new_y -= min_h - new_h; }
+                    new_h = min_h;
+                }
+
+                // 递归找到图层中的 Window 节点并篡改它的 Root 尺寸和锚点坐标
+                fn modify_node(node: &mut crate::layout::LayoutNode, name: &str, new_w: i32, new_h: i32) -> bool {
+                    match node {
+                        crate::layout::LayoutNode::Window { name: n, size, .. } => {
+                            if n == name {
+                                *size = Some(crate::layout::WindowSize::Absolute2D(new_w as u16, new_h as u16));
+                                return true;
+                            }
+                        }
+                        crate::layout::LayoutNode::Container { children, .. } => {
+                            for c in children {
+                                if modify_node(c, name, new_w, new_h) { return true; }
+                            }
+                        }
+                    }
+                    false
+                }
+
+                for layer in &mut engine.layout_layers {
+                    if !matches!(layer.anchor, crate::layout::Anchor::ScreenAbsolute {..}) { continue; }
+                    if modify_node(&mut layer.root, &layer_name, new_w, new_h) {
+                        layer.anchor = crate::layout::Anchor::ScreenAbsolute {
+                            x: crate::layout::Coord::Pixels(new_x.max(0) as u16),
+                            y: crate::layout::Coord::Pixels(new_y.max(0) as u16),
+                        };
+                        break;
+                    }
+                }
+
+                all_rects = engine.calc_all_rects(columns, rows);
+                engine.mark_all_dirty();
+
+            } else if let Some(app::DragTarget::ResizeEdge(primary, neighbor, dir)) = engine.drag.resize_target.clone() {
                 let has_moved = engine.drag.last_col != engine.drag.start_col
                     || engine.drag.last_row != engine.drag.start_row;
 
@@ -210,7 +272,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let r1 = engine.drag.initial_t1_rect;
                     let r2 = engine.drag.initial_t2_rect;
 
-                    // 【关键修复】获取边框开销，因为 Absolute 注入的是内容区尺寸，必须减去边框！
                     let oh1 = all_rects.iter().find(|(_, n, _, _)| n == &primary)
                         .map(|(_, _, b, _)| {
                             let (ox, oy) = b.overhead();
@@ -337,29 +398,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match key_event.code {
                         KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace | KeyCode::Left | KeyCode::Right
                         | KeyCode::Home | KeyCode::End | KeyCode::Char(_) => {
+
+                            // 提前判断是否是搜索框激活
+                            let is_search = engine.components.values()
+                                .any(|c| matches!(c, app::Component::Input(i) if i.is_active && i.prefix == "/"));
+
                             if let Some((input_name, result)) = engine.handle_input_key(*key_event) {
                                 if result == "__CANCEL__" {
-                                } else {
-                                    if let Some(app::Component::Input(input)) = engine.components.get(&input_name) {
-                                        if input.prefix == "/" {
-                                            engine.apply_search(&result, columns, rows);
-                                        } else if let Some(ref cmd_template) = input.on_submit {
-                                            let cmd = cmd_template.replace("{input}", &result);
-                                            let args = crate::config::split_args(&cmd);
-                                            if !args.is_empty() {
-                                                match exec::execute_command_silent(&args) {
-                                                    Ok(code) => {
-                                                        if code != 0 {
-                                                            engine.last_error = Some(format!("Input cmd exited with code {}", code));
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        engine.last_error = Some(e.to_string());
+                                    // 【修复】如果是搜索框取消，必须清空搜索状态，恢复全列表！
+                                    if is_search {
+                                        if let app::Focus::Component(focused_name) = engine.focus.current.clone() {
+                                            if let Some(app::Component::Tree(t)) = engine.components.get_mut(&focused_name) {
+                                                if t.search_query.take().is_some() {
+                                                    t.rebuild_visible_ids();
+                                                    if !t.visible_ids.is_empty() {
+                                                        t.selected_idx = 0;
+                                                        t.selected_id = Some(t.visible_ids[0].clone());
                                                     }
                                                 }
                                             }
+                                            engine.pending_selection_changed = Some(focused_name);
                                         }
+                                        engine.mark_all_dirty();
                                     }
+                                } else {
+                                    if is_search {
+                                        engine.apply_search(&result, columns, rows);
+                                    } else {
+                                        engine.submit_input(&input_name, &result, columns, rows);
+                                    }
+                                }
+                            } else if is_search && key_event.code != KeyCode::Esc && key_event.code != KeyCode::Enter {
+                                // 【新增】fzf 式实时搜索过滤
+                                if let Some(app::Component::Input(i)) = engine.components.values().find(|c| matches!(c, app::Component::Input(i) if i.is_active)) {
+                                    let current_buffer = i.buffer.clone();
+                                    engine.apply_search(&current_buffer, columns, rows);
                                 }
                             }
                             continue;
@@ -374,7 +447,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 match internal_cmd {
                                     app::InternalCommand::Exit => break 'main_loop,
                                     app::InternalCommand::Esc => {
-                                        if engine.has_active_input() { engine.cancel_input(); }
+                                        if engine.has_active_input() {
+                                            engine.cancel_input();
+                                        } else {
+                                            // 【新增】如果没有激活的 Input，按 Esc 退出搜索结果，恢复全列表
+                                            let mut dirty = false;
+                                            for (name, comp) in engine.components.iter_mut() {
+                                                if let app::Component::Tree(t) = comp {
+                                                    if t.search_query.take().is_some() {
+                                                        t.rebuild_visible_ids();
+                                                        if !t.visible_ids.is_empty() {
+                                                            t.selected_idx = 0;
+                                                            t.selected_id = Some(t.visible_ids[0].clone());
+                                                        }
+                                                        engine.pending_selection_changed = Some(name.clone());
+                                                        dirty = true;
+                                                    }
+                                                }
+                                            }
+                                            if dirty { engine.mark_all_dirty(); }
+                                        }
                                     }
                                     app::InternalCommand::Tab => engine.handle_tab(columns, rows),
                                     app::InternalCommand::Expand => engine.toggle_expand(),
@@ -411,6 +503,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app::InternalCommand::HideLayout(name) => engine.set_layout_visible(&name, false),
                                     app::InternalCommand::ScrollLeft => engine.scroll_left(),
                                     app::InternalCommand::ScrollRight => engine.scroll_right(),
+                                    // 【新增指令派发】
+                                    app::InternalCommand::CycleLayer => engine.cycle_layer(&all_rects),
+                                    app::InternalCommand::FocusLeft => engine.focus_direction("left", &all_rects),
+                                    app::InternalCommand::FocusRight => engine.focus_direction("right", &all_rects),
+                                    app::InternalCommand::FocusUp => engine.focus_direction("up", &all_rects),
+                                    app::InternalCommand::FocusDown => engine.focus_direction("down", &all_rects),
                                 }
                             } else {
                                 runner::execute_binding(&mut engine, &full_cmd_args, is_silent, columns, rows);
@@ -421,12 +519,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // 2. 处理鼠标事件
+            let mut sorted_rects: Vec<_> = all_rects.iter().collect();
+            sorted_rects.sort_by(|a, b| b.3.cmp(&a.3));
+
             for mouse_event in &mouse_events {
                 if !engine.mouse.enabled { continue; }
 
+                // ==========================================
+                // 【0. 悬停获取焦点
+                // ==========================================
+                if matches!(mouse_event.kind, crossterm::event::MouseEventKind::Moved) && !engine.drag.active {
+                    for (rect, name, _, _) in sorted_rects.iter() {
+                        let in_x = mouse_event.column >= rect.start_col && mouse_event.column < rect.start_col + rect.width;
+                        let in_y = mouse_event.row >= rect.start_row && mouse_event.row < rect.start_row + rect.height;
+
+                        if in_x && in_y {
+                            // 绝不允许 StatusBar 获得焦点
+                            if let Some(app::Component::StatusBar(_)) = engine.components.get(name) { break; }
+
+                            // 如果焦点发生了变化，更新状态并标脏
+                            if engine.focus.current != app::Focus::Component(name.clone()) {
+                                let old_focus = engine.focus.current.clone();
+                                engine.focus.current = app::Focus::Component(name.clone());
+
+                                if let app::Focus::Component(old_name) = &old_focus {
+                                    engine.mark_dirty(old_name);
+                                }
+                                engine.mark_dirty(name);
+
+                                // 状态栏也需要刷新
+                                for (n, c) in &engine.components {
+                                    if matches!(c, app::Component::StatusBar(_)) {
+                                        engine.dirty_components.insert(n.clone());
+                                    }
+                                }
+
+                                // 如果该组件配置了 focus 信号，则触发
+                                if let Some(app::Component::Tree(t)) = engine.components.get(name) {
+                                    if t.focus_to_fire {
+                                        engine.emit("focus", columns, rows);
+                                    }
+                                }
+                            }
+                            break; // 只要命中了最顶层的窗口，就立刻退出
+                        }
+                    }
+                    continue; // 悬停事件只用于改焦点，不进入后续点击逻辑
+                }
+
                 if matches!(mouse_event.kind, crossterm::event::MouseEventKind::Up(_)) {
                     if engine.drag.active {
-                        if engine.drag.resize_target.is_some() {
+                        if let Some(app::DragTarget::ResizeFloating(_, _)) = &engine.drag.resize_target {
+                            engine.mark_all_dirty(); // 标记重绘
+                        } else if engine.drag.resize_target.is_some() {
                             let has_dragged = engine.drag.last_col != engine.drag.start_col
                                 || engine.drag.last_row != engine.drag.start_row;
 
@@ -458,21 +603,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // ==========================================
-                // 非拖拽状态：全局边界碰撞检测
+                // 非拖拽状态：碰撞检测 (优先级：顶层浮动边缘 > 底层 Flexbox 边缘 > 窗口内部)
                 // ==========================================
+
+                let mut hit_floating_edge = false;
+                let mut hit_floating_inside = false;
+
+                // 1. 优先检测：浮动窗口边缘拉伸
+                if let crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse_event.kind {
+                    let (edge_hit, inside) = engine.check_floating_edge_hit(mouse_event.column, mouse_event.row, &all_rects);
+                    hit_floating_inside = inside;
+
+                    if let Some((win_name, edge_mask, init_x, init_y, w, h)) = edge_hit {
+                        engine.focus.current = app::Focus::Component(win_name.clone());
+                        engine.mark_dirty(&win_name);
+
+                        engine.drag.active = true;
+                        engine.drag.resize_target = Some(app::DragTarget::ResizeFloating(win_name.clone(), edge_mask));
+                        engine.drag.start_col = mouse_event.column;
+                        engine.drag.start_row = mouse_event.row;
+                        engine.drag.last_col = mouse_event.column;
+                        engine.drag.last_row = mouse_event.row;
+                        engine.drag.initial_width = w;
+                        engine.drag.initial_height = h;
+                        engine.drag.initial_anchor_x = init_x;
+                        engine.drag.initial_anchor_y = init_y;
+                        hit_floating_edge = true;
+                    }
+                }
+
+                if hit_floating_edge {
+                    continue; // 已经开始拖拽，拦截事件
+                }
+
+                // 2. 次优先检测：底层 Flexbox 边缘
                 let mut sorted_edges: Vec<_> = engine.drag.cached_edges.iter().collect();
                 sorted_edges.sort_by(|a, b| b.z_index.cmp(&a.z_index));
 
                 let mut hit_edge = None;
-                for edge in sorted_edges {
-                    let in_x = mouse_event.column >= edge.hit_rect.start_col
-                        && mouse_event.column < edge.hit_rect.start_col + edge.hit_rect.width;
-                    let in_y = mouse_event.row >= edge.hit_rect.start_row
-                        && mouse_event.row < edge.hit_rect.start_row + edge.hit_rect.height;
+                // 【关键修复】如果鼠标点在了浮动窗口内部，直接跳过 Flexbox 边缘检测！
+                if !hit_floating_inside {
+                    for edge in sorted_edges {
+                        let in_x = mouse_event.column >= edge.hit_rect.start_col
+                            && mouse_event.column < edge.hit_rect.start_col + edge.hit_rect.width;
+                        let in_y = mouse_event.row >= edge.hit_rect.start_row
+                            && mouse_event.row < edge.hit_rect.start_row + edge.hit_rect.height;
 
-                    if in_x && in_y {
-                        hit_edge = Some(edge);
-                        break;
+                        if in_x && in_y {
+                            hit_edge = Some(edge);
+                            break;
+                        }
                     }
                 }
 
@@ -492,12 +672,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let neighbor_id = edge.neighbor_id.clone();
                             let dir = edge.direction;
 
+                            // 【修复 2】点击边框时赋予焦点
+                            engine.focus.current = app::Focus::Component(primary_id.clone());
+                            engine.mark_dirty(&primary_id);
+
                             // 1. 记录叶子节点的初始物理尺寸
                             let r1 = engine.get_node_current_bbox(&primary_id, columns, rows).map(|(r, _)| r).unwrap_or_default();
                             let r2 = engine.get_node_current_bbox(&neighbor_id, columns, rows).map(|(r, _)| r).unwrap_or_default();
 
                             engine.drag.active = true;
-                            engine.drag.is_restructured = false; // 重置标记
+                            engine.drag.is_restructured = false;
                             engine.drag.resize_target = Some(app::DragTarget::ResizeEdge(primary_id, neighbor_id, dir));
                             engine.drag.start_col = mouse_event.column;
                             engine.drag.start_row = mouse_event.row;
@@ -513,32 +697,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // ==========================================
                 // 窗口内容区命中逻辑
                 // ==========================================
-                let mut sorted_rects: Vec<_> = all_rects.iter().collect();
-                sorted_rects.sort_by(|a, b| b.3.cmp(&a.3));
-
                 for (rect, name, _border, _z) in sorted_rects.iter() {
                     let in_x = mouse_event.column >= rect.start_col && mouse_event.column < rect.start_col + rect.width;
                     let in_y = mouse_event.row >= rect.start_row && mouse_event.row < rect.start_row + rect.height;
                     if !in_x || !in_y { continue; }
 
-                    let old_focus = engine.focus.current.clone();
-                    engine.focus.current = app::Focus::Component(name.clone());
+                    // 【终极防御】鼠标点击 StatusBar 时，直接跳过，绝不允许它获得焦点！
+                    if let Some(app::Component::StatusBar(_)) = engine.components.get(name) {
+                        continue;
+                    }
 
-                    if old_focus != engine.focus.current {
-                        if let app::Focus::Component(old_name) = &old_focus {
-                            engine.mark_dirty(old_name);
-                        }
-                        engine.mark_dirty(name);
-                        // 【修复】焦点变化时，状态栏也需要更新
-                        for (n, c) in &engine.components {
-                            if matches!(c, app::Component::StatusBar(_)) {
-                                engine.dirty_components.insert(n.clone());
+                    // 【修复 1】只在鼠标按下时才切换焦点，悬停不再改变样式！
+                    let is_press = matches!(mouse_event.kind,
+                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) |
+                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right)
+                    );
+
+                    if is_press {
+                        let old_focus = engine.focus.current.clone();
+                        engine.focus.current = app::Focus::Component(name.clone());
+
+                        if old_focus != engine.focus.current {
+                            if let app::Focus::Component(old_name) = &old_focus {
+                                engine.mark_dirty(old_name);
+                            }
+                            engine.mark_dirty(name);
+                            // 【修复】焦点变化时，状态栏也需要更新
+                            for (n, c) in &engine.components {
+                                if matches!(c, app::Component::StatusBar(_)) {
+                                    engine.dirty_components.insert(n.clone());
+                                }
+                            }
+                            if let Some(app::Component::Tree(t)) = engine.components.get(name) {
+                                if t.focus_to_fire {
+                                    engine.emit("focus", columns, rows);
+                                }
                             }
                         }
-                        if let Some(app::Component::Tree(t)) = engine.components.get(name) {
-                            if t.focus_to_fire {
-                                engine.emit("focus", columns, rows);
-                            }
+
+                        // 【修复 2】鼠标点击切换焦点时，强制关闭激活的输入框！彻底解决 Space 失灵
+                        if engine.has_active_input() {
+                            engine.cancel_input();
                         }
                     }
 
@@ -680,8 +879,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 v.is_loading = false;
                 // 只有当返回的结果对应于当前最新选中的 ID 时，才更新缓冲区
                 if v.cached_entity_id == target_id {
-                    v.content_buffer = content;
-                    v.scroll_offset = 0;
+                    // 【修复】如果内容没变，保留滚动位置，防止跳动
+                    if v.content_buffer != content {
+                        v.content_buffer = content;
+                        v.scroll_offset = 0;
+                    }
                     engine.mark_dirty(&view_name);
                 }
             }
@@ -705,13 +907,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let mut ctx = ui::RenderCtx { engine: &mut engine, style_engine: &style_engine, term_size };
-        let mut out = std::io::BufWriter::new(stdout());
+
+        // 【优化2】直接使用外部的 out，不再重复创建
         if let Err(e) = ui::render_all(&mut ctx, &all_rects, &mut out) {
             terminal::disable_raw_mode()?;
             stdout().execute(DisableMouseCapture)?;
             stdout().execute(terminal::LeaveAlternateScreen)?;
             return Err(e.into());
         }
+
+        // 【优化3】确保每帧渲染后刷新缓冲区到终端
+        out.flush()?;
     }
 
     terminal::disable_raw_mode()?;

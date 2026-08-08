@@ -2,40 +2,27 @@
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
-use crate::protocol::Entity;
+use std::collections::HashMap;
 
 const MAX_LINE_CHARS: usize = 500;
 const MAX_TOTAL_BYTES: usize = 1024 * 1024;
 
 pub fn replace_placeholders_in_args(
     template_args: &[String],
-    selected_entity: Option<&Entity>,
-    ids_str: &str,
-    paths_str: &str,
-    window_name: &str,
-    width: &str,
-    height: &str,
-    event: &str,
+    context: &HashMap<String, String>,
 ) -> Vec<String> {
+    // 【修复缺陷】收集 keys 并排序，确保嵌套占位符替换的确定性
+    let mut keys: Vec<&String> = context.keys().collect();
+    keys.sort();
+
     template_args.iter().map(|arg| {
         let mut res = arg.clone();
-        if let Some(entity) = selected_entity {
-            res = res.replace("{id}", &entity.id);
-            res = res.replace("{path}", &entity.path);
-            res = res.replace("{display}", &entity.display);
-            res = res.replace("{tags}", &entity.tags);
-        } else {
-            res = res.replace("{id}", "");
-            res = res.replace("{path}", "");
-            res = res.replace("{display}", "");
-            res = res.replace("{tags}", "");
+        // 【修复 E0507】使用 &keys 进行引用遍历，避免消耗 keys 的所有权
+        for key in &keys {
+            if let Some(val) = context.get(*key) {
+                res = res.replace(&format!("{{{}}}", key), val);
+            }
         }
-        res = res.replace("{ids}", ids_str);
-        res = res.replace("{paths}", paths_str);
-        res = res.replace("{window}", window_name);
-        res = res.replace("{event}", event);
-        res = res.replace("{width}", width);
-        res = res.replace("{height}", height);
         res
     }).collect()
 }
@@ -175,70 +162,22 @@ pub fn execute_command_silent(cmd_args: &[String]) -> std::io::Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::Entity;
 
     #[test]
     fn test_placeholder_expansion() {
-        let entity = Entity {
-            id: "U-01".into(),
-            display: "Test".into(),
-            path: "/path/with spaces.md".into(),
-            tags: "live".into(),
-        };
+        let mut ctx = HashMap::new();
+        ctx.insert("path".to_string(), "/path/with spaces.md".to_string());
 
         let template = vec!["vim".into(), "{path}".into()];
-        let result = replace_placeholders_in_args(
-            &template,
-            Some(&entity),
-            "U-01",
-            "\"/path/with spaces.md\"",
-            "Main",
-            "80",
-            "24",
-            "", // 补全 event 参数
-        );
-
+        let result = replace_placeholders_in_args(&template, &ctx);
         assert_eq!(result, vec!["vim", "/path/with spaces.md"]);
     }
 
     #[test]
-    fn test_paths_quote_escaping() {
-        let entity = Entity {
-            id: "U-01".into(),
-            display: "Test".into(),
-            path: "/path/with\"quote.md".into(),
-            tags: "live".into(),
-        };
-
-        let template = vec!["echo".into(), "{paths}".into()];
-        let result = replace_placeholders_in_args(
-            &template,
-            Some(&entity),
-            "U-01",
-            "\"/path/with\\\"quote.md\"",
-            "Main",
-            "80",
-            "24",
-            "", // 补全 event 参数
-        );
-
-        assert_eq!(result[1], "\"/path/with\\\"quote.md\"");
-    }
-
-    #[test]
-    fn test_empty_entity() {
-        let template = vec!["echo".into(), "{id}".into(), "{path}".into()];
-        let result = replace_placeholders_in_args(
-            &template,
-            None,
-            "",
-            "",
-            "Main",
-            "80",
-            "24",
-            "", // 补全 event 参数
-        );
-
-        assert_eq!(result, vec!["echo", "", ""]);
+    fn test_empty_context() {
+        let ctx = HashMap::new();
+        let template = vec!["echo".into(), "{id}".into()];
+        let result = replace_placeholders_in_args(&template, &ctx);
+        assert_eq!(result, vec!["echo", "{id}"]);
     }
 }

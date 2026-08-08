@@ -4,11 +4,10 @@ use super::renderer::WindowRenderer;
 use super::TextStyle;
 use crate::app::TreeState;
 use crate::style::{StyleEngine, UiTheme};
-use std::io::Write;
 
 /// 【提纯】Tree 组件不再关心绝对坐标和边框开销
-pub fn draw_tree_window<'a, W: Write>(
-    renderer: &mut WindowRenderer<'a, W>,
+pub fn draw_tree_window(
+    renderer: &mut WindowRenderer,
     tree: &TreeState,
     style_engine: &StyleEngine,
     scroll_offset: usize,
@@ -57,7 +56,7 @@ pub fn draw_tree_window<'a, W: Write>(
             fg_color.unwrap_or(ui_theme.view_unfocused)
         };
 
-        let bg_color = if is_selected && is_focused { Some(ui_theme.selected_bg) } else { None };
+        let bg_color = if is_selected { Some(ui_theme.selected_bg) } else { None };
         let style = TextStyle { fg: final_fg, bg: bg_color, bold: is_bold };
 
         renderer.print(0, drawn as u16, &display, style, tree.h_scroll)?;

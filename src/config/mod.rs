@@ -35,12 +35,21 @@ impl BindConfig {
             signal_bindings: HashMap::new(),
         };
         let defaults = vec![
-            ("q", "__EXIT__"), ("esc", "__ESC__"), ("tab", "__TAB__"),
+            ("q", "__EXIT__"), ("esc", "__ESC__"),
+            // 【修改】Tab 改为 Z 轴图层切换
+            ("tab", "__CYCLE_LAYER__"),
+
             ("up", "__UP__"), ("k", "__UP__"), ("down", "__DOWN__"), ("j", "__DOWN__"),
             ("left", "__EXPAND__"), ("h", "__EXPAND__"), ("right", "__EXPAND__"), ("l", "__EXPAND__"),
             ("space", "__MARK__"), ("g", "__TOP__"), ("G", "__BOTTOM__"),
             ("H", "__SCROLL_LEFT__"), ("L", "__SCROLL_RIGHT__"),
             ("/", "__ACTIVATE_SEARCH__"), (":", "__ACTIVATE_CMD__"), ("enter", "__ENTER__"),
+
+            // 【新增】Vim 风格的窗口方向切换
+            ("ctrl-h", "__FOCUS_LEFT__"),
+            ("ctrl-l", "__FOCUS_RIGHT__"),
+            ("ctrl-k", "__FOCUS_UP__"),
+            ("ctrl-j", "__FOCUS_DOWN__"),
         ];
         for (key_desc, cmd) in defaults {
             if let Some(key_event) = parse_key_desc(key_desc) {

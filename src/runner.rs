@@ -26,6 +26,10 @@ pub fn execute_binding(
             Ok(code) => {
                 if code != 0 {
                     engine.last_error = Some(format!("Silent cmd exited with code {}", code));
+                } else {
+                    // 【修复死锁】静默命令成功后，由引擎自动触发重载！
+                    // 彻底废弃在脚本中调用 stree update MainTree 的做法。
+                    engine.trigger_reload(columns, rows);
                 }
             }
             Err(e) => {
@@ -55,6 +59,11 @@ pub fn execute_binding(
         let _ = stdout().execute(terminal::EnterAlternateScreen);
         let _ = stdout().execute(EnableMouseCapture);
         let _ = terminal::enable_raw_mode();
+
+        // 【关键修复】重新进入 Alternate Screen 后，终端物理屏幕已被清空。
+        // 必须清空 prev_rects 强制触发全量重绘，否则 diff 引擎会认为画面没变，导致白屏！
+        engine.prev_rects.clear();
+        engine.mark_all_dirty();
 
         match status {
             Ok(s) => {

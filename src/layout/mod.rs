@@ -50,6 +50,7 @@ pub enum WindowSize {
     Percent(u16), // 万分比精度：0 = 0.00%, 10000 = 100.00%
     Absolute(u16),
     Absolute2D(u16, u16),
+    Percent2D(u16, u16), // 【新增】二维百分比
 }
 
 #[derive(Debug, Clone)]
@@ -156,10 +157,16 @@ fn compute_rects(
     match node {
         LayoutNode::Window { name, border, size, .. } => {
             let mut final_rect = rect;
-            // 【新增】如果是浮动窗口且声明了二维尺寸，直接覆盖宽高，无视 Flexbox 撑满规则
-            if let Some(WindowSize::Absolute2D(w, h)) = size {
-                final_rect.width = *w;
-                final_rect.height = *h;
+            match size {
+                Some(WindowSize::Absolute2D(w, h)) => {
+                    final_rect.width = *w;
+                    final_rect.height = *h;
+                }
+                Some(WindowSize::Percent2D(w, h)) => {
+                    final_rect.width = (*w as u32 * rect.width as u32 / 10000) as u16;
+                    final_rect.height = (*h as u32 * rect.height as u32 / 10000) as u16;
+                }
+                _ => {}
             }
             rects.push((final_rect, name.clone(), *border));
         }
@@ -199,13 +206,16 @@ fn compute_rects(
                     Some(WindowSize::Absolute(n)) => {
                         absolute_content_len = absolute_content_len.saturating_add(n);
                     }
-                    // 【新增】处理二维尺寸：在 Flexbox 中按主轴方向参与绝对像素分配
                     Some(WindowSize::Absolute2D(w, h)) => {
                         let main_axis_len = if *direction == Direction::Horizontal { w } else { h };
                         absolute_content_len = absolute_content_len.saturating_add(main_axis_len);
                     }
                     Some(WindowSize::Percent(p)) => {
                         declared_pct_sum = declared_pct_sum.saturating_add(p);
+                    }
+                    // 【补丁】Percent2D 视为 undeclared，不参与 flex 分配
+                    Some(WindowSize::Percent2D(_, _)) => {
+                        undeclared_count += 1;
                     }
                     None => {
                         undeclared_count += 1;
@@ -233,7 +243,6 @@ fn compute_rects(
 
                 let s = match child_size {
                     Some(WindowSize::Absolute(n)) => n,
-                    // 【修复】补充 Absolute2D 的处理，按主轴方向提取尺寸
                     Some(WindowSize::Absolute2D(w, h)) => {
                         if *direction == Direction::Horizontal { w } else { h }
                     }
@@ -242,6 +251,8 @@ fn compute_rects(
                             (flex_len as u32 * p as u32 / pct_base as u32) as u16
                         }
                     }
+                    // 【补丁】Percent2D 在 flex 中返回 0，最终尺寸由 Window 分支覆盖
+                    Some(WindowSize::Percent2D(_, _)) => 0,
                     None => 0,
                 };
                 content_sizes.push(s);

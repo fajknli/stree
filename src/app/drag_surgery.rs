@@ -65,6 +65,9 @@ impl Engine {
 
         for layer in &self.layout_layers {
             if !layer.visible { continue; }
+            if !matches!(layer.anchor, crate::layout::Anchor::FullScreen) {
+                continue;
+            }
             Self::extract_edges_from_node(&layer.root, &w_map, layer.z_index, &mut self.drag.cached_edges);
         }
 
@@ -262,10 +265,11 @@ impl Engine {
         }
     }
 
-    fn get_node_id(node: &LayoutNode) -> String {
+    // 【优化】返回 &str，避免不必要的 String 分配
+    fn get_node_id(node: &LayoutNode) -> &str {
         match node {
-            LayoutNode::Window { name, .. } => name.clone(),
-            LayoutNode::Container { id, .. } => id.clone(),
+            LayoutNode::Window { name, .. } => name.as_str(),
+            LayoutNode::Container { id, .. } => id.as_str(),
         }
     }
 
@@ -371,6 +375,8 @@ impl Engine {
 
                 let is_abs = match child {
                     LayoutNode::Window { size: Some(WindowSize::Absolute(_)), .. } => true,
+                    LayoutNode::Window { size: Some(WindowSize::Absolute2D(_, _)), .. } => true,
+                    LayoutNode::Window { size: Some(WindowSize::Percent2D(_, _)), .. } => true,
                     _ => false,
                 };
                 is_absolute_flags.push(is_abs);
@@ -543,15 +549,20 @@ impl Engine {
                             }
                         };
 
-                        let mut new_children = Vec::new();
+                        let mut new_children: Vec<LayoutNode> = Vec::with_capacity(children.len() - 1);
                         let insert_idx = idx_p.min(idx_n);
-                        for (i, child) in children.iter().enumerate() {
-                            if i == idx_p || i == idx_n {
-                                if i == insert_idx {
-                                    new_children.push(replacement_node.clone());
+
+                        // 【优化】使用 Option 包裹，用 take() 完美实现单次所有权转移
+                        let mut replacement_opt = Some(replacement_node);
+
+                        for (i, child) in children.drain(..).enumerate() {
+                            if i == insert_idx {
+                                if let Some(rep) = replacement_opt.take() {
+                                    new_children.push(rep);
                                 }
-                            } else {
-                                new_children.push(child.clone());
+                            }
+                            if i != idx_p && i != idx_n {
+                                new_children.push(child);
                             }
                         }
 
@@ -681,6 +692,69 @@ impl Engine {
                 None
             }
             _ => None,
+        }
+    }
+    // 【新增】统一的浮动窗口边缘检测辅助函数
+    pub fn check_floating_edge_hit(
+        &self,
+        mouse_col: u16,
+        mouse_row: u16,
+        all_rects: &[(WindowRect, String, BorderStyle, usize)]
+    ) -> (Option<(String, u8, u16, u16, u16, u16)>, bool) {
+        let mut hit_inside_any = false;
+        for layer in &self.layout_layers {
+            if !layer.visible || !matches!(layer.anchor, crate::layout::Anchor::ScreenAbsolute {..}) { continue; }
+
+            if let Some(res) = Self::check_node_edge_recursive(&layer.root, mouse_col, mouse_row, all_rects) {
+                // 如果点中了边缘，直接返回
+                if res.0.is_some() {
+                    return (res.0, true);
+                }
+                // 如果只是点在了内部，记录下来
+                if res.1 {
+                    hit_inside_any = true;
+                }
+            }
+        }
+        (None, hit_inside_any)
+    }
+
+    fn check_node_edge_recursive(
+        node: &LayoutNode,
+        col: u16, row: u16,
+        all_rects: &[(WindowRect, String, BorderStyle, usize)]
+    ) -> Option<(Option<(String, u8, u16, u16, u16, u16)>, bool)> {
+        match node {
+            LayoutNode::Window { name, .. } => {
+                let rect = all_rects.iter().find(|(_, n, _, _)| n == name)?.0;
+                let in_x = col >= rect.start_col && col < rect.start_col + rect.width;
+                let in_y = row >= rect.start_row && row < rect.start_row + rect.height;
+                if in_x && in_y {
+                    let mut mask = 0u8;
+                    if col == rect.start_col { mask |= 1; }
+                    if col == rect.start_col + rect.width - 1 { mask |= 2; }
+                    if row == rect.start_row { mask |= 4; }
+                    if row == rect.start_row + rect.height - 1 { mask |= 8; }
+                    let edge_data = if mask != 0 {
+                        Some((name.clone(), mask, rect.start_col, rect.start_row, rect.width, rect.height))
+                    } else { None };
+                    return Some((edge_data, true));
+                }
+                None
+            }
+            LayoutNode::Container { children, .. } => {
+                let mut found_inside = false;
+                for c in children {
+                    if let Some(res) = Self::check_node_edge_recursive(c, col, row, all_rects) {
+                        if res.0.is_some() {
+                            return Some(res);
+                        }
+                        if res.1 { found_inside = true; }
+                    }
+                }
+                if found_inside { return Some((None, true)); }
+                None
+            }
         }
     }
 }
