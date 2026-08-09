@@ -7,6 +7,7 @@ pub mod tree;
 pub mod navigation;
 pub mod data_loader;
 pub mod drag_surgery;
+pub mod metrics;
 
 pub use view::ViewState;
 pub use statusbar::StatusBarState;

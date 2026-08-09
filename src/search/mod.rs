@@ -29,8 +29,12 @@ pub fn match_entities(entities: &[Entity], query: &str) -> HashSet<String> {
 
     for entity in entities {
         // 仅搜索内容层（id, display, path），不搜索元数据层
-        // 【修复】去掉路径末尾的 .md 扩展名，防止搜索 "md" 或 "." 匹配到所有文件
-        let searchable_path = entity.path.trim_end_matches(".md");
+        // 【修复】截取最后一个 '.' 之前的内容，彻底去掉任何文件扩展名（如 .md, .txt），
+        // 防止搜索扩展名匹配到所有文件
+        let searchable_path = match entity.path.rfind('.') {
+            Some(idx) => &entity.path[..idx],
+            None => entity.path.as_str(),
+        };
 
         let is_match = entity.id.to_lowercase().contains(&lower_query)
             || entity.display.to_lowercase().contains(&lower_query)

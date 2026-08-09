@@ -408,3 +408,41 @@ pub fn default_layout() -> Layout {
         }],
     }
 }
+
+/// 将布局 AST 转换为紧凑的字符串表示
+pub fn layout_ast_to_string(node: &LayoutNode) -> String {
+    match node {
+        LayoutNode::Window { name, size, border, .. } => {
+            let size_str = match size {
+                Some(WindowSize::Percent(p)) => format!("{}%", *p as f64 / 100.0),
+                Some(WindowSize::Absolute(n)) => format!("{}", n),
+                Some(WindowSize::Absolute2D(w, h)) => format!("{}x{}", w, h),
+                Some(WindowSize::Percent2D(w, h)) => format!("{:.0}%x{:.0}%", *w as f64 / 100.0, *h as f64 / 100.0),
+                None => String::new(),
+            };
+            let border_str = match border {
+                BorderStyle::Box => "",
+                BorderStyle::Line => "[line]",
+                BorderStyle::None => "[none]",
+            };
+            if size_str.is_empty() {
+                format!("area{}:{}", border_str, name)
+            } else {
+                format!("area({}){}:{}", size_str, border_str, name)
+            }
+        }
+        LayoutNode::Container { direction, children, .. } => {
+            let dir_str = match direction {
+                Direction::Horizontal => "H",
+                Direction::Vertical => "V",
+            };
+            let children_str: Vec<String> = children.iter().map(layout_ast_to_string).collect();
+            format!("{}({})", dir_str, children_str.join(", "))
+        }
+    }
+}
+
+/// 获取全局容器 ID 计数器当前值
+pub fn get_container_count() -> usize {
+    CONTAINER_ID_COUNTER.load(Ordering::SeqCst)
+}

@@ -2,7 +2,7 @@
 name = "stree"
 version = "1.0.0"
 edition = "2021"
-description = "通用声明式结构化树形终端视图引擎"
+description = "A General-Purpose,Declarative,Structured,Tree-Based Terminal View Engine"
 license = "MIT"
 
 [profile.release]

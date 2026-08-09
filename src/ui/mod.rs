@@ -9,6 +9,7 @@ use crate::app::{Component, Engine, Focus};
 use crate::layout::{WindowRect, BorderStyle};
 use crossterm::style::Color;
 use std::io::Write;
+use std::collections::HashMap;
 use crossterm::{cursor, QueueableCommand};
 use unicode_width::UnicodeWidthStr;
 
@@ -24,6 +25,8 @@ thread_local! {
     // 【优化1】新增 CURR_BUFFER 用于复用
     static CURR_BUFFER: RefCell<Option<Buffer>> = RefCell::new(None);
     static CURSOR_POS: RefCell<Option<(u16, u16)>> = RefCell::new(None);
+    // 【极致优化】预分配 HashMap，避免每帧渲染状态栏时分配内存
+    static METRICS_BUF: RefCell<std::collections::HashMap<String, String>> = RefCell::new(std::collections::HashMap::new());
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -108,7 +111,6 @@ pub fn render_all<W: Write>(ctx: &mut RenderCtx, all_rects: &[(WindowRect, Strin
         } else if let Some(comp) = ctx.engine.components.get(name) {
             match comp {
                 Component::View(v) => {
-                    // ... (保留 View 渲染逻辑不变)
                     let content = v.content_buffer.as_str();
                     let lines: Vec<&str> = content.lines().collect();
                     let max_rows = renderer.content_height() as usize;
@@ -117,8 +119,11 @@ pub fn render_all<W: Write>(ctx: &mut RenderCtx, all_rects: &[(WindowRect, Strin
                     let color = if is_focused { ctx.engine.ui_theme.view_focused } else { ctx.engine.ui_theme.view_unfocused };
                     let style = TextStyle { fg: color, ..Default::default() };
                     for i in 0..max_rows {
-                        if let Some(line) = lines.get(i + actual_offset) { renderer.print(0, i as u16, line, style, v.h_scroll)?; }
-                        else { renderer.clear_row(i as u16)?; }
+                        // 【同步修复】预览窗也先清行再画，防止短行覆盖长行时的属性残留
+                        renderer.clear_row(i as u16)?;
+                        if let Some(line) = lines.get(i + actual_offset) {
+                            renderer.print(0, i as u16, line, style, v.h_scroll)?;
+                        }
                     }
                 }
                 Component::StatusBar(s) => {
@@ -135,25 +140,30 @@ pub fn render_all<W: Write>(ctx: &mut RenderCtx, all_rects: &[(WindowRect, Strin
                         // 无 Input 激活：正常渲染状态栏
                         let mut status_text = s.format_template.clone();
 
-                        // 【修复】优先渲染临时消息，如果未过期
+                        // 优先渲染临时消息，如果未过期
                         let show_msg = if let Some(expire) = s.message_expire {
                             std::time::Instant::now() < expire
-                        } else {
-                            false
-                        };
+                        } else { false };
                         if show_msg {
-                            if let Some(msg) = &s.message {
-                                status_text = msg.clone();
-                            }
+                            if let Some(msg) = &s.message { status_text = msg.clone(); }
                         }
 
-                        status_text = status_text.replace("{stree_focus}", match &ctx.engine.focus.current { Focus::Component(n) => n, _ => "None" });
-                        if let Some(t) = ctx.engine.get_focused_tree_state() {
-                            status_text = status_text.replace("{stree_visible}", &t.visible_ids.len().to_string());
-                            status_text = status_text.replace("{stree_total}", &t.dataset.entities.len().to_string());
-                            status_text = status_text.replace("{stree_marked}", &t.marked_ids.len().to_string());
-                            status_text = status_text.replace("{stree_id}", t.selected_id.as_deref().unwrap_or(""));
-                        }
+                        // ==========================================
+                        // 【终极重构】UI 层不再写任何业务逻辑，直接向引擎要数据！
+                        // ==========================================
+                        METRICS_BUF.with(|buf| {
+                            let mut m = buf.borrow_mut();
+                            ctx.engine.collect_status_metrics(
+                                ctx.term_size.columns,
+                                ctx.term_size.rows,
+                                all_rects,
+                                &mut m
+                            );
+                            for (key, val) in m.iter() {
+                                status_text = status_text.replace(&format!("{{stree_{}}}", key), val);
+                            }
+                        });
+
                         let max_rows = renderer.content_height() as u16;
                         for i in 0..max_rows { renderer.clear_row(i)?; }
                         let style = TextStyle { fg: ctx.engine.ui_theme.statusbar_fg, ..Default::default() };

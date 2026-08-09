@@ -90,6 +90,8 @@ pub fn draw_tree_window(
         let bg_color = if is_selected { Some(ui_theme.selected_bg) } else { None };
         let style = TextStyle { fg: final_fg, bg: bg_color, bold: is_bold };
 
+        // 【终极修复】画字前先清空该行，彻底消灭旧字符属性（bold/color）残留！
+        renderer.clear_row(drawn as u16)?;
         renderer.print(0, drawn as u16, &display, style, tree.h_scroll)?;
         drawn += 1;
     }

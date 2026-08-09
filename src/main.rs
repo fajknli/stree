@@ -541,7 +541,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 【修复借用冲突】使用 clone 截断对 engine 的不可变借用，允许循环内部对 engine 进行可变操作
             let mut sorted_edges: Vec<_> = engine.drag.cached_edges.clone();
             sorted_edges.sort_by(|a, b| b.z_index.cmp(&a.z_index));
-
             for mouse_event in &mouse_events {
                 if !engine.mouse.enabled { continue; }
 
