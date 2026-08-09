@@ -1,5 +1,3 @@
-// src/app/drag_surgery.rs
-
 use crate::app::{Engine, DragEdge};
 use crate::layout::{LayoutNode, WindowRect, BorderStyle, WindowSize, Direction};
 use std::collections::HashMap;
@@ -174,16 +172,17 @@ impl Engine {
         }
     }
 
+    // 【修改】收集叶子节点时，同时记录 draggable 标志
     fn collect_leaf_rects(
         node: &LayoutNode,
         rects: &HashMap<String, WindowRect>,
         z_index: usize,
-        out: &mut Vec<(WindowRect, String, usize)>,
+        out: &mut Vec<(WindowRect, String, usize, bool)>,
     ) {
         match node {
-            LayoutNode::Window { name, .. } => {
+            LayoutNode::Window { name, draggable, .. } => {
                 if let Some(rect) = rects.get(name) {
-                    out.push((*rect, name.clone(), z_index));
+                    out.push((*rect, name.clone(), z_index, *draggable));
                 }
             }
             LayoutNode::Container { children, .. } => {
@@ -205,8 +204,11 @@ impl Engine {
 
         for i in 0..leaf_rects.len() {
             for j in i + 1..leaf_rects.len() {
-                let (r1, name1, _z1) = &leaf_rects[i];
-                let (r2, name2, _z2) = &leaf_rects[j];
+                let (r1, name1, _z1, drag1) = &leaf_rects[i];
+                let (r2, name2, _z2, drag2) = &leaf_rects[j];
+
+                // 【新增绝对防线】只有双方都显式声明了 [drag]，它们之间的边框才可拖拽！
+                if !(*drag1 && *drag2) { continue; }
 
                 let horizontal_adjacent =
                     r1.start_row == r2.start_row
@@ -726,17 +728,22 @@ impl Engine {
         all_rects: &[(WindowRect, String, BorderStyle, usize)]
     ) -> Option<(Option<(String, u8, u16, u16, u16, u16)>, bool)> {
         match node {
-            LayoutNode::Window { name, .. } => {
+            LayoutNode::Window { name, draggable, .. } => {
                 let rect = all_rects.iter().find(|(_, n, _, _)| n == name)?.0;
                 let in_x = col >= rect.start_col && col < rect.start_col + rect.width;
                 let in_y = row >= rect.start_row && row < rect.start_row + rect.height;
                 if in_x && in_y {
                     let mut mask = 0u8;
-                    if col == rect.start_col { mask |= 1; }
-                    // 【修复】防止 width/height 为 0 时减法下溢导致引擎崩溃
-                    if rect.width > 0 && col == rect.start_col + rect.width - 1 { mask |= 2; }
-                    if row == rect.start_row { mask |= 4; }
-                    if rect.height > 0 && row == rect.start_row + rect.height - 1 { mask |= 8; }
+
+                    // 【新增绝对防线】只有声明了 [drag] 的浮动窗口，才计算边缘拉伸掩码
+                    if *draggable {
+                        if col == rect.start_col { mask |= 1; }
+                        // 【修复】防止 width/height 为 0 时减法下溢导致引擎崩溃
+                        if rect.width > 0 && col == rect.start_col + rect.width - 1 { mask |= 2; }
+                        if row == rect.start_row { mask |= 4; }
+                        if rect.height > 0 && row == rect.start_row + rect.height - 1 { mask |= 8; }
+                    }
+
                     let edge_data = if mask != 0 {
                         Some((name.clone(), mask, rect.start_col, rect.start_row, rect.width, rect.height))
                     } else { None };

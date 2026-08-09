@@ -16,7 +16,6 @@ fn collect_visible_leaf_names(node: &LayoutNode, names: &mut HashSet<String>) {
 }
 
 impl Engine {
-    // 统一的焦点设置入口，自动维护历史栈
     pub fn set_focus(&mut self, name: &str) {
         // 【防线1】绝不允许聚焦到 StatusBar
         if let Some(c) = self.components.get(name) {
@@ -33,12 +32,14 @@ impl Engine {
                 if self.focus_history.len() > 10 {
                     self.focus_history.remove(0);
                 }
+                // 【新增】将旧焦点推入 blur 挂起队列，等待渲染前统一消费
+                self.pending_blur = Some(old.clone());
             }
         }
         self.focus.current = Focus::Component(name.to_string());
         self.mark_dirty(name);
 
-        // 【新增防线】如果聚焦的是 Tree，挂起一次选中变化广播，刷新 View
+        // 【防线】如果聚焦的是 Tree，挂起一次选中变化广播，刷新 View
         if let Some(Component::Tree(_)) = self.components.get(name) {
             self.pending_selection_changed = Some(name.to_string());
         }

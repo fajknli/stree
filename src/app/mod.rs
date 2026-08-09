@@ -182,6 +182,7 @@ pub struct Engine {
     pub prev_rects: std::collections::HashMap<String, WindowRect>,
     pub dirty_components: std::collections::HashSet<String>,
     pub pending_selection_changed: Option<String>,
+    pub pending_blur: Option<String>, // 【新增】失去焦点挂起队列
     pub async_view_tx: Sender<(String, Option<String>, String)>,
     pub async_view_rx: Receiver<(String, Option<String>, String)>,
     pub async_reload_tx: Sender<(String, std::io::Result<String>)>,
@@ -399,6 +400,7 @@ impl Engine {
             prev_rects: std::collections::HashMap::new(),
             dirty_components: std::collections::HashSet::new(),
             pending_selection_changed: None,
+            pending_blur: None, // 【新增】
             async_view_tx: tx,
             async_view_rx: rx,
             async_reload_tx: rtx,
@@ -435,6 +437,31 @@ impl Engine {
         if let Some(tree_name) = self.pending_selection_changed.take() {
             self.broadcast_selection_changed(&tree_name, term_width, term_height);
             self.emit_select_if_changed(term_width, term_height);
+        }
+
+        // 【新增】处理失去焦点信号
+        if let Some(blur_name) = self.pending_blur.take() {
+            let binding = self.key_bindings.get_signal_binding(Some(&blur_name), "blur");
+            if let Some((cmd_template_args, _is_silent)) = binding {
+                let ctx = Self::build_exec_context(
+                    None, "", "", &blur_name,
+                    &term_width.to_string(), &term_height.to_string(), "blur", None
+                );
+                let full_cmd_args = crate::exec::replace_placeholders_in_args(cmd_template_args, &ctx);
+
+                // 复用内部指令直连魔法！零延迟同步执行 UI 状态变更
+                if let Some(internal_cmd) = InternalCommand::from_args(&full_cmd_args) {
+                    match internal_cmd {
+                        InternalCommand::ToggleLayout(name) => self.toggle_layout_visible(&name),
+                        InternalCommand::ShowLayout(name) => self.set_layout_visible(&name, true),
+                        InternalCommand::HideLayout(name) => self.set_layout_visible(&name, false),
+                        _ => {}
+                    }
+                } else {
+                    // 如果不是内部指令，降级为外部静默执行
+                    let _ = crate::exec::execute_command_silent(&full_cmd_args);
+                }
+            }
         }
     }
 
