@@ -34,6 +34,8 @@ impl Engine {
             m.insert("tags".into(), sel.map(|e| e.tags.clone()).unwrap_or_default());
             m.insert("trees".into(), self.components.values().filter(|c| matches!(c, Component::Tree(_))).count().to_string());
             m.insert("markable".into(), if t.markable { "Y" } else { "N" }.into());
+            m.insert("scroll_v".into(), t.v_scroll.to_string());  // 【补丁】暴露垂直滚动
+            m.insert("scroll_h".into(), t.h_scroll.to_string());  // 【补丁】暴露水平滚动
         }
 
         // --- 2. 预览窗与 I/O 层 ---

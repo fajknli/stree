@@ -9,7 +9,6 @@ use crate::app::{Component, Engine, Focus};
 use crate::layout::{WindowRect, BorderStyle};
 use crossterm::style::Color;
 use std::io::Write;
-use std::collections::HashMap;
 use crossterm::{cursor, QueueableCommand};
 use unicode_width::UnicodeWidthStr;
 

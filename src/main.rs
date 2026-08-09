@@ -196,6 +196,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ==========================================
         // 1. 布局系统：只计算一次，得到物理真相
         // ==========================================
+        // 【新增】在计算布局前，先解析 Auto 高度
+        engine.precalculate_auto_sizes(rows);
+
         let mut all_rects = engine.calc_all_rects(columns, rows);
 
         if !engine.drag.active {
@@ -938,6 +941,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let app::Focus::Component(name) = &engine.focus.current.clone() {
                 let name = name.clone();
                 engine.broadcast_selection_changed(&name, columns, rows);
+                // 【补丁】启动时触发 load 信号，符合契约
+                engine.emit("load", columns, rows);
             }
         }
 

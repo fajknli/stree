@@ -6,7 +6,6 @@ pub struct InputState {
     pub cursor: usize,          // 字符索引（不是字节）
     pub is_active: bool,
     pub prefix: String,         // "/" 或 ":" 等
-    pub last_rendered: String,
     pub on_submit: Option<String>, // 提交时执行的命令模板
     pub on_submit_is_silent: bool,
 }
@@ -20,7 +19,6 @@ impl InputState {
             prefix: prefix.to_string(),
             on_submit: None,
             on_submit_is_silent: false,
-            last_rendered: String::new(),
         }
     }
 

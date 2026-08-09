@@ -273,7 +273,7 @@ fn parse_window(s: &str) -> Option<LayoutNode> {
         let close = rest.find(')')?;
         let size_str = rest[1..close].trim();
         let sz = if let Some(comma_pos) = size_str.find(',') {
-            // 【修复】优先处理包含逗号的二维尺寸
+            // 优先处理包含逗号的二维尺寸
             let w_str = size_str[..comma_pos].trim();
             let h_str = size_str[comma_pos+1..].trim();
             if let (Some(w_pct), Some(h_pct)) = (w_str.strip_suffix('%'), h_str.strip_suffix('%')) {
@@ -285,6 +285,10 @@ fn parse_window(s: &str) -> Option<LayoutNode> {
             }
         } else if let Some(p_str) = size_str.strip_suffix('%') {
             Some(WindowSize::Percent(parse_percent_to_mille(p_str)?))
+        } else if size_str == "auto" {
+            Some(WindowSize::Auto(1)) // 【新增】默认 fallback 高度为 1
+        } else if let Some(auto_str) = size_str.strip_prefix("auto:") {
+            Some(WindowSize::Auto(auto_str.parse::<u16>().ok()?)) // 【新增】支持 auto:5
         } else if size_str.is_empty() {
             None
         } else {
@@ -319,7 +323,8 @@ fn parse_window(s: &str) -> Option<LayoutNode> {
             Some(WindowSize::Percent(p)) => format!("{}pct", p),
             Some(WindowSize::Absolute(n)) => format!("{}abs", n),
             Some(WindowSize::Absolute2D(w, h)) => format!("{}x{}", w, h),
-            Some(WindowSize::Percent2D(w, h)) => format!("{}x{}pct", w, h), // 【补丁】防止编译报错
+            Some(WindowSize::Percent2D(w, h)) => format!("{}x{}pct", w, h),
+            Some(WindowSize::Auto(n)) => format!("auto_{}", n), // 【修复】补全 Auto 的分支
             None => "unnamed".to_string(),
         })
     };

@@ -37,6 +37,12 @@ impl Engine {
         }
         self.focus.current = Focus::Component(name.to_string());
         self.mark_dirty(name);
+
+        // 【新增防线】如果聚焦的是 Tree，挂起一次选中变化广播，刷新 View
+        if let Some(Component::Tree(_)) = self.components.get(name) {
+            self.pending_selection_changed = Some(name.to_string());
+        }
+
         for (n, c) in &self.components {
             if matches!(c, Component::StatusBar(_)) {
                 self.dirty_components.insert(n.clone());

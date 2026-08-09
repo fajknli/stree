@@ -43,11 +43,6 @@ pub struct DragEdge {
     pub z_index: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BorderSide {
-    Top, Bottom, Left, Right,
-}
-
 #[derive(Debug)]
 pub enum Component {
     Tree(TreeState),
@@ -172,6 +167,7 @@ pub struct Engine {
     pub components: HashMap<String, Component>,
     pub layout_layers: Vec<layout::LayoutLayer>,
     pub window_rect_overrides: HashMap<String, layout::WindowSize>,
+    pub auto_overrides: HashMap<String, layout::WindowSize>, // 【新增】Auto 预计算专用字典
     pub key_bindings: BindConfig,
     pub border_chars: HashMap<String, String>,
     pub global_relations: Vec<crate::protocol::Relation>,
@@ -194,6 +190,7 @@ pub struct Engine {
     pub prev_term_size: (u16, u16),
     pub ui_theme: crate::style::UiTheme,
     pub focus_history: Vec<String>,
+    pub layout_blueprint: Vec<String>,
 }
 
 fn parse_component_prefixes(cfg: &str) -> (bool, bool, bool, &str) {
@@ -386,6 +383,7 @@ impl Engine {
             global_relations,
             border_chars: border_chars_map,
             window_rect_overrides: std::collections::HashMap::new(),
+            auto_overrides: std::collections::HashMap::new(), // 【新增】
             drag: DragState::default(),
             focus: FocusState {
                 current: focused.clone(),
@@ -409,6 +407,7 @@ impl Engine {
             prev_term_size: (0, 0),
             ui_theme: crate::style::UiTheme::parse(ui_colors),
             focus_history: Vec::new(),
+            layout_blueprint: layout_strings, // 【必须新增】将传入的布局字符串保存为蓝图
         };
 
         engine.is_initialized = false;
@@ -458,7 +457,13 @@ impl Engine {
     }
 
     pub fn calc_all_rects(&self, term_width: u16, term_height: u16) -> Vec<(WindowRect, String, BorderStyle, usize)> {
-        layout::calc_window_rects(&self.layout_layers, term_width, term_height, &self.window_rect_overrides)
+        layout::calc_window_rects(
+            &self.layout_layers,
+            term_width,
+            term_height,
+            &self.window_rect_overrides,
+            &self.auto_overrides // 【新增】
+        )
     }
 
     pub fn toggle_layout_visible(&mut self, name: &str) {
@@ -754,9 +759,25 @@ impl Engine {
             );
 
             let full_cmd_args = exec::replace_placeholders_in_args(cmd_template_args, &ctx);
-            if !full_cmd_args.is_empty() && !(full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) {
-                let _ = exec::execute_command_silent(&full_cmd_args);
+
+            if full_cmd_args.is_empty() || (full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) {
+                return true;
             }
+
+            // 【新增内部指令直连魔法】
+            // 优先尝试解析为内部指令，零延迟同步执行 UI 状态机变更，绝不 fork 进程！
+            if let Some(internal_cmd) = InternalCommand::from_args(&full_cmd_args) {
+                match internal_cmd {
+                    InternalCommand::ToggleLayout(name) => self.toggle_layout_visible(&name),
+                    InternalCommand::ShowLayout(name) => self.set_layout_visible(&name, true),
+                    InternalCommand::HideLayout(name) => self.set_layout_visible(&name, false),
+                    _ => {} // 其他内部指令暂不支持通过信号触发
+                }
+                return true; // 直接返回，不走外部 Shell
+            }
+
+            // 如果不是内部指令，才降级为外部静默执行
+            let _ = exec::execute_command_silent(&full_cmd_args);
         }
         true
     }
@@ -850,5 +871,92 @@ impl Engine {
     pub fn get_main_tree_state(&self) -> Option<&TreeState> {
         let name = self.focus.main_tree_name.as_ref()?;
         if let Some(Component::Tree(t)) = self.components.get(name) { Some(t) } else { None }
+    }
+
+    // 【新增】预计算自适应高度，将 Auto 转化为临时的 Absolute 覆盖
+    pub fn precalculate_auto_sizes(&mut self, term_height: u16) {
+        // 拖拽期间绝对禁止预计算，防止与物理像素冻结冲突
+        if self.drag.active {
+            return;
+        }
+
+        let mut next_overrides = std::collections::HashMap::new();
+
+        // 1. 扫描布局树，为非加载中的节点计算最新高度
+        for layer in &self.layout_layers {
+            Self::scan_auto_nodes(&layer.root, &self.components, term_height, &mut next_overrides);
+        }
+
+        // 2. 【冻结魔法】对于正在加载中的视图，如果上一帧有高度，直接继承过来！
+        // 这样在异步加载的零点几秒内，窗口尺寸纹丝不动，消灭闪烁。
+        for (name, size) in &self.auto_overrides {
+            if !next_overrides.contains_key(name) {
+                if let Some(Component::View(v)) = self.components.get(name) {
+                    if v.is_loading {
+                        // 【修复】继承高度时，必须强制 clamp，防止终端缩小导致高度溢出
+                        let clamped_size = match size {
+                            layout::WindowSize::Absolute(h) => {
+                                layout::WindowSize::Absolute((*h).min(term_height).max(1))
+                            }
+                            _ => *size,
+                        };
+                        next_overrides.insert(name.clone(), clamped_size);
+                    }
+                }
+            }
+        }
+
+        self.auto_overrides = next_overrides;
+    }
+
+    fn scan_auto_nodes(
+        node: &layout::LayoutNode,
+        components: &std::collections::HashMap<String, Component>,
+        term_height: u16,
+        overrides: &mut std::collections::HashMap<String, layout::WindowSize>
+    ) {
+        match node {
+            layout::LayoutNode::Window { name, size, .. } => {
+                if let Some(layout::WindowSize::Auto(fallback)) = size {
+
+                    // 【核心防御】如果视图正在加载，直接跳过，不生成新高度
+                    // 让外层逻辑把上一帧的高度继承过来
+                    let is_loading = if let Some(Component::View(v)) = components.get(name) {
+                        v.is_loading
+                    } else {
+                        false
+                    };
+
+                    if !is_loading {
+                        let content_lines = match components.get(name) {
+                            Some(Component::View(v)) => {
+                                if v.content_buffer.is_empty() {
+                                    *fallback as usize
+                                } else {
+                                    v.content_buffer.lines().count()
+                                }
+                            }
+                            Some(Component::Tree(t)) => {
+                                if t.visible_ids.is_empty() {
+                                    *fallback as usize
+                                } else {
+                                    t.visible_ids.len()
+                                }
+                            }
+                            _ => *fallback as usize
+                        };
+
+                        // 限制不超过终端总高度，且至少为 1
+                        let clamped = content_lines.min(term_height as usize).max(1) as u16;
+                        overrides.insert(name.clone(), layout::WindowSize::Absolute(clamped));
+                    }
+                }
+            }
+            layout::LayoutNode::Container { children, .. } => {
+                for child in children {
+                    Self::scan_auto_nodes(child, components, term_height, overrides);
+                }
+            }
+        }
     }
 }

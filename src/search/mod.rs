@@ -28,13 +28,12 @@ pub fn match_entities(entities: &[Entity], query: &str) -> HashSet<String> {
     let lower_query = query.to_lowercase();
 
     for entity in entities {
-        // 仅搜索内容层（id, display, path），不搜索元数据层
-        // 【修复】截取最后一个 '.' 之前的内容，彻底去掉任何文件扩展名（如 .md, .txt），
-        // 防止搜索扩展名匹配到所有文件
-        let searchable_path = match entity.path.rfind('.') {
-            Some(idx) => &entity.path[..idx],
-            None => entity.path.as_str(),
-        };
+        // 仅搜索内容层，不搜索元数据层
+        // 【修复】使用标准库安全地移除文件扩展名，保留完整目录结构
+        let searchable_path = std::path::Path::new(&entity.path)
+            .with_extension("")
+            .to_string_lossy()
+            .to_string();
 
         let is_match = entity.id.to_lowercase().contains(&lower_query)
             || entity.display.to_lowercase().contains(&lower_query)

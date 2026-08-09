@@ -79,13 +79,22 @@ impl<'a> WindowRenderer<'a> {
     ) -> std::io::Result<()> {
         if max_width == 0 { return Ok(()); }
         let max_w = max_width as usize;
+        let limit = max_w.saturating_sub(1); // 预留 1 列给 '~'
 
         let mut current_fg = base_style.fg;
         let mut current_bg = base_style.bg;
         let mut current_bold = base_style.bold;
 
+        // 【新增】左侧截断指示符 '<'
+        let has_left_trunc = h_offset > 0 && max_w > 2;
+        let mut current_w = if has_left_trunc {
+            self.buffer.set_cell(start_col as usize, row as usize, '<', current_fg, current_bg, current_bold);
+            1 // 文本从第 1 列开始画，跳过第 0 列的 '<'
+        } else {
+            0
+        };
+
         let mut skipped_w = 0;
-        let mut current_w = 0;
 
         let mut chars = text.char_indices().peekable();
         while let Some((_, c)) = chars.next() {
@@ -94,7 +103,6 @@ impl<'a> WindowRenderer<'a> {
                 if let Some(&(_, next_c)) = chars.peek() {
                     if next_c == '[' {
                         chars.next(); // consume '['
-                        // 【Geek 优化】调用独立解析器，主循环清爽无比
                         let (fg, bg, bold) = Self::parse_ansi_sgr(&mut chars, base_style);
                         current_fg = fg;
                         current_bg = bg;
@@ -110,17 +118,17 @@ impl<'a> WindowRenderer<'a> {
                     continue;
                 }
 
-                if current_w + cw > max_w {
-                    if current_w < max_w {
-                        self.buffer.set_cell((start_col + current_w as u16) as usize, row as usize, '~', current_fg, current_bg, current_bold);
+                // 截断逻辑：严格预留 1 列给 '~'
+                if current_w + cw > limit {
+                    if current_w <= limit {
+                        self.buffer.set_cell((start_col + limit as u16) as usize, row as usize, '~', current_fg, current_bg, current_bold);
                     }
                     break;
                 }
 
                 self.buffer.set_cell((start_col + current_w as u16) as usize, row as usize, c, current_fg, current_bg, current_bold);
 
-                // 【关键修复】处理宽字符（如中文）：如果字符宽度为2，必须在下一列填入空格占位
-                // 绝不能再用 '\0'，否则会导致 Diff 算法状态机脱节，产生高亮残影！
+                // 处理宽字符（如中文）：如果字符宽度为2，必须在下一列填入空格占位
                 if cw == 2 {
                     let next_x = (start_col + current_w as u16 + 1) as usize;
                     self.buffer.set_cell(next_x, row as usize, ' ', current_fg, current_bg, current_bold);

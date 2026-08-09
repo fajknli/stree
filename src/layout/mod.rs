@@ -51,6 +51,7 @@ pub enum WindowSize {
     Absolute(u16),
     Absolute2D(u16, u16),
     Percent2D(u16, u16), // 【新增】二维百分比
+    Auto(u16), // 【新增】自适应高度，参数为 fallback 默认行数
 }
 
 #[derive(Debug, Clone)]
@@ -105,8 +106,17 @@ pub fn calc_window_rects(
     term_width: u16,
     term_height: u16,
     overrides: &std::collections::HashMap<String, WindowSize>,
+    auto_overrides: &std::collections::HashMap<String, WindowSize>,
 ) -> Vec<(WindowRect, String, BorderStyle, usize)> {
     let mut all_rects = Vec::new();
+
+    // 【关键修复】反转合并顺序！
+    // 必须先克隆 auto_overrides，然后用 overrides (包含拖拽物理锁) 覆盖它。
+    // 这样拖拽时的物理像素篡改才能生效！
+    let mut effective_overrides = auto_overrides.clone();
+    for (k, v) in overrides {
+        effective_overrides.insert(k.clone(), *v);
+    }
 
     for layer in layers {
         if !layer.visible { continue; }
@@ -137,7 +147,7 @@ pub fn calc_window_rects(
         };
 
         let mut layer_rects = Vec::new();
-        compute_rects(&layer.root, canvas, &mut layer_rects, overrides);
+        compute_rects(&layer.root, canvas, &mut layer_rects, &effective_overrides);
 
         for (rect, name, border) in layer_rects {
             all_rects.push((rect, name, border, layer.z_index));
@@ -146,6 +156,7 @@ pub fn calc_window_rects(
 
     all_rects
 }
+
 
 // 纯粹的 Flexbox 空间分配算法（最大余数法）
 fn compute_rects(
@@ -189,6 +200,7 @@ fn compute_rects(
             let mut declared_pct_sum: u16 = 0;
             let mut undeclared_count: u16 = 0;
 
+            // ================ Phase 0: 统计基础数据 ================
             for child in children.iter() {
                 let border_extra = match child {
                     LayoutNode::Window { border: BorderStyle::Box, .. } => 2,
@@ -213,7 +225,10 @@ fn compute_rects(
                     Some(WindowSize::Percent(p)) => {
                         declared_pct_sum = declared_pct_sum.saturating_add(p);
                     }
-                    // 【补丁】Percent2D 视为 undeclared，不参与 flex 分配
+                    // 【新增】Auto 视为绝对值，占用固定空间
+                    Some(WindowSize::Auto(n)) => {
+                        absolute_content_len = absolute_content_len.saturating_add(n);
+                    }
                     Some(WindowSize::Percent2D(_, _)) => {
                         undeclared_count += 1;
                     }
@@ -251,8 +266,8 @@ fn compute_rects(
                             (flex_len as u32 * p as u32 / pct_base as u32) as u16
                         }
                     }
-                    // 【补丁】Percent2D 在 flex 中返回 0，最终尺寸由 Window 分支覆盖
                     Some(WindowSize::Percent2D(_, _)) => 0,
+                    Some(WindowSize::Auto(n)) => n, // 【新增】Auto 直接使用 fallback 值
                     None => 0,
                 };
                 content_sizes.push(s);
@@ -296,7 +311,8 @@ fn compute_rects(
                         LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
                         LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or_else(|| percent.map(WindowSize::Percent)),
                     };
-                    if !matches!(child_size, Some(WindowSize::Absolute(_)) | Some(WindowSize::Absolute2D(_, _))) { Some(content_sizes[i]) } else { None }
+                    // 【新增】Auto 也不参与余数分配
+                    if !matches!(child_size, Some(WindowSize::Absolute(_)) | Some(WindowSize::Absolute2D(_, _)) | Some(WindowSize::Auto(_))) { Some(content_sizes[i]) } else { None }
                 })
                 .sum();
             let remainder = flex_len.saturating_sub(non_absolute_sum) as usize;
@@ -314,7 +330,8 @@ fn compute_rects(
                         LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
                         LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or_else(|| percent.map(WindowSize::Percent)),
                     };
-                    if !matches!(child_size, Some(WindowSize::Absolute(_)) | Some(WindowSize::Absolute2D(_, _))) {
+                    // 【新增】Auto 也不参与余数分配
+                    if !matches!(child_size, Some(WindowSize::Absolute(_)) | Some(WindowSize::Absolute2D(_, _)) | Some(WindowSize::Auto(_))) {
                         let exact_x10000: u64 = match child_size {
                             Some(WindowSize::Percent(p)) => {
                                 if pct_base == 0 { 0 } else {
@@ -418,6 +435,7 @@ pub fn layout_ast_to_string(node: &LayoutNode) -> String {
                 Some(WindowSize::Absolute(n)) => format!("{}", n),
                 Some(WindowSize::Absolute2D(w, h)) => format!("{}x{}", w, h),
                 Some(WindowSize::Percent2D(w, h)) => format!("{:.0}%x{:.0}%", *w as f64 / 100.0, *h as f64 / 100.0),
+                Some(WindowSize::Auto(n)) => format!("auto:{}", n), // 【新增】
                 None => String::new(),
             };
             let border_str = match border {

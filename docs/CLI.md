@@ -1,4 +1,4 @@
-# stree 引擎契约与 CLI 参考手册 (V3.1)
+# stree 引擎契约与 CLI 参考手册 (V3.3)
 
 本文档是 `stree` 引擎与外部业务层（胶水脚本）之间的严格契约。`stree` 采用 **混合保留模式**：内部通过 Rust 严格管理高频 UI 交互状态（焦点、滚动、展开、标记）以实现零延迟响应，外部通过 Unix 管道、IPC 与声明式配置驱动一切业务逻辑。
 
@@ -76,15 +76,33 @@ ID \t Display \t Path \t Tags
 --statusbar "Name:FormatTemplate"
 ```
 
-专属状态占位符：
+**全息探测器**：引擎在渲染状态栏时，会通过 `collect_status_metrics` 将内部 30 多种状态收集为平坦的 `HashMap`。UI 层仅做无脑的字符串替换。支持以下占位符自动替换：
 
-| 占位符 | 展开值 |
-| :--- | :--- |
-| `{stree_focus}` | 当前焦点窗口名 |
-| `{stree_visible}` | 当前 Tree 可见节点数 |
-| `{stree_total}` | 当前 Tree 总节点数 |
-| `{stree_marked}` | 被标记的节点数 |
-| `{stree_id}` | 当前选中节点 ID |
+| 类别 | 占位符 | 展开值 |
+| :--- | :--- | :--- |
+| **VST 数据** | `{stree_id}` / `{stree_display}` / `{stree_path}` / `{stree_tags}` | 当前选中节点的 4 列数据 |
+| **树拓扑** | `{stree_visible}` / `{stree_total}` | 可见节点数 / 总节点数 |
+| | `{stree_marked}` / `{stree_expanded}` | 标记数 / 展开的节点数 |
+| | `{stree_roots}` / `{stree_relations}` | 根节点数 / 图谱连线总数 |
+| | `{stree_idx}` / `{stree_depth}` | 当前选中行号 (从1起) / 当前节点深度 |
+| | `{stree_search}` | 当前激活的搜索词（无则空） |
+| | `{stree_scroll_v}` / `{stree_scroll_h}` | 树视图垂直/水平滚动偏移 |
+| **预览/IO** | `{stree_loading}` | 正在后台加载的 View 数量 |
+| | `{stree_view_v}` / `{stree_view_h}` | 聚焦 View 的滚动位置 |
+| | `{stree_buffer_kb}` | 聚焦 View 的缓冲区大小 (KB) |
+| **布局渲染** | `{stree_ast}` | 当前主图层的 AST 拓扑简写字符串 |
+| | `{stree_layers}` / `{stree_windows}` | 可见图层数 / 窗口总数 |
+| | `{stree_dirty}` | 当前帧被标脏的组件数 |
+| | `{stree_edges}` / `{stree_intersections}` | 可拖拽边缘数 / 交叉点数 |
+| | `{stree_cols}` / `{stree_rows}` | 当前终端尺寸 |
+| | `{stree_prev_cols}` / `{stree_prev_rows}` | 上一帧终端尺寸 |
+| **交互系统** | `{stree_focus}` | 当前焦点窗口名 |
+| | `{stree_drag}` | 拖拽状态 (显示 `DRAG` 或空) |
+| | `{stree_marking}` | 鼠标右键批量标记状态 (显示 `MARK` 或空) |
+| | `{stree_input}` | 输入模式状态 (显示 `INPUT` 或空) |
+| | `{stree_history}` | 焦点历史栈深度 |
+| **系统** | `{stree_ipc_sock}` | 当前 IPC Socket 路径 |
+| | `{stree_pid}` | 引擎进程 PID |
 
 **渲染优先级**：当有 Input 组件激活时，StatusBar 的物理区域被 Input 劫持（渲染输入框）。全局错误提示（`last_error`）以红底白字覆盖 StatusBar 内容。
 
@@ -99,6 +117,7 @@ ID \t Display \t Path \t Tags
 - **`/` 特殊行为**：若 Prefix 为 `/`，引擎拦截输入执行**内部实时模糊搜索**（fzf 式逐键过滤），不执行 `OnSubmitTemplate`。
 - **`{input}` 占位符**：提交时，用户输入的原始字符串通过 `{input}` 注入命令模板。
 - **编辑快捷键**：`Ctrl-U` 清空、`Ctrl-A` 行首、`Ctrl-E` 行尾、`Home`/`End`、`Left`/`Right`。
+- **退格退出**：若输入框内容已为空，再次按下 `Backspace` 等同于按 `Esc`，直接退出输入模式。
 
 ---
 
@@ -118,6 +137,7 @@ area(size)[border,drag]:Name
 | 绝对尺寸 | `area(3)` | 主轴方向固定字符数 |
 | 二维绝对 | `area(40,15)` | 宽 × 高固定字符数（`Absolute2D`），仅用于浮动层 |
 | 二维百分比 | `area(95%,95%)` | 宽 × 高百分比（`Percent2D`），仅用于浮动层 |
+| 自适应高度 | `area(auto)` 或 `area(auto:5)` | 根据内容行数自动计算高度，参数为 fallback 默认行数（默认 1）。**仅推荐在垂直容器中使用**。 |
 | 留空 | `area:Main` | 均分剩余空间 |
 
 - **`border`**：`box`（默认，四边框）、`line`（仅顶线）、`none`（无边框）。
@@ -153,9 +173,18 @@ vertical(size, child1, child2, ...)
 
 1. **Phase 1 — 基础整数分配**：`Absolute` 节点直接占用固定尺寸；`Percent` 节点按 `flex_len × p / pct_base` 取整。
 2. **Phase 2 — 未声明节点公平份额**：未声明尺寸的节点均分剩余空间（含余数分配）。
-3. **Phase 3 — 最大余数法（Largest Remainder Method）**：全局余数按小数部分降序分配，确保容器被**精确填满**，无黑色缝隙。
+3. **Phase 3 — 最大余数法**：全局余数按小数部分降序分配，确保容器被**精确填满**，无黑色缝隙。
 
-### 3.5 鼠标拖拽与 AST 动态手术
+### 3.5 Auto 语义与防闪烁冻结机制
+
+对于 `area(auto)` 节点，引擎采用“降维打击”策略，不修改底层 Flexbox 算法，而是通过预计算动态覆盖：
+
+1. **预计算降维**：每帧渲染前，`precalculate_auto_sizes` 扫描 AST 中的 `Auto` 节点。对于 `Tree` 取 `visible_ids.len()`，对于 `View` 取 `content_buffer.lines().count()`，将其转换为临时的 `Absolute` 覆盖存入 `auto_overrides` 字典。
+2. **字典优先级**：底层 `calc_window_rects` 合并字典时，优先级为 `拖拽物理锁 (window_rect_overrides)` > `Auto预计算 (auto_overrides)` > `AST声明`。
+3. **防闪烁冻结**：如果 View 正在异步加载（`is_loading = true`），跳过重算，直接继承上一帧的 `auto_overrides` 高度。但在继承时，必须强制进行 `clamp(term_height)` 限制，防止终端缩小时高度溢出导致布局崩溃。
+4. **拖拽固化**：一旦用户拖拽了 `Auto` 窗口的边缘，AST 重组会直接将其固化为静态的 `Absolute`，彻底退出动态计算。需通过 `@layout-reset` 从蓝图快照恢复。
+
+### 3.6 鼠标拖拽与 AST 动态手术
 
 #### Flexbox 边缘拖拽（`ResizeEdge`）
 
@@ -181,7 +210,7 @@ echo "" | stree update @layout-reset           # 清空所有覆盖
 echo "" | stree update "@layout-reset Main"     # 仅重置指定窗口
 ```
 
-### 3.6 图层显隐控制
+### 3.7 图层显隐控制
 
 - `__TOGGLE_LAYOUT__ Name`：切换包含该窗口的图层显隐。打开时自动聚焦图层内第一个窗口；关闭时从 `focus_history` 栈回退焦点。
 - `__SHOW_LAYOUT__ Name` / `__HIDE_LAYOUT__ Name`：强制显示/隐藏。
@@ -201,12 +230,17 @@ echo "" | stree update "@layout-reset Main"     # 仅重置指定窗口
 
 **全屏重绘触发条件**：`prev_rects` 为空（首帧）、终端尺寸变化、图层显隐切换。此时先发送 `Clear(All)`，再重建 `PREV_BUFFER`。
 
-### 4.2 宽字符处理
+### 4.2 背景擦除与 Z 轴覆盖
+
+- **浮动窗口强制不透明**：为防止底层 Flexbox 窗口内容透出，Z-index > 0 的浮动层在渲染前会强制用空格擦除背景（`clear_bg = true`）。普通底层窗口在无背景色时跳过擦除以提升性能。
+- **行级清空**：Tree 和 View 组件在绘制每一行新内容前，会先清空该行残留的旧属性，彻底杜绝颜色重叠残影。
+
+### 4.3 宽字符处理
 
 - 宽度为 2 的字符（如中文）在 Buffer 中占据两列：第一列存储字符本身，第二列存储**空格 `' '` 占位符**（绝不使用 `\0`）。
 - Diff 时动态检测左侧字符宽度（`UnicodeWidthChar::width`），若为 2 则当前列是宽字符右半部分：**不打印字符**（防止破坏宽字符），但**必须同步样式状态**（防止 ANSI 状态机脱节导致残影）。
 
-### 4.3 ANSI SGR 解析器
+### 4.4 ANSI SGR 解析器
 
 `WindowRenderer::parse_ansi_sgr` 零分配解析器，支持：
 
@@ -224,7 +258,7 @@ echo "" | stree update "@layout-reset Main"     # 仅重置指定窗口
 
 截断逻辑：按可见字符宽度计数，确保不会劈裂 ANSI 序列。超出宽度时追加 `~` 符号（预留 1 列）。
 
-### 4.4 脏标记与延迟广播
+### 4.5 脏标记与延迟广播
 
 - **`dirty_components`**：记录需要重绘的组件集合。Tree 变化时自动标脏所有 StatusBar。
 - **`pending_selection_changed`**：`j/k/Space` 等操作不立即广播选中变化，而是在渲染前统一 `flush_pending_updates`，合并多次变更为一次。
@@ -234,13 +268,16 @@ echo "" | stree update "@layout-reset Main"     # 仅重置指定窗口
 
 ## 5. 交互契约
 
-### 5.1 搜索防幽灵契约
+### 5.1 搜索防幽灵契约与高亮
 
 通过 `/` 激活搜索时，引擎执行实时模糊匹配。
 
 **严格契约**：引擎**仅搜索内容层**（`ID`, `Display`, `Path`），**绝对不搜索元数据层**（`Tags`）。
+**安全剥离扩展名**：搜索 Path 时，使用 Rust 标准库 `Path::with_extension("")` 移除文件扩展名，完美处理多级目录和带点的文件名（如 `/tmp/my.note.md` -> `/tmp/my.note`），防止搜索扩展名匹配到所有文件。
 
 *设计意图*：防止搜索 `"li"` 时，因隐藏的 `"live"` 标签导致所有节点全亮。
+
+**搜索高亮**：匹配的子串会在树视图中以 TrueColor 红色 (`\x1b[38;2;201;59;59m`) 高亮显示，使用 `\x1b[39m` 恢复前景色，确保不破坏选中行的背景色。
 
 ### 5.2 默认快捷键
 
@@ -271,6 +308,7 @@ echo "" | stree update "@layout-reset Main"     # 仅重置指定窗口
 ### 5.3 焦点系统
 
 - **`set_focus` 统一入口**：自动维护 `focus_history` 栈（最多 10 层），**绝不允许聚焦到 StatusBar**。
+- **异步刷新防挂起**：`set_focus` 修改焦点后，不会同步触发视图刷新（避免 `&mut self` 借用冲突），而是将刷新请求挂起到 `pending_selection_changed` 队列，由主循环在渲染前统一消费。这解决了 `Tab` 切换时 View 不刷新的时序 Bug。
 - **方向切换（`focus_direction`）**：基于物理矩形计算空间距离（`tolerance = 2`），按欧几里得距离排序选择最近候选。仅考虑**可见图层**内的组件。
 - **Z 轴切换（`cycle_layer`）**：在可见图层间循环跳转，优先从 `focus_history` 中恢复该图层的历史焦点。
 - **焦点回退（`recover_focus`）**：当前焦点丢失时，从历史栈恢复；历史栈为空时选择第一个非 StatusBar 组件。
@@ -327,7 +365,7 @@ echo "" | stree update "@layout-reset Main"     # 仅重置指定窗口
 **`refresh_engine_state` 三步曲**：
 1. `trigger_reload`：重新执行所有 Tree 的数据源命令。
 2. 清空所有 View 的 `cached_entity_id`，强制重新加载。
-3. `broadcast_selection_changed`：广播当前选中状态，触发 View 异步加载。
+3. `broadcast_selection_changed`：广播当前选中状态，触发 View 异步加载。若焦点不在 Tree 上，则**回退到主树 (`main_tree_name`)** 作为上下文刷新 View，避免视图永久挂起。
 
 ### 6.3 静默模式的死锁防御
 
@@ -339,7 +377,7 @@ echo "" | stree update "@layout-reset Main"     # 仅重置指定窗口
 
 ```bash
 --bind "select=@echo {id}"           # 全局信号
---bind "TreeA:select=bat {path}"     # 局部作用域（Window:signal）
+--bind "TreeA:select=bat {path}"     # 局部作用域
 --bind "ctrl-t=@switch-view.sh"      # 物理按键
 ```
 
@@ -419,12 +457,12 @@ Socket 路径通过 `$STREE_SOCK` 暴露。帧结构（大端序）：
 ```bash
 ./generate-data.sh | stree update MainTree   # 重建 Tree 内存结构 + 广播选中 + 触发 load 信号
 echo "Loading..." | stree update Preview     # 直接替换 View 缓冲区
-echo "[ERR] ..." | stree update Status       # 替换 StatusBar 模板
+echo "[ERR] ..." | stree update Status       # StatusBar 临时消息推送
 ```
 
 - **Tree 更新**：解析 TSV → 重建内存树 → 保留 `expanded_ids`（retain 有效 ID）→ 恢复选中 → 广播 → 触发 `select` 和 `load` 信号。
 - **View 更新**：替换 `content_buffer`，清空 `cached_entity_id`，滚动归零。
-- **StatusBar 更新**：替换 `format_template`。
+- **StatusBar 更新**：推送的消息作为**临时消息**显示，3 秒后自动过期恢复原模板。
 
 ### 8.3 布局控制指令
 
@@ -526,3 +564,9 @@ echo "User selected: $selected"
 3. **提供机制，不提供策略**：引擎提供标签匹配机制但不定义标签含义；提供 IPC 通道但不定义推送格式；提供占位符展开但不定义命令逻辑。
 4. **同步主循环纯洁性**：主循环只消耗在纯计算上。可能阻塞的物理操作（文件 I/O、进程等待）剥离到子进程或后台线程。
 5. **UI 交互状态与业务状态分离**：引擎持有焦点、滚动、展开、标记等 UI 交互状态（延迟敏感，不能走 IPC）。业务状态 100% 由外部脚本管理。
+6. 动态语义降维，底层算法纯粹：
+引擎底层只认识有限的基础类型（如 Absolute, Percent）。任何高级动态语义（如根据内容自适应的 Auto），必须在渲染前通过“预计算”降维为静态类型（注入 auto_overrides）。底层 Flexbox 数学算法绝不为业务特性妥协或打补丁。
+7. 状态变更解耦，异步挂起队列优先：
+在事件处理或焦点切换中，绝不同步触发跨组件的级联广播（极易引发 Rust Borrow Checker 冲突或死锁）。所有状态变更必须丢入挂起队列（如 pending_selection_changed），由主循环在安全的时间点统一 flush。
+8. 极限防御与安全降级：
+终端环境是极其混乱的（尺寸突变、宽字符越界、异步加载延迟）。所有物理坐标计算必须使用 saturating_sub/add 防止下溢 Panic；所有继承自历史帧的状态（如防闪烁的高度冻结）必须经过 clamp 边界重校验；遇到不可恢复的错误时，通过 panic hook 安全退出并恢复终端，绝不把烂摊子留给 Shell。

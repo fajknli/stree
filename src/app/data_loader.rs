@@ -49,6 +49,10 @@ impl Engine {
                 v.cached_entity_id = new_cached_id.clone();
                 v.is_loading = true;
 
+                // 【新增】切换节点时，重置水平和垂直滚动位置，从头展示新内容
+                v.h_scroll = 0;
+                v.scroll_offset = 0;
+
                 let ctx = Self::build_exec_context(
                     selected_entity.as_ref(), &ids_str, &paths_str, &window_name,
                     &width_str, &height_str, "", None
@@ -88,6 +92,16 @@ impl Engine {
                 let window_name = view_name.clone();
                 let template_args_vec = crate::config::split_args(&v.cmd_template);
 
+                // 【优化】如果是依赖选中实体的动态视图，跳过初始化同步执行，
+                // 交给 broadcast_selection_changed 进行异步加载，防止闪烁和错误输出。
+                let depends_on_selection = template_args_vec.iter().any(|arg|
+                    arg.contains("{id}") || arg.contains("{path}") || arg.contains("{display}") ||
+                    arg.contains("{tags}") || arg.contains("{ids}") || arg.contains("{paths}")
+                );
+                if depends_on_selection {
+                    continue;
+                }
+
                 let ctx = Self::build_exec_context(None, "", "", &window_name, &width_str, &height_str, "", None);
                 let full_cmd_args = exec::replace_placeholders_in_args(&template_args_vec, &ctx);
 
@@ -107,11 +121,10 @@ impl Engine {
     pub fn handle_ipc_update(&mut self, target: &str, data: &str, term_width: u16, term_height: u16) {
         if target == "@layout-reset" {
             self.window_rect_overrides.clear();
-            self.mark_all_dirty();
-            return;
-        }
-        if let Some(layer_name) = target.strip_prefix("@layout-reset ") {
-            self.window_rect_overrides.remove(layer_name.trim());
+            // 【新增】从蓝图完全重建 AST，恢复 Auto 和初始 Percent！
+            let parsed_layout = crate::layout::parse_layouts(&self.layout_blueprint);
+            self.layout_layers = parsed_layout.layers;
+
             self.mark_all_dirty();
             return;
         }

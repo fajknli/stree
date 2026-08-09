@@ -377,6 +377,7 @@ impl Engine {
                     LayoutNode::Window { size: Some(WindowSize::Absolute(_)), .. } => true,
                     LayoutNode::Window { size: Some(WindowSize::Absolute2D(_, _)), .. } => true,
                     LayoutNode::Window { size: Some(WindowSize::Percent2D(_, _)), .. } => true,
+                    LayoutNode::Window { size: Some(WindowSize::Auto(_)), .. } => true, // 【必须保留】
                     _ => false,
                 };
                 is_absolute_flags.push(is_abs);

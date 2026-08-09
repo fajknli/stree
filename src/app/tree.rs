@@ -198,6 +198,8 @@ mod tests {
             click_to_fire: false,
             focus_to_fire: false,
             search_query: None,
+            h_scroll: 0,  // 【补丁】新增
+            v_scroll: 0,  // 【补丁】新增
         };
         state.select_id("U-01");
         state

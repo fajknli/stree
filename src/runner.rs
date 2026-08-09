@@ -94,9 +94,14 @@ fn refresh_engine_state(engine: &mut Engine, columns: u16, rows: u16) {
         }
     }
 
-    // 3. 广播当前选中状态，让刚被清空缓存的 View 立刻去加载
-    if let crate::app::Focus::Component(name) = &engine.focus.current.clone() {
-        let name = name.clone();
-        engine.broadcast_selection_changed(&name, columns, rows);
+    // 3. 【更优解】寻找有效的 Tree 上下文来刷新 View
+    // 优先使用当前聚焦的 Tree，如果焦点不在 Tree 上（如在 View 或 StatusBar），则回退到主树
+    let tree_to_refresh = match &engine.focus.current {
+        crate::app::Focus::Component(n) if matches!(engine.components.get(n), Some(crate::app::Component::Tree(_))) => Some(n.clone()),
+        _ => engine.focus.main_tree_name.clone(),
+    };
+
+    if let Some(tree_name) = tree_to_refresh {
+        engine.broadcast_selection_changed(&tree_name, columns, rows);
     }
 }

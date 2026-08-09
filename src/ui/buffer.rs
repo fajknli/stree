@@ -60,6 +60,10 @@ impl Buffer {
         let mut last_bg: Option<Color> = None;
         let mut last_bold = false;
 
+        // 【关键修复】每帧 Diff 开始前，强制重置终端的 SGR 全局状态！
+        // 终端是状态机，如果不显式重置，上一帧末尾遗留的背景色/粗体会污染本帧初始的 Diff 判断。
+        out.queue(style::SetAttribute(style::Attribute::Reset))?;
+
         for y in 0..self.height {
             for x in 0..self.width {
                 let idx = y * self.width + x;
