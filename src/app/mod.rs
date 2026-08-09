@@ -347,7 +347,16 @@ impl Engine {
         }
 
         for i_cfg in inputs {
-            let parts: Vec<&str> = i_cfg.splitn(3, ':').collect();
+            let mut is_instant = false;
+            let mut cfg_str = i_cfg.trim();
+
+            // 【新增】解析 instant: 前缀
+            if let Some(stripped) = cfg_str.strip_prefix("instant:") {
+                is_instant = true;
+                cfg_str = stripped.trim();
+            }
+
+            let parts: Vec<&str> = cfg_str.splitn(3, ':').collect();
             let name = parts[0].to_string();
             let prefix = parts.get(1).filter(|s| !s.is_empty()).map(|s| s.to_string()).unwrap_or_else(|| ":".to_string());
             let on_submit_raw = parts.get(2).map(|s| s.to_string());
@@ -366,6 +375,7 @@ impl Engine {
             let mut input_state = InputState::new(&prefix);
             input_state.on_submit = on_submit;
             input_state.on_submit_is_silent = is_silent;
+            input_state.is_instant = is_instant; // 【新增】设置标志
             components.insert(name, Component::Input(input_state));
         }
 
@@ -798,6 +808,7 @@ impl Engine {
                     InternalCommand::ToggleLayout(name) => self.toggle_layout_visible(&name),
                     InternalCommand::ShowLayout(name) => self.set_layout_visible(&name, true),
                     InternalCommand::HideLayout(name) => self.set_layout_visible(&name, false),
+                    InternalCommand::ActivateInput(name) => self.activate_input(&name, ""),
                     _ => {} // 其他内部指令暂不支持通过信号触发
                 }
                 return true; // 直接返回，不走外部 Shell

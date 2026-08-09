@@ -455,7 +455,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             continue;
                         }
-                        _ => {}
+                        _ => { continue; }
                     }
                 }
                 match key_event.code {
@@ -468,22 +468,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         if engine.has_active_input() {
                                             engine.cancel_input();
                                         } else {
-                                            // 【新增】如果没有激活的 Input，按 Esc 退出搜索结果，恢复全列表
-                                            let mut dirty = false;
-                                            for (name, comp) in engine.components.iter_mut() {
-                                                if let app::Component::Tree(t) = comp {
-                                                    if t.search_query.take().is_some() {
-                                                        t.rebuild_visible_ids();
-                                                        if !t.visible_ids.is_empty() {
-                                                            t.selected_idx = 0;
-                                                            t.selected_id = Some(t.visible_ids[0].clone());
-                                                        }
-                                                        engine.pending_selection_changed = Some(name.clone());
-                                                        dirty = true;
+                                            let mut hid_layer = false;
+                                            // 1. 检查当前聚焦的窗口是否在浮动图层 (z > 0)
+                                            if let app::Focus::Component(name) = engine.focus.current.clone() {
+                                                if let Some((_, _, _, z)) = all_rects.iter().find(|(_, n, _, _)| n == &name) {
+                                                    if *z > 0 {
+                                                        engine.set_layout_visible(&name, false);
+                                                        hid_layer = true;
                                                     }
                                                 }
                                             }
-                                            if dirty { engine.mark_all_dirty(); }
+
+                                            // 2. 如果没关浮动窗，才去清空搜索
+                                            if !hid_layer {
+                                                let mut cleared_search = false;
+                                                for (name, comp) in engine.components.iter_mut() {
+                                                    if let app::Component::Tree(t) = comp {
+                                                        if t.search_query.take().is_some() {
+                                                            t.rebuild_visible_ids();
+                                                            if !t.visible_ids.is_empty() {
+                                                                t.selected_idx = 0;
+                                                                t.selected_id = Some(t.visible_ids[0].clone());
+                                                            }
+                                                            engine.pending_selection_changed = Some(name.clone());
+                                                            cleared_search = true;
+                                                        }
+                                                    }
+                                                }
+
+                                                if cleared_search {
+                                                    engine.mark_all_dirty();
+                                                } else {
+                                                    // 3. 没有输入框、没有浮动窗、没有搜索状态 -> 触发退出请求信号
+                                                    engine.emit("quit_request", columns, rows);
+                                                }
+                                            }
                                         }
                                     }
                                     app::InternalCommand::Tab => engine.handle_tab(columns, rows),

@@ -44,6 +44,11 @@ pub fn check_and_clear_quit() -> bool {
     SHOULD_QUIT.swap(false, Ordering::SeqCst)
 }
 
+// 【新增】供 IPC 调用的主动退出方法
+pub fn request_quit() {
+    SHOULD_QUIT.store(true, Ordering::SeqCst);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

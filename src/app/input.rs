@@ -8,6 +8,7 @@ pub struct InputState {
     pub prefix: String,         // "/" 或 ":" 等
     pub on_submit: Option<String>, // 提交时执行的命令模板
     pub on_submit_is_silent: bool,
+    pub is_instant: bool,       // 【新增】瞬时输入模式标志
 }
 
 impl InputState {
@@ -19,6 +20,7 @@ impl InputState {
             prefix: prefix.to_string(),
             on_submit: None,
             on_submit_is_silent: false,
+            is_instant: false, // 默认关闭
         }
     }
 

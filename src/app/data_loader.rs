@@ -119,6 +119,12 @@ impl Engine {
     }
 
     pub fn handle_ipc_update(&mut self, target: &str, data: &str, term_width: u16, term_height: u16) {
+       // 【新增】拦截 @exit 指令，触发优雅退出
+        if target == "@exit" {
+            crate::signal::request_quit();
+            return;
+        }
+
         if target == "@layout-reset" {
             self.window_rect_overrides.clear();
             // 【新增】从蓝图完全重建 AST，恢复 Auto 和初始 Percent！
@@ -126,6 +132,15 @@ impl Engine {
             self.layout_layers = parsed_layout.layers;
 
             self.mark_all_dirty();
+            return;
+        }
+        // 【新增】支持通过 IPC 控制图层显隐
+        if let Some(layer_name) = target.strip_prefix("@layout-show ") {
+            self.set_layout_visible(layer_name.trim(), true);
+            return;
+        }
+        if let Some(layer_name) = target.strip_prefix("@layout-hide ") {
+            self.set_layout_visible(layer_name.trim(), false);
             return;
         }
         if let Some(comp) = self.components.get_mut(target) {

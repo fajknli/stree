@@ -375,6 +375,22 @@ impl Engine {
             .map(|(n, _)| n.clone())?;
 
         if let Some(Component::Input(input)) = self.components.get_mut(&input_name) {
+            // 【新增】瞬时模式：按下任意字符键立即提交，其他键取消
+            if input.is_instant {
+                if let KeyCode::Char(c) = key.code {
+                    let submitted = c.to_string();
+                    input.deactivate();
+                    self.mark_all_dirty();
+                    return Some((input_name, submitted));
+                } else {
+                    // 按下 Esc、Enter、方向键等非字符按键直接取消
+                    input.deactivate();
+                    self.mark_all_dirty();
+                    return Some((input_name, "__CANCEL__".to_string()));
+                }
+            }
+
+            // 原有的普通输入模式逻辑保持不变
             match key.code {
                 KeyCode::Esc => {
                     input.deactivate();
