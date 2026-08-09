@@ -187,6 +187,8 @@ pub struct Engine {
     pub pending_selection_changed: Option<String>,
     pub async_view_tx: Sender<(String, Option<String>, String)>,
     pub async_view_rx: Receiver<(String, Option<String>, String)>,
+    pub async_reload_tx: Sender<(String, std::io::Result<String>)>,
+    pub async_reload_rx: Receiver<(String, std::io::Result<String>)>,
     pub pending_view_reload: std::collections::HashSet<String>,
     pub prev_term_size: (u16, u16),
     pub ui_theme: crate::style::UiTheme,
@@ -338,7 +340,11 @@ impl Engine {
             let parts: Vec<&str> = s_cfg.splitn(2, ':').collect();
             let name = parts[0].to_string();
             let fmt = parts.get(1).map(|s| s.to_string()).unwrap_or_default();
-            components.insert(name, Component::StatusBar(StatusBarState { format_template: fmt }));
+            components.insert(name, Component::StatusBar(StatusBarState {
+                format_template: fmt,
+                message: None,
+                message_expire: None,
+            }));
         }
 
         for i_cfg in inputs {
@@ -369,6 +375,7 @@ impl Engine {
             .unwrap_or(Focus::None);
 
         let (tx, rx) = std::sync::mpsc::channel();
+        let (rtx, rrx) = std::sync::mpsc::channel();
 
         let mut engine = Self {
             components,
@@ -395,6 +402,8 @@ impl Engine {
             pending_selection_changed: None,
             async_view_tx: tx,
             async_view_rx: rx,
+            async_reload_tx: rtx,
+            async_reload_rx: rrx,
             pending_view_reload: std::collections::HashSet::new(),
             prev_term_size: (0, 0),
             ui_theme: crate::style::UiTheme::parse(ui_colors),
@@ -669,7 +678,13 @@ impl Engine {
                 };
                 let ids = entities.iter().map(|e| e.id.as_str()).collect::<Vec<_>>().join(" ");
                 let paths = entities.iter()
-                    .map(|e| format!("\"{}\"", e.path.replace("\"", "\\\"")))
+                    .map(|e| {
+                        if e.path.contains(' ') {
+                            format!("\"{}\"", e.path)
+                        } else {
+                            e.path.clone()
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(" ");
                 (sel, ids, paths)
@@ -718,7 +733,16 @@ impl Engine {
                     marked.iter().cloned().collect()
                 } else { sel.map(|e| vec![e]).unwrap_or_default() };
                 let ids = entities.iter().map(|e| e.id.as_str()).collect::<Vec<_>>().join(" ");
-                let paths = entities.iter().map(|e| format!("\"{}\"", e.path.replace("\"", "\\\""))).collect::<Vec<_>>().join(" ");
+                let paths = entities.iter()
+                    .map(|e| {
+                        if e.path.contains(' ') {
+                            format!("\"{}\"", e.path)
+                        } else {
+                            e.path.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 (sel.cloned(), ids, paths)
             } else { (None, String::new(), String::new()) };
 
@@ -785,7 +809,16 @@ impl Engine {
         } else { selected_entity.map(|e| vec![e]).unwrap_or_default() };
 
         let ids_str = entities.iter().map(|e| e.id.as_str()).collect::<Vec<_>>().join(" ");
-        let paths_str = entities.iter().map(|e| format!("\"{}\"", e.path.replace("\"", "\\\""))).collect::<Vec<_>>().join(" ");
+        let paths_str = entities.iter()
+            .map(|e| {
+                if e.path.contains(' ') {
+                    format!("\"{}\"", e.path)
+                } else {
+                    e.path.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
 
         let window_name = match &self.focus.current { Focus::Component(n) => n.clone(), Focus::None => String::new() };
         let ctx = Self::build_exec_context(

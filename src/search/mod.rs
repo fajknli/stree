@@ -28,10 +28,13 @@ pub fn match_entities(entities: &[Entity], query: &str) -> HashSet<String> {
     let lower_query = query.to_lowercase();
 
     for entity in entities {
-        // 仅搜索内容层（id, display, path），不搜索元数据层（status）
+        // 仅搜索内容层（id, display, path），不搜索元数据层
+        // 【修复】去掉路径末尾的 .md 扩展名，防止搜索 "md" 或 "." 匹配到所有文件
+        let searchable_path = entity.path.trim_end_matches(".md");
+
         let is_match = entity.id.to_lowercase().contains(&lower_query)
             || entity.display.to_lowercase().contains(&lower_query)
-            || entity.path.to_lowercase().contains(&lower_query);
+            || searchable_path.to_lowercase().contains(&lower_query);
 
         if is_match {
             matched.insert(entity.id.clone());

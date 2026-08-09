@@ -236,8 +236,17 @@ pub(crate) fn split_args(s: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
     let mut in_quote: Option<char> = None;
+    let mut chars = s.chars().peekable();
 
-    for c in s.chars() {
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next_c) = chars.peek() {
+                current.push(next_c);
+                chars.next();
+            }
+            continue;
+        }
+
         match in_quote {
             Some(q) if c == q => { in_quote = None; }
             None if c == '\'' || c == '"' => { in_quote = Some(c); }

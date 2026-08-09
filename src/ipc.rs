@@ -16,8 +16,9 @@ pub struct IpcServer {
 impl IpcServer {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let pid = std::process::id();
-        let socket_path = std::env::var("STREE_SOCK")
-            .unwrap_or_else(|_| format!("/tmp/stree_{}.sock", pid));
+        // 【修复】强制基于当前 PID 生成路径，防止外部环境变量污染导致 Socket 冲突
+        let socket_path = format!("/tmp/stree_{}.sock", pid);
+
         // 防线1：启动预删
         let _ = std::fs::remove_file(&socket_path);
 

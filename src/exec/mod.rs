@@ -11,20 +11,26 @@ pub fn replace_placeholders_in_args(
     template_args: &[String],
     context: &HashMap<String, String>,
 ) -> Vec<String> {
-    // 【修复缺陷】收集 keys 并排序，确保嵌套占位符替换的确定性
     let mut keys: Vec<&String> = context.keys().collect();
     keys.sort();
 
-    template_args.iter().map(|arg| {
+    let mut full_args = Vec::new();
+    for arg in template_args {
         let mut res = arg.clone();
-        // 【修复 E0507】使用 &keys 进行引用遍历，避免消耗 keys 的所有权
         for key in &keys {
             if let Some(val) = context.get(*key) {
                 res = res.replace(&format!("{{{}}}", key), val);
             }
         }
-        res
-    }).collect()
+
+        // 【修复】{ids} 和 {paths} 可能展开为多个参数（包含空格），需要重新用 split_args 解析
+        if res.contains(' ') && (arg.contains("{ids}") || arg.contains("{paths}")) {
+            full_args.extend(crate::config::split_args(&res));
+        } else {
+            full_args.push(res);
+        }
+    }
+    full_args
 }
 
 pub fn execute_command_args(cmd_args: &[String], max_lines: usize) -> std::io::Result<(i32, String)> {
@@ -43,7 +49,6 @@ pub fn execute_command_args(cmd_args: &[String], max_lines: usize) -> std::io::R
 
     let child_stderr = child.stderr.take();
 
-    // 【修复 Bug #2】使用独立线程读取 stderr，防止管道死锁
     let stderr_thread = std::thread::spawn(move || {
         let mut stderr_buf = String::new();
         if let Some(err) = child_stderr {
@@ -51,7 +56,7 @@ pub fn execute_command_args(cmd_args: &[String], max_lines: usize) -> std::io::R
             for line in reader.lines().flatten() {
                 stderr_buf.push_str(&line);
                 stderr_buf.push('\n');
-                if stderr_buf.len() > 1024 { break; }
+                if stderr_buf.len() > 8192 { break; }
             }
         }
         stderr_buf
@@ -144,6 +149,7 @@ pub fn execute_reload_hook(hook_cmd: Option<&str>) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+// 【纯粹哲学】静默执行：不碰 stdout/stderr，不碰文件，杜绝一切死锁，只看退出码
 pub fn execute_command_silent(cmd_args: &[String]) -> std::io::Result<i32> {
     if cmd_args.is_empty() {
         return Ok(0);

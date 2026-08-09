@@ -1,4 +1,6 @@
 target/
+temp-0/
+tests-0/
 Cargo.lock
 *.tsv.tmp
 *.log
@@ -6,3 +8,4 @@ Cargo.lock
 .idea/
 *.swp
 *.swo
+*.sh

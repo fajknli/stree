@@ -14,10 +14,11 @@ pub struct WindowRenderer<'a> {
     offset_y: u16,
     content_w: u16,
     content_h: u16,
+    clear_bg: bool, // 【新增】强制清空背景标志
 }
 
 impl<'a> WindowRenderer<'a> {
-    pub fn new(buffer: &'a mut Buffer, rect: WindowRect, border: BorderStyle) -> Self {
+    pub fn new(buffer: &'a mut Buffer, rect: WindowRect, border: BorderStyle, clear_bg: bool) -> Self {
         let (offset_x, offset_y, oh_x, oh_y) = match border {
             BorderStyle::Box => (1, 1, 2, 2),
             BorderStyle::Line => (0, 1, 0, 1),
@@ -30,6 +31,7 @@ impl<'a> WindowRenderer<'a> {
             offset_y,
             content_w: rect.width.saturating_sub(oh_x),
             content_h: rect.height.saturating_sub(oh_y),
+            clear_bg,
         }
     }
 
@@ -43,9 +45,11 @@ impl<'a> WindowRenderer<'a> {
         let max_w = self.content_w.saturating_sub(x);
         if max_w == 0 { return Ok(()); }
 
-        // 【关键修复】绘制前先用基础样式清空该行的内容区域，防止底层窗口残影透出
-        for i in 0..max_w {
-            self.buffer.set_cell((real_x + i) as usize, real_y as usize, ' ', style.fg, style.bg, style.bold);
+        // 【修复】如果是浮动窗口（clear_bg=true）或指定了背景色，必须用空格铺满背景，防止底层透出！
+        if self.clear_bg || style.bg.is_some() {
+            for i in 0..max_w {
+                self.buffer.set_cell((real_x + i) as usize, real_y as usize, ' ', style.fg, style.bg, style.bold);
+            }
         }
 
         self.draw_clipped_text(real_x, real_y, text, max_w, style, h_offset)
@@ -115,11 +119,11 @@ impl<'a> WindowRenderer<'a> {
 
                 self.buffer.set_cell((start_col + current_w as u16) as usize, row as usize, c, current_fg, current_bg, current_bold);
 
-                // 【关键修复】处理宽字符（如中文）：如果字符宽度为2，必须在下一列填入 '\0' 占位符
-                // 这样 diff_and_flush 就知道这一列已经被前一个字符占用，不会单独打印它导致覆盖
+                // 【关键修复】处理宽字符（如中文）：如果字符宽度为2，必须在下一列填入空格占位
+                // 绝不能再用 '\0'，否则会导致 Diff 算法状态机脱节，产生高亮残影！
                 if cw == 2 {
                     let next_x = (start_col + current_w as u16 + 1) as usize;
-                    self.buffer.set_cell(next_x, row as usize, '\0', current_fg, current_bg, current_bold);
+                    self.buffer.set_cell(next_x, row as usize, ' ', current_fg, current_bg, current_bold);
                 }
 
                 current_w += cw;

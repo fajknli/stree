@@ -732,9 +732,10 @@ impl Engine {
                 if in_x && in_y {
                     let mut mask = 0u8;
                     if col == rect.start_col { mask |= 1; }
-                    if col == rect.start_col + rect.width - 1 { mask |= 2; }
+                    // 【修复】防止 width/height 为 0 时减法下溢导致引擎崩溃
+                    if rect.width > 0 && col == rect.start_col + rect.width - 1 { mask |= 2; }
                     if row == rect.start_row { mask |= 4; }
-                    if row == rect.start_row + rect.height - 1 { mask |= 8; }
+                    if rect.height > 0 && row == rect.start_row + rect.height - 1 { mask |= 8; }
                     let edge_data = if mask != 0 {
                         Some((name.clone(), mask, rect.start_col, rect.start_row, rect.width, rect.height))
                     } else { None };

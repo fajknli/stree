@@ -17,7 +17,13 @@ impl Engine {
         } else { return; };
 
         let ids_str = selected_entity.as_ref().map(|e| e.id.clone()).unwrap_or_default();
-        let paths_str = selected_entity.as_ref().map(|e| format!("\"{}\"", e.path.replace("\"", "\\\""))).unwrap_or_default();
+        let paths_str = selected_entity.as_ref().map(|e| {
+            if e.path.contains(' ') {
+                format!("\"{}\"", e.path)
+            } else {
+                e.path.clone()
+            }
+        }).unwrap_or_default();
         let window_name = tree_name.to_string();
         let mut dirty_views = Vec::new();
 
@@ -145,7 +151,9 @@ impl Engine {
                     self.mark_dirty(target);
                 }
                 Component::StatusBar(s) => {
-                    s.format_template = data.to_string();
+                    // 【修复】不再永久覆盖模板，改为临时消息，3秒后自动消失
+                    s.message = Some(data.to_string());
+                    s.message_expire = Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                     self.mark_dirty(target);
                 }
                 _ => {}
@@ -153,7 +161,7 @@ impl Engine {
         }
     }
 
-    pub fn trigger_reload(&mut self, term_width: u16, term_height: u16) {
+    pub fn trigger_reload(&mut self) {
         self.mark_all_dirty();
         let tree_names: Vec<String> = self.components.iter()
             .filter(|(_, c)| matches!(c, Component::Tree(_)))
@@ -167,16 +175,13 @@ impl Engine {
                 None
             };
             if let Some(cmd) = source_cmd {
-                match crate::exec::execute_reload_hook(Some(&cmd)) {
-                    Ok(stdout) => {
-                        // 【修复】去掉非空判断！只要命令执行成功，无论是否有数据，
-                        // 都必须传递给 handle_ipc_update，以便清空旧的幽灵节点！
-                        self.handle_ipc_update(&name, &stdout, term_width, term_height);
-                    }
-                    Err(e) => {
-                        self.last_error = Some(format!("Reload failed for {}: {}", name, e));
-                    }
-                }
+                let tx = self.async_reload_tx.clone();
+                let name_clone = name.clone();
+                // 【修复】放入后台线程执行，彻底解除主线程阻塞
+                std::thread::spawn(move || {
+                    let result = crate::exec::execute_reload_hook(Some(&cmd));
+                    let _ = tx.send((name_clone, result));
+                });
             }
         }
     }

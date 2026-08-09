@@ -174,12 +174,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let term_size = ui::TermSize { columns, rows };
 
         if signal::check_and_clear_reload() {
-            engine.trigger_reload(columns, rows);
+            engine.trigger_reload();
         }
 
         ipc_server.try_accept_and_process(|target, data| {
             engine.handle_ipc_update(target, data, columns, rows);
         });
+
+        // 【修复】接收异步重载数据
+        while let Ok((tree_name, result)) = engine.async_reload_rx.try_recv() {
+            match result {
+                Ok(stdout) => {
+                    engine.handle_ipc_update(&tree_name, &stdout, columns, rows);
+                }
+                Err(e) => {
+                    engine.last_error = Some(format!("Reload failed for {}: {}", tree_name, e));
+                }
+            }
+        }
 
         // ==========================================
         // 1. 布局系统：只计算一次，得到物理真相
@@ -367,6 +379,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if !event::poll(Duration::ZERO)? { break; }
+
+                // 【修复】限制单帧最大处理事件数，防止大量鼠标移动事件导致渲染饥饿
+                if key_events.len() + mouse_events.len() > 50 { break; }
 
                 // 【极致丝滑优化】如果在拖拽中，并且已经拿到了最新的鼠标位置，立刻退出去渲染！
                 // 队列里积压的旧 Drag 事件会在下一轮循环中被快速丢弃，绝不阻塞渲染。
@@ -871,6 +886,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 必须重算 all_rects，确保渲染的是最新的布局真相，不留空白！
         if engine.prev_rects.is_empty() {
             all_rects = engine.calc_all_rects(columns, rows);
+        }
+
+        // 【修复】清理过期的状态栏临时消息
+        let mut status_expired = false;
+        for comp in engine.components.values_mut() {
+            if let app::Component::StatusBar(s) = comp {
+                if let Some(expire) = s.message_expire {
+                    if std::time::Instant::now() >= expire {
+                        s.message = None;
+                        s.message_expire = None;
+                        status_expired = true;
+                    }
+                }
+            }
+        }
+        if status_expired {
+            engine.mark_all_dirty();
         }
 
         // 【优化】在渲染前统一处理积压的状态变更

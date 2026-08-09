@@ -94,7 +94,9 @@ pub fn render_all<W: Write>(ctx: &mut RenderCtx, all_rects: &[(WindowRect, Strin
         let border_color = if is_focused { ctx.engine.ui_theme.border_focused } else { ctx.engine.ui_theme.border_unfocused };
 
         primitives::draw_border(&mut curr_buffer, &safe_rect, title, *border, border_color, border_chars)?;
-        let mut renderer = WindowRenderer::new(&mut curr_buffer, safe_rect, *border);
+        // 【修复】浮动窗口必须强制清空背景，防止底层内容透出
+        let is_floating = *_z_index > 0;
+        let mut renderer = WindowRenderer::new(&mut curr_buffer, safe_rect, *border, is_floating);
 
         if let Some(Component::Tree(t)) = ctx.engine.components.get_mut(name) {
             // ... (保留 Tree 渲染逻辑不变)
@@ -120,7 +122,6 @@ pub fn render_all<W: Write>(ctx: &mut RenderCtx, all_rects: &[(WindowRect, Strin
                     }
                 }
                 Component::StatusBar(s) => {
-                    // 【修改】使用克隆出的数据 active_input_data
                     if let Some((prefix, buffer, cursor)) = &active_input_data {
                         // 有 Input 激活：劫持此 StatusBar 的物理区域渲染输入框
                         renderer.clear_row(0)?;
@@ -133,6 +134,19 @@ pub fn render_all<W: Write>(ctx: &mut RenderCtx, all_rects: &[(WindowRect, Strin
                     } else {
                         // 无 Input 激活：正常渲染状态栏
                         let mut status_text = s.format_template.clone();
+
+                        // 【修复】优先渲染临时消息，如果未过期
+                        let show_msg = if let Some(expire) = s.message_expire {
+                            std::time::Instant::now() < expire
+                        } else {
+                            false
+                        };
+                        if show_msg {
+                            if let Some(msg) = &s.message {
+                                status_text = msg.clone();
+                            }
+                        }
+
                         status_text = status_text.replace("{stree_focus}", match &ctx.engine.focus.current { Focus::Component(n) => n, _ => "None" });
                         if let Some(t) = ctx.engine.get_focused_tree_state() {
                             status_text = status_text.replace("{stree_visible}", &t.visible_ids.len().to_string());
@@ -157,7 +171,7 @@ pub fn render_all<W: Write>(ctx: &mut RenderCtx, all_rects: &[(WindowRect, Strin
         if !has_statusbar {
             let bottom_y = (term_height as u16).saturating_sub(1);
             let fake_rect = WindowRect { start_col: 0, start_row: bottom_y, width: term_width as u16, height: 1 };
-            let mut fake_renderer = WindowRenderer::new(&mut curr_buffer, fake_rect, BorderStyle::None);
+            let mut fake_renderer = WindowRenderer::new(&mut curr_buffer, fake_rect, BorderStyle::None, true);
 
             if let Some((prefix, buffer, cursor)) = &active_input_data {
                 fake_renderer.clear_row(0)?;
@@ -176,7 +190,7 @@ pub fn render_all<W: Write>(ctx: &mut RenderCtx, all_rects: &[(WindowRect, Strin
         let status_rect_opt = all_rects.iter().find(|(_, n, _, _)| matches!(ctx.engine.components.get(n), Some(Component::StatusBar(_)))).map(|(r, _, _, _)| *r);
         if let Some(rect) = status_rect_opt {
             let safe_rect = clip_rect_to_term(&rect, term_width as u16, term_height as u16).unwrap_or(rect);
-            let mut err_renderer = WindowRenderer::new(&mut curr_buffer, safe_rect, BorderStyle::None);
+            let mut err_renderer = WindowRenderer::new(&mut curr_buffer, safe_rect, BorderStyle::None, true);
             err_renderer.clear_row(0)?;
             let err_text = format!(" ERR: {} ", err);
             let style = TextStyle { fg: ctx.engine.ui_theme.error_fg, bg: Some(ctx.engine.ui_theme.error_bg), ..Default::default() };

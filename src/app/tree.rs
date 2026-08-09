@@ -156,9 +156,12 @@ impl TreeState {
                 // 不修改 selected_idx，防止视图跳动
             }
         } else {
-            // ID 不在数据集中（例如数据集更新丢失了该节点），重置到第一个可见项
-            self.selected_idx = 0;
-            self.selected_id = self.visible_ids.first().cloned();
+            // ID 不在数据集中（例如数据集更新丢失了该节点），尽量保持原地索引，防止视图跳动
+            let new_len = self.visible_ids.len();
+            if self.selected_idx >= new_len && new_len > 0 {
+                self.selected_idx = new_len - 1;
+            }
+            self.selected_id = self.visible_ids.get(self.selected_idx).cloned();
         }
     }
 }

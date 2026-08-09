@@ -380,7 +380,16 @@ impl Engine {
                     self.mark_all_dirty();
                     return Some((input_name, submitted));
                 }
-                KeyCode::Backspace => input.backspace(),
+                KeyCode::Backspace => {
+                    // 【新增】如果输入框已经为空，退格键充当 Esc，直接退出输入模式
+                    if input.buffer.is_empty() {
+                        input.deactivate();
+                        self.mark_all_dirty();
+                        return Some((input_name, "__CANCEL__".to_string()));
+                    } else {
+                        input.backspace();
+                    }
+                }
                 KeyCode::Left => input.move_left(),
                 KeyCode::Right => input.move_right(),
                 KeyCode::Home => input.move_home(),
@@ -399,9 +408,13 @@ impl Engine {
 
     pub fn activate_input(&mut self, name: &str, prefix: &str) {
         if let Some(Component::Input(input)) = self.components.get_mut(name) {
-            input.prefix = prefix.to_string();
+            // 【修复】只有当显式传入前缀时才覆盖（如搜索的 "/" 和命令的 ":"），
+            // 如果传入为空，则保留配置文件中定义的前缀（如 "Delete? (y/n):"）
+            if !prefix.is_empty() {
+                input.prefix = prefix.to_string();
+            }
             input.activate();
-            self.mark_all_dirty(); // 触发重绘以显示 Input
+            self.mark_all_dirty();
         }
     }
 
