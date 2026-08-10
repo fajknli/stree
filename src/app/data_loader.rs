@@ -119,30 +119,12 @@ impl Engine {
     }
 
     pub fn handle_ipc_update(&mut self, target: &str, data: &str, term_width: u16, term_height: u16) {
-       // 【新增】拦截 @exit 指令，触发优雅退出
-        if target == "@exit" {
-            crate::signal::request_quit();
-            return;
+        // 1. 优先处理系统控制指令 (@exit, @layout-reset, @layout-show/hide)
+        if self.handle_system_command(target) {
+            return; // 如果是系统指令，处理完直接返回，不再走数据更新逻辑
         }
 
-        if target == "@layout-reset" {
-            self.window_rect_overrides.clear();
-            // 【新增】从蓝图完全重建 AST，恢复 Auto 和初始 Percent！
-            let parsed_layout = crate::layout::parse_layouts(&self.layout_blueprint);
-            self.layout_layers = parsed_layout.layers;
-
-            self.mark_all_dirty();
-            return;
-        }
-        // 【新增】支持通过 IPC 控制图层显隐
-        if let Some(layer_name) = target.strip_prefix("@layout-show ") {
-            self.set_layout_visible(layer_name.trim(), true);
-            return;
-        }
-        if let Some(layer_name) = target.strip_prefix("@layout-hide ") {
-            self.set_layout_visible(layer_name.trim(), false);
-            return;
-        }
+        // 2. 处理组件数据更新 (Tree, View, StatusBar)
         if let Some(comp) = self.components.get_mut(target) {
             match comp {
                 Component::Tree(t) => {
@@ -179,12 +161,56 @@ impl Engine {
                     self.mark_dirty(target);
                 }
                 Component::StatusBar(s) => {
-                    // 【修复】不再永久覆盖模板，改为临时消息，3秒后自动消失
+                    // 不再永久覆盖模板，改为临时消息，3秒后自动消失
                     s.message = Some(data.to_string());
                     s.message_expire = Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                     self.mark_dirty(target);
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// 【新增】专门处理 @ 开头的引擎系统控制指令
+    fn handle_system_command(&mut self, target: &str) -> bool {
+        match target {
+            "@exit" => {
+                crate::signal::request_quit();
+                true
+            }
+            "@layout-reset" => {
+                self.window_rect_overrides.clear();
+                let parsed_layout = crate::layout::parse_layouts(&self.layout_blueprint);
+                self.layout_layers = parsed_layout.layers;
+                self.mark_all_dirty();
+                true
+            }
+            // 【新增】清理所有 Tree 组件的标记状态
+            "@clear-marks" => {
+                let mut cleared = false;
+                for comp in self.components.values_mut() {
+                    if let crate::app::Component::Tree(t) = comp {
+                        if !t.marked_ids.is_empty() {
+                            t.marked_ids.clear();
+                            cleared = true;
+                        }
+                    }
+                }
+                if cleared {
+                    self.mark_all_dirty();
+                }
+                true
+            }
+            _ => {
+                if let Some(layer_name) = target.strip_prefix("@layout-show ") {
+                    self.set_layout_visible(layer_name.trim(), true);
+                    true
+                } else if let Some(layer_name) = target.strip_prefix("@layout-hide ") {
+                    self.set_layout_visible(layer_name.trim(), false);
+                    true
+                } else {
+                    false // 不是系统指令，交给数据更新逻辑处理
+                }
             }
         }
     }
