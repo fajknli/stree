@@ -1,14 +1,24 @@
 // src/app/input.rs
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputKeyResult {
+    Cancelled,
+    Submitted(String),
+    Updated, // 普通按键，仅更新了 buffer
+}
+
 #[derive(Debug)]
 pub struct InputState {
     pub buffer: String,
-    pub cursor: usize,          // 字符索引（不是字节）
+    pub cursor: usize,
     pub is_active: bool,
-    pub prefix: String,         // "/" 或 ":" 等
-    pub on_submit: Option<String>, // 提交时执行的命令模板
+    pub prompt_template: String,
+    pub prefix: String,
+    pub on_submit: Option<String>,
     pub on_submit_is_silent: bool,
-    pub is_instant: bool,       // 【新增】瞬时输入模式标志
+    pub is_instant: bool,
+    pub target_override: Option<String>,
+    pub is_search: bool, // 【新增】标记是否为实时搜索框
 }
 
 impl InputState {
@@ -17,10 +27,13 @@ impl InputState {
             buffer: String::new(),
             cursor: 0,
             is_active: false,
+            prompt_template: prefix.to_string(),
             prefix: prefix.to_string(),
             on_submit: None,
             on_submit_is_silent: false,
-            is_instant: false, // 默认关闭
+            is_instant: false,
+            target_override: None,
+            is_search: false, // 初始化
         }
     }
 

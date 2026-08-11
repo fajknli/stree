@@ -8,6 +8,8 @@ pub mod navigation;
 pub mod data_loader;
 pub mod drag_surgery;
 pub mod metrics;
+pub mod overlay;
+pub mod event_handler;
 
 pub use view::ViewState;
 pub use statusbar::StatusBarState;
@@ -51,6 +53,12 @@ pub enum Component {
     Input(InputState),
 }
 
+#[derive(Debug, Clone)]
+pub struct OverlayLayer {
+    pub source: String,
+    pub target: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum InternalCommand {
     Exit,
@@ -63,20 +71,19 @@ pub enum InternalCommand {
     Top,
     Bottom,
     Enter,
-    ActivateSearch,
-    ActivateCmd,
     ActivateInput(String),
     ToggleLayout(String),
     ShowLayout(String),
     HideLayout(String),
     ScrollLeft,
     ScrollRight,
-    // 【新增】
     FocusLeft,
     FocusRight,
     FocusUp,
     FocusDown,
     CycleLayer,
+    CloseOverlay(String),  // 新增
+    CloseTopOverlay,       // 新增
 }
 
 impl InternalCommand {
@@ -95,20 +102,19 @@ impl InternalCommand {
             ("__TOP__", None) => Some(Self::Top),
             ("__BOTTOM__", None) => Some(Self::Bottom),
             ("__ENTER__", None) => Some(Self::Enter),
-            ("__ACTIVATE_SEARCH__", None) => Some(Self::ActivateSearch),
-            ("__ACTIVATE_CMD__", None) => Some(Self::ActivateCmd),
             ("__ACTIVATE_INPUT__", Some(name)) => Some(Self::ActivateInput(name)),
             ("__TOGGLE_LAYOUT__", Some(name)) => Some(Self::ToggleLayout(name)),
             ("__SHOW_LAYOUT__", Some(name)) => Some(Self::ShowLayout(name)),
             ("__HIDE_LAYOUT__", Some(name)) => Some(Self::HideLayout(name)),
             ("__SCROLL_LEFT__", None) => Some(Self::ScrollLeft),
             ("__SCROLL_RIGHT__", None) => Some(Self::ScrollRight),
-            // 【新增映射】
             ("__FOCUS_LEFT__", None) => Some(Self::FocusLeft),
             ("__FOCUS_RIGHT__", None) => Some(Self::FocusRight),
             ("__FOCUS_UP__", None) => Some(Self::FocusUp),
             ("__FOCUS_DOWN__", None) => Some(Self::FocusDown),
             ("__CYCLE_LAYER__", None) => Some(Self::CycleLayer),
+            ("__CLOSE_OVERLAY__", Some(name)) => Some(Self::CloseOverlay(name)),
+            ("__CLOSE_TOP_OVERLAY__", None) => Some(Self::CloseTopOverlay),
             _ => None,
         }
     }
@@ -162,12 +168,29 @@ pub struct SignalState {
     pub last_emitted_select_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    pub initial_dataset: Dataset,
+    pub layout_strings: Vec<String>,
+    pub key_bindings: BindConfig,
+    pub mouse_enabled: bool,
+    pub border_chars: Vec<String>,
+    pub trees: Vec<String>,
+    pub views: Vec<String>,
+    pub statusbars: Vec<String>,
+    pub inputs: Vec<String>,
+    pub relations_path: Option<String>,
+    pub max_lines: usize,
+    pub ui_colors: String,
+}
+
+
 #[derive(Debug)]
 pub struct Engine {
     pub components: HashMap<String, Component>,
     pub layout_layers: Vec<layout::LayoutLayer>,
     pub window_rect_overrides: HashMap<String, layout::WindowSize>,
-    pub auto_overrides: HashMap<String, layout::WindowSize>, // 【新增】Auto 预计算专用字典
+    pub auto_overrides: HashMap<String, layout::WindowSize>,
     pub key_bindings: BindConfig,
     pub border_chars: HashMap<String, String>,
     pub global_relations: Vec<crate::protocol::Relation>,
@@ -182,16 +205,19 @@ pub struct Engine {
     pub prev_rects: std::collections::HashMap<String, WindowRect>,
     pub dirty_components: std::collections::HashSet<String>,
     pub pending_selection_changed: Option<String>,
-    pub pending_blur: Option<String>, // 【新增】失去焦点挂起队列
+    pub pending_blur: Option<String>,
     pub async_view_tx: Sender<(String, Option<String>, String)>,
     pub async_view_rx: Receiver<(String, Option<String>, String)>,
     pub async_reload_tx: Sender<(String, std::io::Result<String>)>,
     pub async_reload_rx: Receiver<(String, std::io::Result<String>)>,
+    pub async_exec_tx: Sender<()>,       // 【新增】异步脚本执行完成通知
+    pub async_exec_rx: Receiver<()>,     // 【新增】异步脚本执行完成接收
     pub pending_view_reload: std::collections::HashSet<String>,
     pub prev_term_size: (u16, u16),
     pub ui_theme: crate::style::UiTheme,
     pub focus_history: Vec<String>,
     pub layout_blueprint: Vec<String>,
+    pub overlay_stack: Vec<OverlayLayer>, // 【新增】统一覆盖栈
 }
 
 fn parse_component_prefixes(cfg: &str) -> (bool, bool, bool, &str) {
@@ -218,20 +244,22 @@ fn parse_component_prefixes(cfg: &str) -> (bool, bool, bool, &str) {
 }
 
 impl Engine {
-    pub fn new(
-        initial_dataset: Dataset,
-        layout_strings: Vec<String>,
-        key_bindings: BindConfig,
-        mouse_enabled: bool,
-        border_chars: Vec<String>,
-        trees: Vec<String>,
-        views: Vec<String>,
-        statusbars: Vec<String>,
-        inputs: Vec<String>,
-        relations_path: Option<String>,
-        max_lines: usize,
-        ui_colors: &str,
-    ) -> Self {
+    pub fn new(config: EngineConfig) -> Self {
+        let EngineConfig {
+            initial_dataset,
+            layout_strings,
+            key_bindings,
+            mouse_enabled,
+            border_chars,
+            trees,
+            views,
+            statusbars,
+            inputs,
+            relations_path,
+            max_lines,
+            ui_colors,
+        } = config;
+
         let mut border_chars_map = HashMap::new();
         for bc in &border_chars {
             let parts: Vec<&str> = bc.splitn(2, ':').collect();
@@ -343,25 +371,49 @@ impl Engine {
                 format_template: fmt,
                 message: None,
                 message_expire: None,
+                current_text: String::new(),
             }));
         }
 
         for i_cfg in inputs {
             let mut is_instant = false;
+            let mut is_search = false; // 新增
             let mut cfg_str = i_cfg.trim();
 
-            // 【新增】解析 instant: 前缀
             if let Some(stripped) = cfg_str.strip_prefix("instant:") {
                 is_instant = true;
                 cfg_str = stripped.trim();
             }
 
+            // 【新增】解析 search: 前缀
+            if let Some(stripped) = cfg_str.strip_prefix("search:") {
+                is_search = true;
+                cfg_str = stripped.trim();
+            }
+
             let parts: Vec<&str> = cfg_str.splitn(3, ':').collect();
-            let name = parts[0].to_string();
+            let name_part = parts[0].to_string();
+
+            // 解析 Name[Target] 语法
+            let (name, target_override) = if let Some(open_bracket) = name_part.find('[') {
+                if let Some(close_bracket) = name_part.find(']') {
+                    if close_bracket > open_bracket {
+                        let n = name_part[..open_bracket].to_string();
+                        let t = name_part[open_bracket+1..close_bracket].to_string();
+                        (n, Some(t))
+                    } else {
+                        (name_part, None)
+                    }
+                } else {
+                    (name_part, None)
+                }
+            } else {
+                (name_part, None)
+            };
+
             let prefix = parts.get(1).filter(|s| !s.is_empty()).map(|s| s.to_string()).unwrap_or_else(|| ":".to_string());
             let on_submit_raw = parts.get(2).map(|s| s.to_string());
 
-            // 【修复】统一返回 Option<String>
             let (is_silent, on_submit) = if let Some(ref cmd) = on_submit_raw {
                 if cmd.starts_with('@') {
                     (true, Some(cmd[1..].to_string()))
@@ -375,7 +427,9 @@ impl Engine {
             let mut input_state = InputState::new(&prefix);
             input_state.on_submit = on_submit;
             input_state.on_submit_is_silent = is_silent;
-            input_state.is_instant = is_instant; // 【新增】设置标志
+            input_state.is_instant = is_instant;
+            input_state.target_override = target_override;
+            input_state.is_search = is_search; // 注入标志
             components.insert(name, Component::Input(input_state));
         }
 
@@ -385,6 +439,8 @@ impl Engine {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let (rtx, rrx) = std::sync::mpsc::channel();
+        let (etx, erx) = std::sync::mpsc::channel(); // 【新增】
+
 
         let mut engine = Self {
             components,
@@ -394,7 +450,7 @@ impl Engine {
             global_relations,
             border_chars: border_chars_map,
             window_rect_overrides: std::collections::HashMap::new(),
-            auto_overrides: std::collections::HashMap::new(), // 【新增】
+            auto_overrides: std::collections::HashMap::new(),
             drag: DragState::default(),
             focus: FocusState {
                 current: focused.clone(),
@@ -410,16 +466,19 @@ impl Engine {
             prev_rects: std::collections::HashMap::new(),
             dirty_components: std::collections::HashSet::new(),
             pending_selection_changed: None,
-            pending_blur: None, // 【新增】
+            pending_blur: None,
             async_view_tx: tx,
             async_view_rx: rx,
             async_reload_tx: rtx,
             async_reload_rx: rrx,
+            async_exec_tx: etx,   // 【新增】
+            async_exec_rx: erx,   // 【新增】
             pending_view_reload: std::collections::HashSet::new(),
             prev_term_size: (0, 0),
-            ui_theme: crate::style::UiTheme::parse(ui_colors),
+            ui_theme: crate::style::UiTheme::parse(&ui_colors),
             focus_history: Vec::new(),
-            layout_blueprint: layout_strings, // 【必须新增】将传入的布局字符串保存为蓝图
+            layout_blueprint: layout_strings,
+            overlay_stack: Vec::new(), // 【新增】初始化
         };
 
         engine.is_initialized = false;
@@ -467,8 +526,6 @@ impl Engine {
                         InternalCommand::HideLayout(name) => self.set_layout_visible(&name, false),
                         _ => {}
                     }
-                } else {
-                    // 如果不是内部指令，降级为外部静默执行
                     let _ = crate::exec::execute_command_silent(&full_cmd_args);
                 }
             }
@@ -697,201 +754,6 @@ impl Engine {
         ctx
     }
 
-    // 【新增】统一的输入提交执行器
-    pub fn submit_input(&mut self, input_name: &str, text: &str, term_width: u16, term_height: u16) {
-        let (template_opt, is_silent) = if let Some(Component::Input(input)) = self.components.get(input_name) {
-            (input.on_submit.clone(), input.on_submit_is_silent)
-        } else { return };
-
-        if let Some(template) = template_opt {
-            let args = crate::config::split_args(&template);
-
-            let tree_name = match &self.focus.current {
-                Focus::Component(n) if matches!(self.components.get(n), Some(Component::Tree(_))) => n.clone(),
-                _ => self.focus.main_tree_name.clone().unwrap_or_default(),
-            };
-
-            let (selected_entity, ids_str, paths_str) = if let Some(Component::Tree(t)) = self.components.get(&tree_name) {
-                let sel = t.get_selected_entity().cloned();
-                let marked = t.get_marked_entities();
-                let entities: Vec<&crate::protocol::Entity> = if !marked.is_empty() {
-                    marked.iter().cloned().collect()
-                } else {
-                    sel.as_ref().map(|e| vec![e]).unwrap_or_default()
-                };
-                let ids = entities.iter().map(|e| e.id.as_str()).collect::<Vec<_>>().join(" ");
-                let paths = entities.iter()
-                    .map(|e| {
-                        if e.path.contains(' ') {
-                            format!("\"{}\"", e.path)
-                        } else {
-                            e.path.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                (sel, ids, paths)
-            } else {
-                (None, String::new(), String::new())
-            };
-
-            let window_name = match &self.focus.current { Focus::Component(n) => n.clone(), _ => String::new() };
-
-            let ctx = Self::build_exec_context(
-                selected_entity.as_ref(), &ids_str, &paths_str, &window_name,
-                &term_width.to_string(), &term_height.to_string(), "",
-                Some(&[("input", text)])
-            );
-
-            let full_cmd_args = exec::replace_placeholders_in_args(&args, &ctx);
-            if !full_cmd_args.is_empty() {
-                crate::runner::execute_binding(self, &full_cmd_args, is_silent, term_width, term_height);
-            }
-        }
-    }
-
-    pub fn emit(&mut self, signal: &'static str, term_width: u16, term_height: u16) -> bool {
-        // ... (保留防抖与实体获取逻辑)
-        if signal == "select" {
-            let now = Instant::now();
-            if let Some(last) = self.signals.last_emit.get(signal) {
-                if now.duration_since(*last).as_millis() < 200 { return false; }
-            }
-            self.signals.last_emit.insert(signal, now);
-        }
-
-        let current_window = match &self.focus.current { Focus::Component(n) => Some(n.as_str()), Focus::None => None };
-        let binding = self.key_bindings.get_signal_binding(current_window, signal);
-
-        if let Some((cmd_template_args, _is_silent)) = binding {
-            let tree_name = match &self.focus.current {
-                Focus::Component(n) if matches!(self.components.get(n), Some(Component::Tree(_))) => n.clone(),
-                _ => self.focus.main_tree_name.clone().unwrap_or_default(),
-            };
-
-            let (selected_entity, ids_str, paths_str) = if let Some(Component::Tree(t)) = self.components.get(&tree_name) {
-                let sel = t.get_selected_entity();
-                let marked = t.get_marked_entities();
-                let entities: Vec<&crate::protocol::Entity> = if !marked.is_empty() {
-                    marked.iter().cloned().collect()
-                } else { sel.map(|e| vec![e]).unwrap_or_default() };
-                let ids = entities.iter().map(|e| e.id.as_str()).collect::<Vec<_>>().join(" ");
-                let paths = entities.iter()
-                    .map(|e| {
-                        if e.path.contains(' ') {
-                            format!("\"{}\"", e.path)
-                        } else {
-                            e.path.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                (sel.cloned(), ids, paths)
-            } else { (None, String::new(), String::new()) };
-
-            let window_name = current_window.unwrap_or("").to_string();
-            let ctx = Self::build_exec_context(
-                selected_entity.as_ref(), &ids_str, &paths_str, &window_name,
-                &term_width.to_string(), &term_height.to_string(), signal, None
-            );
-
-            let full_cmd_args = exec::replace_placeholders_in_args(cmd_template_args, &ctx);
-
-            if full_cmd_args.is_empty() || (full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) {
-                return true;
-            }
-
-            // 【新增内部指令直连魔法】
-            // 优先尝试解析为内部指令，零延迟同步执行 UI 状态机变更，绝不 fork 进程！
-            if let Some(internal_cmd) = InternalCommand::from_args(&full_cmd_args) {
-                match internal_cmd {
-                    InternalCommand::ToggleLayout(name) => self.toggle_layout_visible(&name),
-                    InternalCommand::ShowLayout(name) => self.set_layout_visible(&name, true),
-                    InternalCommand::HideLayout(name) => self.set_layout_visible(&name, false),
-                    InternalCommand::ActivateInput(name) => self.activate_input(&name, ""),
-                    _ => {} // 其他内部指令暂不支持通过信号触发
-                }
-                return true; // 直接返回，不走外部 Shell
-            }
-
-            // 如果不是内部指令，才降级为外部静默执行
-            let _ = exec::execute_command_silent(&full_cmd_args);
-        }
-        true
-    }
-
-    pub fn emit_select_if_changed(&mut self, term_width: u16, term_height: u16) {
-        let current_id = self.get_selected_entity().map(|e| e.id.clone());
-        if current_id != self.signals.last_emitted_select_id {
-            if self.emit("select", term_width, term_height) {
-                self.signals.last_emitted_select_id = current_id;
-            }
-        }
-    }
-
-    pub fn get_focused_tree_state(&self) -> Option<&TreeState> {
-        let name = match &self.focus.current {
-            Focus::Component(n) => n,
-            Focus::None => return self.get_main_tree_state(),
-        };
-        if let Some(Component::Tree(t)) = self.components.get(name) {
-            return Some(t);
-        }
-        self.get_main_tree_state()
-    }
-
-    pub fn get_selected_entity(&self) -> Option<&crate::protocol::Entity> {
-        let name = match &self.focus.current {
-            Focus::Component(n) => n,
-            Focus::None => self.focus.main_tree_name.as_ref()?,
-        };
-        if let Some(Component::Tree(t)) = self.components.get(name) {
-            return t.get_selected_entity();
-        }
-        None
-    }
-
-    pub fn prepare_key_binding_args(&self, key: &crossterm::event::KeyEvent, term_width: u16, term_height: u16) -> Option<(Vec<String>, bool)> {
-        let (cmd_template_args, is_silent) = self.key_bindings.get(key)?;
-
-        let tree_name = match &self.focus.current {
-            Focus::Component(n) if matches!(self.components.get(n), Some(Component::Tree(_))) => n.clone(),
-            Focus::None => self.focus.main_tree_name.as_ref()?.clone(),
-            _ => self.focus.main_tree_name.as_ref()?.clone(),
-        };
-
-        let tree_state = if let Some(Component::Tree(t)) = self.components.get(&tree_name) { t } else { return None; };
-        let selected_entity = tree_state.get_selected_entity();
-        let marked_entities = tree_state.get_marked_entities();
-
-        let entities: Vec<&crate::protocol::Entity> = if !marked_entities.is_empty() {
-            marked_entities.iter().cloned().collect()
-        } else { selected_entity.map(|e| vec![e]).unwrap_or_default() };
-
-        let ids_str = entities.iter().map(|e| e.id.as_str()).collect::<Vec<_>>().join(" ");
-        let paths_str = entities.iter()
-            .map(|e| {
-                if e.path.contains(' ') {
-                    format!("\"{}\"", e.path)
-                } else {
-                    e.path.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let window_name = match &self.focus.current { Focus::Component(n) => n.clone(), Focus::None => String::new() };
-        let ctx = Self::build_exec_context(
-            selected_entity, &ids_str, &paths_str, &window_name,
-            &term_width.to_string(), &term_height.to_string(), "", None
-        );
-
-        let full_cmd_args = exec::replace_placeholders_in_args(cmd_template_args, &ctx);
-        if full_cmd_args.is_empty() || (full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) {
-            None
-        } else { Some((full_cmd_args, *is_silent)) }
-    }
-
     pub fn update_view_rects(&mut self, view_rects: HashMap<String, (usize, u16, u16)>) {
         for (name, (max_rows, width, height)) in view_rects {
             if let Some(Component::View(v)) = self.components.get_mut(&name) {
@@ -996,5 +858,142 @@ impl Engine {
                 }
             }
         }
+    }
+    pub fn prepare_key_binding_args(&self, scope: Option<&str>, key: &crossterm::event::KeyEvent, term_width: u16, term_height: u16) -> Option<(Vec<String>, bool)> {
+        let (cmd_template_args, is_silent) = self.key_bindings.get_scoped(scope, key)?;
+
+        let tree_name = match &self.focus.current {
+            Focus::Component(n) if matches!(self.components.get(n), Some(Component::Tree(_))) => n.clone(),
+            Focus::None => self.focus.main_tree_name.as_ref()?.clone(),
+            _ => self.focus.main_tree_name.as_ref()?.clone(),
+        };
+
+        let tree_state = if let Some(Component::Tree(t)) = self.components.get(&tree_name) { t } else { return None; };
+        let selected_entity = tree_state.get_selected_entity();
+        let marked_entities = tree_state.get_marked_entities();
+
+        let entities: Vec<&crate::protocol::Entity> = if !marked_entities.is_empty() {
+            marked_entities.iter().cloned().collect()
+        } else { selected_entity.map(|e| vec![e]).unwrap_or_default() };
+
+        let ids_str = entities.iter().map(|e| e.id.as_str()).collect::<Vec<_>>().join(" ");
+        let paths_str = entities.iter()
+            .map(|e| {
+                if e.path.contains(' ') {
+                    format!("\"{}\"", e.path)
+                } else {
+                    e.path.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let window_name = match &self.focus.current { Focus::Component(n) => n.clone(), Focus::None => String::new() };
+        let ctx = Self::build_exec_context(
+            selected_entity, &ids_str, &paths_str, &window_name,
+            &term_width.to_string(), &term_height.to_string(), "", None
+        );
+
+        let full_cmd_args = exec::replace_placeholders_in_args(cmd_template_args, &ctx);
+        if full_cmd_args.is_empty() || (full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) {
+            None
+        } else { Some((full_cmd_args, *is_silent)) }
+    }
+
+    pub fn emit(&mut self, signal: &'static str, term_width: u16, term_height: u16) -> bool {
+        if signal == "select" {
+            let now = Instant::now();
+            if let Some(last) = self.signals.last_emit.get(signal) {
+                if now.duration_since(*last).as_millis() < 200 { return false; }
+            }
+            self.signals.last_emit.insert(signal, now);
+        }
+
+        let current_window = match &self.focus.current { Focus::Component(n) => Some(n.as_str()), Focus::None => None };
+        let binding = self.key_bindings.get_signal_binding(current_window, signal);
+
+        if let Some((cmd_template_args, _is_silent)) = binding {
+            let tree_name = match &self.focus.current {
+                Focus::Component(n) if matches!(self.components.get(n), Some(Component::Tree(_))) => n.clone(),
+                _ => self.focus.main_tree_name.clone().unwrap_or_default(),
+            };
+
+            let (selected_entity, ids_str, paths_str) = if let Some(Component::Tree(t)) = self.components.get(&tree_name) {
+                let sel = t.get_selected_entity();
+                let marked = t.get_marked_entities();
+                let entities: Vec<&crate::protocol::Entity> = if !marked.is_empty() {
+                    marked.iter().cloned().collect()
+                } else { sel.map(|e| vec![e]).unwrap_or_default() };
+                let ids = entities.iter().map(|e| e.id.as_str()).collect::<Vec<_>>().join(" ");
+                let paths = entities.iter()
+                    .map(|e| {
+                        if e.path.contains(' ') {
+                            format!("\"{}\"", e.path)
+                        } else {
+                            e.path.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (sel.cloned(), ids, paths)
+            } else { (None, String::new(), String::new()) };
+
+            let window_name = current_window.unwrap_or("").to_string();
+            let ctx = Self::build_exec_context(
+                selected_entity.as_ref(), &ids_str, &paths_str, &window_name,
+                &term_width.to_string(), &term_height.to_string(), signal, None
+            );
+
+            let full_cmd_args = exec::replace_placeholders_in_args(cmd_template_args, &ctx);
+
+            if full_cmd_args.is_empty() || (full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) {
+                return true;
+            }
+
+            if let Some(internal_cmd) = InternalCommand::from_args(&full_cmd_args) {
+                match internal_cmd {
+                    InternalCommand::ToggleLayout(name) => self.toggle_layout_visible(&name),
+                    InternalCommand::ShowLayout(name) => self.set_layout_visible(&name, true),
+                    InternalCommand::HideLayout(name) => self.set_layout_visible(&name, false),
+                    InternalCommand::ActivateInput(name) => self.activate_input(&name, ""),
+                    _ => {}
+                }
+                return true;
+            }
+
+            let _ = exec::execute_command_silent(&full_cmd_args);
+        }
+        true
+    }
+
+    pub fn emit_select_if_changed(&mut self, term_width: u16, term_height: u16) {
+        let current_id = self.get_selected_entity().map(|e| e.id.clone());
+        if current_id != self.signals.last_emitted_select_id {
+            if self.emit("select", term_width, term_height) {
+                self.signals.last_emitted_select_id = current_id;
+            }
+        }
+    }
+
+    pub fn get_focused_tree_state(&self) -> Option<&TreeState> {
+        let name = match &self.focus.current {
+            Focus::Component(n) => n,
+            Focus::None => return self.get_main_tree_state(),
+        };
+        if let Some(Component::Tree(t)) = self.components.get(name) {
+            return Some(t);
+        }
+        self.get_main_tree_state()
+    }
+
+    pub fn get_selected_entity(&self) -> Option<&crate::protocol::Entity> {
+        let name = match &self.focus.current {
+            Focus::Component(n) => n,
+            Focus::None => self.focus.main_tree_name.as_ref()?,
+        };
+        if let Some(Component::Tree(t)) = self.components.get(name) {
+            return t.get_selected_entity();
+        }
+        None
     }
 }

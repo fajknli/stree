@@ -363,84 +363,6 @@ impl Engine {
         }
     }
 
-    pub fn has_active_input(&self) -> bool {
-        self.components.values().any(|c| matches!(c, Component::Input(i) if i.is_active))
-    }
-
-    pub fn handle_input_key(&mut self, key: crossterm::event::KeyEvent) -> Option<(String, String)> {
-        use crossterm::event::{KeyCode, KeyModifiers};
-
-        let input_name = self.components.iter()
-            .find(|(_, c)| matches!(c, Component::Input(i) if i.is_active))
-            .map(|(n, _)| n.clone())?;
-
-        if let Some(Component::Input(input)) = self.components.get_mut(&input_name) {
-            // 【新增】瞬时模式：按下任意字符键立即提交，其他键取消
-            if input.is_instant {
-                if let KeyCode::Char(c) = key.code {
-                    let submitted = c.to_string();
-                    input.deactivate();
-                    self.mark_all_dirty();
-                    return Some((input_name, submitted));
-                } else {
-                    // 按下 Esc、Enter、方向键等非字符按键直接取消
-                    input.deactivate();
-                    self.mark_all_dirty();
-                    return Some((input_name, "__CANCEL__".to_string()));
-                }
-            }
-
-            // 原有的普通输入模式逻辑保持不变
-            match key.code {
-                KeyCode::Esc => {
-                    input.deactivate();
-                    self.mark_all_dirty();
-                    return Some((input_name, "__CANCEL__".to_string()));
-                }
-                KeyCode::Enter => {
-                    let submitted = input.buffer.clone();
-                    input.deactivate();
-                    self.mark_all_dirty();
-                    return Some((input_name, submitted));
-                }
-                KeyCode::Backspace => {
-                    // 【新增】如果输入框已经为空，退格键充当 Esc，直接退出输入模式
-                    if input.buffer.is_empty() {
-                        input.deactivate();
-                        self.mark_all_dirty();
-                        return Some((input_name, "__CANCEL__".to_string()));
-                    } else {
-                        input.backspace();
-                    }
-                }
-                KeyCode::Left => input.move_left(),
-                KeyCode::Right => input.move_right(),
-                KeyCode::Home => input.move_home(),
-                KeyCode::End => input.move_end(),
-                KeyCode::Char(c) => {
-                    if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'u' { input.clear(); }
-                    else if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'a' { input.move_home(); }
-                    else if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'e' { input.move_end(); }
-                    else { input.insert_char(c); }
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
-    pub fn activate_input(&mut self, name: &str, prefix: &str) {
-        if let Some(Component::Input(input)) = self.components.get_mut(name) {
-            // 【修复】只有当显式传入前缀时才覆盖（如搜索的 "/" 和命令的 ":"），
-            // 如果传入为空，则保留配置文件中定义的前缀（如 "Delete? (y/n):"）
-            if !prefix.is_empty() {
-                input.prefix = prefix.to_string();
-            }
-            input.activate();
-            self.mark_all_dirty();
-        }
-    }
-
     pub fn apply_search(&mut self, query: &str, term_width: u16, term_height: u16) {
         if let Focus::Component(focused_name) = self.focus.current.clone() {
             if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
@@ -464,16 +386,6 @@ impl Engine {
                 self.emit_select_if_changed(term_width, term_height);
                 self.mark_dirty(&focused_name);
             }
-        }
-    }
-
-    pub fn cancel_input(&mut self) {
-        if let Some((name, _)) = self.components.iter().find(|(_, c)| matches!(c, Component::Input(i) if i.is_active)) {
-            let name = name.clone();
-            if let Some(Component::Input(input)) = self.components.get_mut(&name) {
-                input.deactivate();
-            }
-            self.mark_all_dirty(); // 触发重绘以隐藏 Input
         }
     }
 }

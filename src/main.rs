@@ -15,7 +15,7 @@ mod runner;
 
 use clap::{Parser, Subcommand};
 use crossterm::{terminal, ExecutableCommand};
-use crossterm::event::{self, Event, KeyCode, EnableMouseCapture, DisableMouseCapture};
+use crossterm::event::{self, Event, EnableMouseCapture, DisableMouseCapture};
 use std::time::Duration;
 use std::io::{self, stdout, Read, Write, IsTerminal};
 
@@ -61,9 +61,9 @@ struct Cli {
     select: Option<String>,
     #[arg(long = "no-mouse", action = clap::ArgAction::SetTrue)]
     no_mouse: bool,
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 1)]
     scroll_step: u8,
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = 1000)]
     max_lines: usize,
 }
 
@@ -116,20 +116,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let style_engine = style::StyleEngine::parse(&cli.status_col);
 
-    let mut engine = app::Engine::new(
-        full_dataset,
+    let engine_config = app::EngineConfig {
+        initial_dataset: full_dataset,
         layout_strings,
         key_bindings,
-        !cli.no_mouse,
-        cli.border_chars,
-        cli.trees,
-        cli.views,
-        cli.statusbars,
-        cli.inputs,
-        cli.relations.clone(),
-        cli.max_lines,
-        &cli.ui_colors,
-    );
+        mouse_enabled: !cli.no_mouse,
+        border_chars: cli.border_chars,
+        trees: cli.trees,
+        views: cli.views,
+        statusbars: cli.statusbars,
+        inputs: cli.inputs,
+        relations_path: cli.relations.clone(),
+        max_lines: cli.max_lines,
+        ui_colors: cli.ui_colors,
+    };
+
+    let mut engine = app::Engine::new(engine_config);
 
     if let Some(ref id) = cli.select {
         let focused_name = if let app::Focus::Component(name) = &engine.focus.current { name.clone() } else { String::new() };
@@ -164,16 +166,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
-        // 【终极哲学：终端尺寸变化时，解除物理锁，让 AST 比例接管】
-        if (columns, rows) != engine.prev_term_size {
+        // 【修改】将尺寸判断结果提取为变量
+        let layout_changed = (columns, rows) != engine.prev_term_size;
+        if layout_changed {
             engine.window_rect_overrides.clear();
             engine.prev_term_size = (columns, rows);
-            engine.prev_rects.clear(); // 【修复】清空上一帧的物理快照，强制触发 force_full 全屏重绘！
+            engine.prev_rects.clear();
             engine.mark_all_dirty();
         }
         let term_size = ui::TermSize { columns, rows };
 
         if signal::check_and_clear_reload() {
+            engine.overlay_stack.clear(); // 【优先撤退】
             engine.trigger_reload();
         }
 
@@ -191,6 +195,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     engine.last_error = Some(format!("Reload failed for {}: {}", tree_name, e));
                 }
             }
+        }
+
+        // 【新增】接收后台静默脚本执行完毕的信号，触发全局刷新
+        while let Ok(()) = engine.async_exec_rx.try_recv() {
+            // 1. 重新加载 Tree 数据源
+            engine.trigger_reload();
+            // 2. 清空 View 缓存
+            for comp in engine.components.values_mut() {
+                if let app::Component::View(v) = comp {
+                    v.cached_entity_id = None;
+                }
+            }
+            // 3. 刷新 View 内容
+            if let app::Focus::Component(tree_name) = &engine.focus.current.clone() {
+                let tree_name = tree_name.clone();
+                engine.broadcast_selection_changed(&tree_name, columns, rows);
+            }
+            engine.mark_all_dirty();
         }
 
         // ==========================================
@@ -399,503 +421,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // 1. 优先处理所有键盘事件
             for key_event in &key_events {
-                if key_event.kind != crossterm::event::KeyEventKind::Press { continue; }
-
-                if engine.drag.active {
-                    if key_event.code == KeyCode::Esc {
-                        engine.drag.active = false;
-                        engine.drag.resize_target = None;
-                        engine.drag.start_idx = None;
-                    }
-                    continue;
-                }
-
-                if engine.last_error.is_some() { engine.last_error = None; }
-
-                if engine.has_active_input() {
-                    match key_event.code {
-                        KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace | KeyCode::Left | KeyCode::Right
-                        | KeyCode::Home | KeyCode::End | KeyCode::Char(_) => {
-
-                            // 提前判断是否是搜索框激活
-                            let is_search = engine.components.values()
-                                .any(|c| matches!(c, app::Component::Input(i) if i.is_active && i.prefix == "/"));
-
-                            if let Some((input_name, result)) = engine.handle_input_key(*key_event) {
-                                if result == "__CANCEL__" {
-                                    // 【修复】如果是搜索框取消，必须清空搜索状态，恢复全列表！
-                                    if is_search {
-                                        if let app::Focus::Component(focused_name) = engine.focus.current.clone() {
-                                            if let Some(app::Component::Tree(t)) = engine.components.get_mut(&focused_name) {
-                                                if t.search_query.take().is_some() {
-                                                    t.rebuild_visible_ids();
-                                                    if !t.visible_ids.is_empty() {
-                                                        t.selected_idx = 0;
-                                                        t.selected_id = Some(t.visible_ids[0].clone());
-                                                    }
-                                                }
-                                            }
-                                            engine.pending_selection_changed = Some(focused_name);
-                                        }
-                                        engine.mark_all_dirty();
-                                    }
-                                } else {
-                                    if is_search {
-                                        engine.apply_search(&result, columns, rows);
-                                    } else {
-                                        engine.submit_input(&input_name, &result, columns, rows);
-                                    }
-                                }
-                            } else if is_search && key_event.code != KeyCode::Esc && key_event.code != KeyCode::Enter {
-                                // 【新增】fzf 式实时搜索过滤
-                                if let Some(app::Component::Input(i)) = engine.components.values().find(|c| matches!(c, app::Component::Input(i) if i.is_active)) {
-                                    let current_buffer = i.buffer.clone();
-                                    engine.apply_search(&current_buffer, columns, rows);
-                                }
-                            }
-                            continue;
-                        }
-                        _ => { continue; }
-                    }
-                }
-                match key_event.code {
-                    _ => {
-                        if let Some((full_cmd_args, is_silent)) = engine.prepare_key_binding_args(key_event, columns, rows) {
-                            if let Some(internal_cmd) = app::InternalCommand::from_args(&full_cmd_args) {
-                                match internal_cmd {
-                                    app::InternalCommand::Exit => break 'main_loop,
-                                    app::InternalCommand::Esc => {
-                                        if engine.has_active_input() {
-                                            engine.cancel_input();
-                                        } else {
-                                            let mut hid_layer = false;
-                                            // 1. 检查当前聚焦的窗口是否在浮动图层 (z > 0)
-                                            if let app::Focus::Component(name) = engine.focus.current.clone() {
-                                                if let Some((_, _, _, z)) = all_rects.iter().find(|(_, n, _, _)| n == &name) {
-                                                    if *z > 0 {
-                                                        engine.set_layout_visible(&name, false);
-                                                        hid_layer = true;
-                                                    }
-                                                }
-                                            }
-
-                                            // 2. 如果没关浮动窗，才去清空搜索
-                                            if !hid_layer {
-                                                let mut cleared_search = false;
-                                                for (name, comp) in engine.components.iter_mut() {
-                                                    if let app::Component::Tree(t) = comp {
-                                                        if t.search_query.take().is_some() {
-                                                            t.rebuild_visible_ids();
-                                                            if !t.visible_ids.is_empty() {
-                                                                t.selected_idx = 0;
-                                                                t.selected_id = Some(t.visible_ids[0].clone());
-                                                            }
-                                                            engine.pending_selection_changed = Some(name.clone());
-                                                            cleared_search = true;
-                                                        }
-                                                    }
-                                                }
-
-                                                if cleared_search {
-                                                    engine.mark_all_dirty();
-                                                } else {
-                                                    // 3. 没有输入框、没有浮动窗、没有搜索状态 -> 触发退出请求信号
-                                                    engine.emit("quit_request", columns, rows);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    app::InternalCommand::Tab => engine.handle_tab(columns, rows),
-                                    app::InternalCommand::Expand => engine.toggle_expand(),
-                                    app::InternalCommand::Mark => engine.toggle_mark(),
-                                    app::InternalCommand::Up => engine.move_up(),
-                                    app::InternalCommand::Down => engine.move_down(),
-                                    app::InternalCommand::Top => engine.jump_to_top(),
-                                    app::InternalCommand::Bottom => engine.jump_to_bottom(),
-                                    app::InternalCommand::Enter => {
-                                        engine.toggle_expand();
-                                        engine.emit("confirm", columns, rows);
-                                    }
-                                    app::InternalCommand::ActivateSearch => {
-                                        let input_name = engine.components.iter()
-                                            .find(|(_, c)| matches!(c, app::Component::Input(_)))
-                                            .map(|(n, _)| n.clone());
-                                        if let Some(name) = input_name {
-                                            engine.activate_input(&name, "/");
-                                        }
-                                    }
-                                    app::InternalCommand::ActivateCmd => {
-                                        let input_name = engine.components.iter()
-                                            .find(|(_, c)| matches!(c, app::Component::Input(_)))
-                                            .map(|(n, _)| n.clone());
-                                        if let Some(name) = input_name {
-                                            engine.activate_input(&name, ":");
-                                        }
-                                    }
-                                    app::InternalCommand::ActivateInput(name) => {
-                                        engine.activate_input(&name, "");
-                                    }
-                                    app::InternalCommand::ToggleLayout(name) => engine.toggle_layout_visible(&name),
-                                    app::InternalCommand::ShowLayout(name) => engine.set_layout_visible(&name, true),
-                                    app::InternalCommand::HideLayout(name) => engine.set_layout_visible(&name, false),
-                                    app::InternalCommand::ScrollLeft => engine.scroll_left(),
-                                    app::InternalCommand::ScrollRight => engine.scroll_right(),
-                                    // 【新增指令派发】
-                                    app::InternalCommand::CycleLayer => engine.cycle_layer(&all_rects),
-                                    app::InternalCommand::FocusLeft => engine.focus_direction("left", &all_rects),
-                                    app::InternalCommand::FocusRight => engine.focus_direction("right", &all_rects),
-                                    app::InternalCommand::FocusUp => engine.focus_direction("up", &all_rects),
-                                    app::InternalCommand::FocusDown => engine.focus_direction("down", &all_rects),
-                                }
-                            } else {
-                                runner::execute_binding(&mut engine, &full_cmd_args, is_silent, columns, rows);
-                            }
-                        }
-                    }
+                if engine.handle_key_event(key_event, &all_rects, columns, rows) {
+                    break 'main_loop;
                 }
             }
 
             // 2. 处理鼠标事件
-            // 【优化2】将排序和收集移到循环外，避免每个鼠标事件都重复分配和排序
-            let mut sorted_rects: Vec<_> = all_rects.iter().collect();
-            sorted_rects.sort_by(|a, b| b.3.cmp(&a.3));
-
-            // 【修复借用冲突】使用 clone 截断对 engine 的不可变借用，允许循环内部对 engine 进行可变操作
-            let mut sorted_edges: Vec<_> = engine.drag.cached_edges.clone();
-            sorted_edges.sort_by(|a, b| b.z_index.cmp(&a.z_index));
             for mouse_event in &mouse_events {
-                if !engine.mouse.enabled { continue; }
-
-                // ==========================================
-                // 【0. 悬停获取焦点
-                // ==========================================
-                if matches!(mouse_event.kind, crossterm::event::MouseEventKind::Moved) && !engine.drag.active {
-                    for (rect, name, _, _) in sorted_rects.iter() {
-                        let in_x = mouse_event.column >= rect.start_col && mouse_event.column < rect.start_col + rect.width;
-                        let in_y = mouse_event.row >= rect.start_row && mouse_event.row < rect.start_row + rect.height;
-
-                        if in_x && in_y {
-                            // 绝不允许 StatusBar 获得焦点
-                            if let Some(app::Component::StatusBar(_)) = engine.components.get(name) { break; }
-
-                            // 如果焦点发生了变化，更新状态并标脏
-                            if engine.focus.current != app::Focus::Component(name.clone()) {
-                                let old_focus = engine.focus.current.clone();
-                                engine.focus.current = app::Focus::Component(name.clone());
-
-                                if let app::Focus::Component(old_name) = &old_focus {
-                                    engine.mark_dirty(old_name);
-                                }
-                                engine.mark_dirty(name);
-
-                                // 状态栏也需要刷新
-                                for (n, c) in &engine.components {
-                                    if matches!(c, app::Component::StatusBar(_)) {
-                                        engine.dirty_components.insert(n.clone());
-                                    }
-                                }
-
-                                // 如果该组件配置了 focus 信号，则触发
-                                if let Some(app::Component::Tree(t)) = engine.components.get(name) {
-                                    if t.focus_to_fire {
-                                        engine.emit("focus", columns, rows);
-                                    }
-                                }
-                            }
-                            break; // 只要命中了最顶层的窗口，就立刻退出
-                        }
-                    }
-                    continue; // 悬停事件只用于改焦点，不进入后续点击逻辑
-                }
-
-                if matches!(mouse_event.kind, crossterm::event::MouseEventKind::Up(_)) {
-                    if engine.drag.active {
-                        if let Some(app::DragTarget::ResizeFloating(_, _)) = &engine.drag.resize_target {
-                            engine.mark_all_dirty(); // 标记重绘
-                        } else if engine.drag.resize_target.is_some() {
-                            let has_dragged = engine.drag.last_col != engine.drag.start_col
-                                || engine.drag.last_row != engine.drag.start_row;
-
-                            if has_dragged {
-                                // AST 已在拖拽首帧重组完毕，这里只需用最终物理真相反算百分比
-                                engine.force_recalculate_percentages(&all_rects);
-                            }
-                            // 清除覆盖，让新 AST 接管
-                            engine.window_rect_overrides.clear();
-                            engine.mark_all_dirty();
-                        }
-                        engine.drag.active = false;
-                        engine.drag.resize_target = None;
-                        engine.drag.start_idx = None;
-                        continue;
-                    }
-                }
-
-                if engine.drag.active && engine.drag.resize_target.is_some() {
-                    match mouse_event.kind {
-                        crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                            // 【修改】只记录最新坐标，具体篡改交给帧头处理
-                            engine.drag.last_col = mouse_event.column;
-                            engine.drag.last_row = mouse_event.row;
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-
-                // ==========================================
-                // 非拖拽状态：碰撞检测 (优先级：顶层浮动边缘 > 底层 Flexbox 边缘 > 窗口内部)
-                // ==========================================
-
-                let mut hit_floating_edge = false;
-                let mut hit_floating_inside = false;
-
-                // 1. 优先检测：浮动窗口边缘拉伸
-                if let crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse_event.kind {
-                    let (edge_hit, inside) = engine.check_floating_edge_hit(mouse_event.column, mouse_event.row, &all_rects);
-                    hit_floating_inside = inside;
-
-                    if let Some((win_name, edge_mask, init_x, init_y, w, h)) = edge_hit {
-                        engine.focus.current = app::Focus::Component(win_name.clone());
-                        engine.mark_dirty(&win_name);
-
-                        engine.drag.active = true;
-                        engine.drag.resize_target = Some(app::DragTarget::ResizeFloating(win_name.clone(), edge_mask));
-                        engine.drag.start_col = mouse_event.column;
-                        engine.drag.start_row = mouse_event.row;
-                        engine.drag.last_col = mouse_event.column;
-                        engine.drag.last_row = mouse_event.row;
-                        engine.drag.initial_width = w;
-                        engine.drag.initial_height = h;
-                        engine.drag.initial_anchor_x = init_x;
-                        engine.drag.initial_anchor_y = init_y;
-                        hit_floating_edge = true;
-                    }
-                }
-
-                if hit_floating_edge {
-                    continue; // 已经开始拖拽，拦截事件
-                }
-
-                // 2. 次优先检测：底层 Flexbox 边缘
-                // 【优化2】去除了原本在这里的 sorted_edges 收集和排序，直接使用外部的 sorted_edges
-                let mut hit_edge = None;
-                // 【关键修复】如果鼠标点在了浮动窗口内部，直接跳过 Flexbox 边缘检测！
-                if !hit_floating_inside {
-                    for edge in &sorted_edges {
-                        let in_x = mouse_event.column >= edge.hit_rect.start_col
-                            && mouse_event.column < edge.hit_rect.start_col + edge.hit_rect.width;
-                        let in_y = mouse_event.row >= edge.hit_rect.start_row
-                            && mouse_event.row < edge.hit_rect.start_row + edge.hit_rect.height;
-
-                        if in_x && in_y {
-                            hit_edge = Some(edge.clone());
-                            break;
-                        }
-                    }
-                }
-
-                let mut in_intersection = false;
-                for &(x, y) in &engine.drag.cached_intersections {
-                    if (mouse_event.column == x || mouse_event.column == x - 1) &&
-                       (mouse_event.row == y || mouse_event.row == y - 1) {
-                        in_intersection = true;
-                        break;
-                    }
-                }
-
-                if !in_intersection {
-                    if let Some(edge) = hit_edge {
-                        if let crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse_event.kind {
-                            let primary_id = edge.primary_id.clone();
-                            let neighbor_id = edge.neighbor_id.clone();
-                            let dir = edge.direction;
-
-                            // 【修复 2】点击边框时赋予焦点
-                            engine.focus.current = app::Focus::Component(primary_id.clone());
-                            engine.mark_dirty(&primary_id);
-
-                            // 1. 记录叶子节点的初始物理尺寸
-                            let r1 = engine.get_node_current_bbox(&primary_id, columns, rows).map(|(r, _)| r).unwrap_or_default();
-                            let r2 = engine.get_node_current_bbox(&neighbor_id, columns, rows).map(|(r, _)| r).unwrap_or_default();
-
-                            engine.drag.active = true;
-                            engine.drag.is_restructured = false;
-                            engine.drag.resize_target = Some(app::DragTarget::ResizeEdge(primary_id, neighbor_id, dir));
-                            engine.drag.start_col = mouse_event.column;
-                            engine.drag.start_row = mouse_event.row;
-                            engine.drag.last_col = mouse_event.column;
-                            engine.drag.last_row = mouse_event.row;
-                            engine.drag.initial_t1_rect = r1;
-                            engine.drag.initial_t2_rect = r2;
-                            continue;
-                        }
-                    }
-                }
-
-                // ==========================================
-                // 窗口内容区命中逻辑
-                // ==========================================
-                for (rect, name, _border, _z) in sorted_rects.iter() {
-                    let in_x = mouse_event.column >= rect.start_col && mouse_event.column < rect.start_col + rect.width;
-                    let in_y = mouse_event.row >= rect.start_row && mouse_event.row < rect.start_row + rect.height;
-                    if !in_x || !in_y { continue; }
-
-                    // 【终极防御】鼠标点击 StatusBar 时，直接跳过，绝不允许它获得焦点！
-                    if let Some(app::Component::StatusBar(_)) = engine.components.get(name) {
-                        continue;
-                    }
-
-                    // 【修复 1】只在鼠标按下时才切换焦点，悬停不再改变样式！
-                    let is_press = matches!(mouse_event.kind,
-                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) |
-                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right)
-                    );
-
-                    if is_press {
-                        let old_focus = engine.focus.current.clone();
-                        engine.focus.current = app::Focus::Component(name.clone());
-
-                        if old_focus != engine.focus.current {
-                            if let app::Focus::Component(old_name) = &old_focus {
-                                engine.mark_dirty(old_name);
-                            }
-                            engine.mark_dirty(name);
-                            // 【修复】焦点变化时，状态栏也需要更新
-                            for (n, c) in &engine.components {
-                                if matches!(c, app::Component::StatusBar(_)) {
-                                    engine.dirty_components.insert(n.clone());
-                                }
-                            }
-                            if let Some(app::Component::Tree(t)) = engine.components.get(name) {
-                                if t.focus_to_fire {
-                                    engine.emit("focus", columns, rows);
-                                }
-                            }
-                        }
-
-                        // 【修复 2】鼠标点击切换焦点时，强制关闭激活的输入框！彻底解决 Space 失灵
-                        if engine.has_active_input() {
-                            engine.cancel_input();
-                        }
-                    }
-
-                    match engine.components.get(name) {
-                        Some(app::Component::Tree(_)) => {
-                            let click_to_fire = if let Some(app::Component::Tree(t)) = engine.components.get(name) {
-                                t.click_to_fire
-                            } else {
-                                false
-                            };
-
-                            // 【关键修复】提前提取所有需要的数据，结束不可变借用！
-                            let (target_idx, clicked_id, visible_len, tree_name) =
-                            if let Some(app::Component::Tree(t)) = engine.components.get(name) {
-                                let max_rows = (rect.height as usize).saturating_sub(2);
-                                // 【修复滚动跳跃】传入 t.v_scroll
-                                let scroll_offset = ui::calc_scroll_offset(t.selected_idx, t.visible_ids.len(), max_rows, t.v_scroll);
-                                let target_idx = scroll_offset + mouse_event.row.saturating_sub(rect.start_row).saturating_sub(1) as usize;
-                                let is_valid_click = target_idx < t.visible_ids.len();
-                                let clicked_id = if is_valid_click { Some(t.visible_ids[target_idx].clone()) } else { None };
-                                (target_idx, clicked_id, t.visible_ids.len(), name.clone())
-                            } else {
-                                (0, None, 0, String::new())
-                            };
-
-                            match mouse_event.kind {
-                                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                                    if let Some(ref cid) = clicked_id {
-                                        let now = std::time::Instant::now();
-                                        let is_double_click = engine.mouse.last_click_time
-                                            .map_or(false, |t| now.duration_since(t).as_millis() < 300)
-                                            && engine.mouse.last_clicked_id.as_deref() == Some(cid.as_str());
-
-                                        if is_double_click {
-                                            engine.select_id(&tree_name, cid);
-                                            engine.toggle_expand();
-                                            engine.emit("confirm", columns, rows);
-                                            engine.mouse.last_click_time = None;
-                                        } else {
-                                            engine.select_id(&tree_name, cid);
-                                            engine.mouse.last_click_time = Some(now);
-                                            engine.mouse.last_clicked_id = Some(cid.clone());
-                                            if click_to_fire {
-                                                engine.emit("click", columns, rows);
-                                            }
-                                        }
-                                    }
-                                }
-                                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right) => {
-                                    if let Some(ref cid) = clicked_id {
-                                        if let Some(app::Component::Tree(t)) = engine.components.get_mut(&tree_name) {
-                                            let was_marked = t.marked_ids.contains(cid);
-                                            if was_marked {
-                                                t.marked_ids.remove(cid);
-                                            } else {
-                                                t.marked_ids.insert(cid.clone());
-                                            }
-                                            engine.drag.is_marking = !was_marked;
-                                        }
-                                        engine.drag.start_idx = Some(target_idx);
-                                        engine.drag.active = true;
-                                        engine.mark_dirty(&tree_name); // 【修复】立刻标脏，触发重绘
-                                    }
-                                }
-                                crossterm::event::MouseEventKind::ScrollUp => {
-                                    engine.move_up_n(scroll_step as usize);
-                                }
-                                crossterm::event::MouseEventKind::ScrollDown => {
-                                    engine.move_down_n(scroll_step as usize);
-                                }
-                                crossterm::event::MouseEventKind::Up(_) => {
-                                    engine.drag.active = false;
-                                    engine.drag.start_idx = None;
-                                    engine.drag.resize_target = None;
-                                    engine.mark_dirty(&tree_name); // 【优化】释放时也标脏，避免残影
-                                }
-                                crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Right) => {
-                                    if engine.drag.active {
-                                        if let Some(start_idx) = engine.drag.start_idx {
-                                            let clamped_target = target_idx.min(visible_len.saturating_sub(1));
-                                            let range = if clamped_target >= start_idx {
-                                                start_idx..=clamped_target
-                                            } else {
-                                                clamped_target..=start_idx
-                                            };
-                                            // 【修复】现在可以安全地 get_mut 了
-                                            if let Some(app::Component::Tree(t)) = engine.components.get_mut(&tree_name) {
-                                                for i in range {
-                                                    if let Some(id) = t.visible_ids.get(i) {
-                                                        if engine.drag.is_marking {
-                                                            t.marked_ids.insert(id.clone());
-                                                        } else {
-                                                            t.marked_ids.remove(id);
-                                                        }
-                                                    }
-                                                }
-                                                engine.mark_dirty(&tree_name);
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        Some(app::Component::View(_)) => {
-                            match mouse_event.kind {
-                                crossterm::event::MouseEventKind::ScrollUp => {
-                                    engine.move_up_n(scroll_step as usize);
-                                }
-                                crossterm::event::MouseEventKind::ScrollDown => {
-                                    engine.move_down_n(scroll_step as usize);
-                                }
-                                _ => {}
-                            }
-                        }
-                        _ => {}
-                    }
-                    break;
-                }
+                engine.handle_mouse_event(mouse_event, &all_rects, columns, rows, scroll_step, layout_changed);
             }
         }
 
@@ -928,6 +461,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // 【优化】在渲染前统一处理积压的状态变更
         engine.flush_pending_updates(columns, rows);
+
+        // 【新增】预计算状态栏文本
+        engine.update_status_bars(columns, rows, &all_rects);
 
         // 【异步接收】检查是否有后台预览命令执行完毕
         while let Ok((view_name, target_id, content)) = engine.async_view_rx.try_recv() {

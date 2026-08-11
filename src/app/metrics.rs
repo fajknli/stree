@@ -5,9 +5,31 @@ use crate::layout::{layout_ast_to_string, BorderStyle, WindowRect};
 use std::collections::HashMap;
 
 impl Engine {
+    /// 预计算状态栏文本，在渲染前调用
+    pub fn update_status_bars(&mut self, term_width: u16, term_height: u16, all_rects: &[(WindowRect, String, BorderStyle, usize)]) {
+        let mut m: HashMap<String, String> = HashMap::new();
+        self.collect_metrics_into(term_width, term_height, all_rects, &mut m);
+
+        for (_, comp) in self.components.iter_mut() {
+            if let Component::StatusBar(s) = comp {
+                let mut status_text = s.format_template.clone();
+                let show_msg = if let Some(expire) = s.message_expire {
+                    std::time::Instant::now() < expire
+                } else { false };
+                if show_msg {
+                    if let Some(msg) = &s.message { status_text = msg.clone(); }
+                }
+
+                for (key, val) in m.iter() {
+                    status_text = status_text.replace(&format!("{{stree_{}}}", key), val);
+                }
+                s.current_text = status_text;
+            }
+        }
+    }
+
     /// 全息探测器：收集所有引擎内部状态，返回一个平坦的 HashMap
-    /// UI 层只需遍历这个 Map 做替换，完全不需要知道数据怎么来的
-    pub fn collect_status_metrics(
+    fn collect_metrics_into(
         &self,
         term_width: u16,
         term_height: u16,
@@ -34,8 +56,8 @@ impl Engine {
             m.insert("tags".into(), sel.map(|e| e.tags.clone()).unwrap_or_default());
             m.insert("trees".into(), self.components.values().filter(|c| matches!(c, Component::Tree(_))).count().to_string());
             m.insert("markable".into(), if t.markable { "Y" } else { "N" }.into());
-            m.insert("scroll_v".into(), t.v_scroll.to_string());  // 【补丁】暴露垂直滚动
-            m.insert("scroll_h".into(), t.h_scroll.to_string());  // 【补丁】暴露水平滚动
+            m.insert("scroll_v".into(), t.v_scroll.to_string());
+            m.insert("scroll_h".into(), t.h_scroll.to_string());
         }
 
         // --- 2. 预览窗与 I/O 层 ---

@@ -4,7 +4,7 @@ use crate::app::Engine;
 use crate::exec;
 use crossterm::{terminal, ExecutableCommand, cursor, event::{EnableMouseCapture, DisableMouseCapture}};
 use std::io::{stdout, Write};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 pub fn drain_terminal_events() {
@@ -19,27 +19,30 @@ pub fn execute_binding(
     engine: &mut Engine,
     full_cmd_args: &[String],
     is_silent: bool,
-    columns: u16,
-    rows: u16,
+    _columns: u16,
+    _rows: u16,
 ) {
     if is_silent {
-        match exec::execute_command_silent(full_cmd_args) {
-            Ok(code) => {
-                if code == 0 {
-                    // 成功：刷新世界
-                    refresh_engine_state(engine, columns, rows);
-                } else {
-                    // 【彻底放权】失败时，引擎保持沉默，绝不设置 last_error！
-                    // 错误提示的责任 100% 交给脚本通过 IPC (ipc_msg) 主动推送到 Status 栏。
-                    // Status 栏是透明背景，完美符合“无红色背景”的需求。
+        // 【防死锁修复】静默执行必须放入后台线程，绝不能用 status() 阻塞主线程！
+        let tx = engine.async_exec_tx.clone();
+        let args: Vec<String> = full_cmd_args.to_vec();
+
+        std::thread::spawn(move || {
+            let status = Command::new(&args[0])
+                .args(&args[1..])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+
+            if let Ok(s) = status {
+                if s.success() {
+                    let _ = tx.send(()); // 脚本成功退出后，通知主线程刷新
                 }
             }
-            Err(e) => {
-                // 只有 Rust 引擎层面的失败（如找不到可执行文件、权限拒绝）才兜底报错
-                engine.last_error = Some(format!("Exec failed: {}", e));
-            }
-        }
-        drain_terminal_events()
+        });
+
+        drain_terminal_events();
     } else {
         let mut out = stdout();
 
@@ -73,8 +76,8 @@ pub fn execute_binding(
             }
         }
 
-        // 通用哲学：从外部交互式命令返回，必定触发一次刷新
-        refresh_engine_state(engine, columns, rows);
+        // 交互式命令(如 vim)退出后，直接在主线程同步刷新
+        refresh_engine_state(engine, _columns, _rows);
 
         drain_terminal_events();
         engine.mark_all_dirty();
@@ -94,8 +97,7 @@ fn refresh_engine_state(engine: &mut Engine, columns: u16, rows: u16) {
         }
     }
 
-    // 3. 【更优解】寻找有效的 Tree 上下文来刷新 View
-    // 优先使用当前聚焦的 Tree，如果焦点不在 Tree 上（如在 View 或 StatusBar），则回退到主树
+    // 3. 寻找有效的 Tree 上下文来刷新 View
     let tree_to_refresh = match &engine.focus.current {
         crate::app::Focus::Component(n) if matches!(engine.components.get(n), Some(crate::app::Component::Tree(_))) => Some(n.clone()),
         _ => engine.focus.main_tree_name.clone(),

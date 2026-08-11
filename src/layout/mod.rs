@@ -159,6 +159,7 @@ pub fn calc_window_rects(
 
 
 // 纯粹的 Flexbox 空间分配算法（最大余数法）
+// 纯粹的 Flexbox 空间分配算法（最大余数法）
 fn compute_rects(
     node: &LayoutNode,
     rect: WindowRect,
@@ -182,7 +183,6 @@ fn compute_rects(
             rects.push((final_rect, name.clone(), *border));
         }
         LayoutNode::Container { direction, children, .. } => {
-            // 【视觉扁平化】：单子节点直接穿透，无视方向差异！
             if children.len() == 1 {
                 if let LayoutNode::Container { .. } = &children[0] {
                     compute_rects(&children[0], rect, rects, overrides);
@@ -195,12 +195,12 @@ fn compute_rects(
                 Direction::Vertical => rect.height,
             };
 
+            // ================ Phase 0: 统计基础数据 ================
             let mut total_border_overhead: u16 = 0;
             let mut absolute_content_len: u16 = 0;
             let mut declared_pct_sum: u16 = 0;
             let mut undeclared_count: u16 = 0;
 
-            // ================ Phase 0: 统计基础数据 ================
             for child in children.iter() {
                 let border_extra = match child {
                     LayoutNode::Window { border: BorderStyle::Box, .. } => 2,
@@ -209,13 +209,10 @@ fn compute_rects(
                 };
                 total_border_overhead = total_border_overhead.saturating_add(border_extra);
 
-                let child_size = match child {
-                    LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
-                    LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or(percent.map(WindowSize::Percent)),
-                };
+                let child_size = get_child_size(child, overrides);
 
                 match child_size {
-                    Some(WindowSize::Absolute(n)) => {
+                    Some(WindowSize::Absolute(n)) | Some(WindowSize::Auto(n)) => {
                         absolute_content_len = absolute_content_len.saturating_add(n);
                     }
                     Some(WindowSize::Absolute2D(w, h)) => {
@@ -225,14 +222,7 @@ fn compute_rects(
                     Some(WindowSize::Percent(p)) => {
                         declared_pct_sum = declared_pct_sum.saturating_add(p);
                     }
-                    // 【新增】Auto 视为绝对值，占用固定空间
-                    Some(WindowSize::Auto(n)) => {
-                        absolute_content_len = absolute_content_len.saturating_add(n);
-                    }
-                    Some(WindowSize::Percent2D(_, _)) => {
-                        undeclared_count += 1;
-                    }
-                    None => {
+                    Some(WindowSize::Percent2D(_, _)) | None => {
                         undeclared_count += 1;
                     }
                 }
@@ -240,129 +230,22 @@ fn compute_rects(
 
             let available_for_content = total_len.saturating_sub(total_border_overhead);
             let flex_len = available_for_content.saturating_sub(absolute_content_len);
+            let pct_base = if undeclared_count > 0 && declared_pct_sum <= 10000 { 10000 } else { declared_pct_sum.max(1) };
 
-            let mut content_sizes: Vec<u16> = Vec::with_capacity(children.len());
-
-            let pct_base = if undeclared_count > 0 && declared_pct_sum <= 10000 {
-                10000
-            } else {
-                declared_pct_sum.max(1)
-            };
+            let mut content_sizes: Vec<u16> = vec![0; children.len()];
 
             // ================ Phase 1: 基础整数分配 ================
-            for child in children.iter() {
-                let child_size = match child {
-                    LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
-                    LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or(percent.map(WindowSize::Percent)),
-                };
-
-                let s = match child_size {
-                    Some(WindowSize::Absolute(n)) => n,
-                    Some(WindowSize::Absolute2D(w, h)) => {
-                        if *direction == Direction::Horizontal { w } else { h }
-                    }
-                    Some(WindowSize::Percent(p)) => {
-                        if pct_base == 0 { 0 } else {
-                            (flex_len as u32 * p as u32 / pct_base as u32) as u16
-                        }
-                    }
-                    Some(WindowSize::Percent2D(_, _)) => 0,
-                    Some(WindowSize::Auto(n)) => n, // 【新增】Auto 直接使用 fallback 值
-                    None => 0,
-                };
-                content_sizes.push(s);
-            }
+            phase1_base_allocation(children, overrides, *direction, flex_len, pct_base, &mut content_sizes);
 
             // ================ Phase 2: 为 undeclared 节点分配公平份额 ================
             if undeclared_count > 0 {
-                let declared_allocated: u16 = children.iter().enumerate()
-                    .filter_map(|(i, child)| {
-                        let child_size = match child {
-                            LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
-                            LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or_else(|| percent.map(WindowSize::Percent)),
-                        };
-                        if matches!(child_size, Some(WindowSize::Percent(_))) { Some(content_sizes[i]) } else { None }
-                    })
-                    .sum();
-
-                let undeclared_total = flex_len.saturating_sub(declared_allocated);
-                let undeclared_share = undeclared_total / undeclared_count;
-                let mut undeclared_rem = undeclared_total % undeclared_count;
-
-                for (i, child) in children.iter().enumerate() {
-                    let child_size = match child {
-                        LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
-                        LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or_else(|| percent.map(WindowSize::Percent)),
-                    };
-                    if child_size.is_none() {
-                        content_sizes[i] = undeclared_share;
-                        if undeclared_rem > 0 {
-                            content_sizes[i] += 1;
-                            undeclared_rem -= 1;
-                        }
-                    }
-                }
+                phase2_undeclared_sharing(children, overrides, flex_len, undeclared_count, &mut content_sizes);
             }
 
             // ================ Phase 3: 最大余数法分配全局余数 ================
-            let non_absolute_sum: u16 = children.iter().enumerate()
-                .filter_map(|(i, child)| {
-                    let child_size = match child {
-                        LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
-                        LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or_else(|| percent.map(WindowSize::Percent)),
-                    };
-                    // 【新增】Auto 也不参与余数分配
-                    if !matches!(child_size, Some(WindowSize::Absolute(_)) | Some(WindowSize::Absolute2D(_, _)) | Some(WindowSize::Auto(_))) { Some(content_sizes[i]) } else { None }
-                })
-                .sum();
-            let remainder = flex_len.saturating_sub(non_absolute_sum) as usize;
+            phase3_remainder_distribution(children, overrides, *direction, flex_len, pct_base, undeclared_count, declared_pct_sum, &mut content_sizes);
 
-            if remainder > 0 {
-                let undeclared_each_pct: u32 = if undeclared_count > 0 && pct_base > 0 {
-                    (pct_base as u32).saturating_sub(declared_pct_sum as u32) / undeclared_count as u32
-                } else {
-                    0
-                };
-
-                let mut fractional_parts: Vec<(usize, u64)> = Vec::new();
-                for (i, child) in children.iter().enumerate() {
-                    let child_size = match child {
-                        LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
-                        LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or_else(|| percent.map(WindowSize::Percent)),
-                    };
-                    // 【新增】Auto 也不参与余数分配
-                    if !matches!(child_size, Some(WindowSize::Absolute(_)) | Some(WindowSize::Absolute2D(_, _)) | Some(WindowSize::Auto(_))) {
-                        let exact_x10000: u64 = match child_size {
-                            Some(WindowSize::Percent(p)) => {
-                                if pct_base == 0 { 0 } else {
-                                    flex_len as u64 * p as u64 * 10000 / pct_base as u64
-                                }
-                            }
-                            None => {
-                                if pct_base == 0 { 0 } else {
-                                    flex_len as u64 * undeclared_each_pct as u64 * 10000 / pct_base as u64
-                                }
-                            }
-                            _ => 0,
-                        };
-                        let frac = exact_x10000 % 10000;
-                        fractional_parts.push((i, frac));
-                    }
-                }
-
-                fractional_parts.sort_by(|a, b| b.1.cmp(&a.1));
-
-                for (idx, _) in fractional_parts.iter().take(remainder) {
-                    content_sizes[*idx] += 1;
-                }
-
-                let distributed = fractional_parts.len().min(remainder);
-                let leftover = remainder - distributed;
-                if leftover > 0 {
-                    if let Some(last) = content_sizes.last_mut() { *last += leftover as u16; }
-                }
-            }
-
+            // ================ 物理坐标计算 ================
             let mut physical_sizes: Vec<u16> = Vec::with_capacity(children.len());
             for (i, child) in children.iter().enumerate() {
                 let border_extra = match child {
@@ -397,6 +280,132 @@ fn compute_rects(
                 current_pos = current_pos.saturating_add(child_len);
                 compute_rects(child, child_rect, rects, overrides);
             }
+        }
+    }
+}
+
+fn get_child_size(child: &LayoutNode, overrides: &std::collections::HashMap<String, WindowSize>) -> Option<WindowSize> {
+    match child {
+        LayoutNode::Window { name, size, .. } => overrides.get(name).copied().or(*size),
+        LayoutNode::Container { id, percent, .. } => overrides.get(id).copied().or(percent.map(WindowSize::Percent)),
+    }
+}
+
+fn phase1_base_allocation(
+    children: &[LayoutNode],
+    overrides: &std::collections::HashMap<String, WindowSize>,
+    direction: Direction,
+    flex_len: u16,
+    pct_base: u16,
+    content_sizes: &mut [u16],
+) {
+    for (i, child) in children.iter().enumerate() {
+        let child_size = get_child_size(child, overrides);
+        let s = match child_size {
+            Some(WindowSize::Absolute(n)) | Some(WindowSize::Auto(n)) => n,
+            Some(WindowSize::Absolute2D(w, h)) => {
+                if direction == Direction::Horizontal { w } else { h }
+            }
+            Some(WindowSize::Percent(p)) => {
+                if pct_base == 0 { 0 } else {
+                    (flex_len as u32 * p as u32 / pct_base as u32) as u16
+                }
+            }
+            Some(WindowSize::Percent2D(_, _)) | None => 0,
+        };
+        content_sizes[i] = s;
+    }
+}
+
+fn phase2_undeclared_sharing(
+    children: &[LayoutNode],
+    overrides: &std::collections::HashMap<String, WindowSize>,
+    flex_len: u16,
+    undeclared_count: u16,
+    content_sizes: &mut [u16],
+) {
+    let declared_allocated: u16 = children.iter().enumerate()
+        .filter_map(|(i, child)| {
+            let child_size = get_child_size(child, overrides);
+            if matches!(child_size, Some(WindowSize::Percent(_))) { Some(content_sizes[i]) } else { None }
+        })
+        .sum();
+
+    let undeclared_total = flex_len.saturating_sub(declared_allocated);
+    let undeclared_share = undeclared_total / undeclared_count;
+    let mut undeclared_rem = undeclared_total % undeclared_count;
+
+    for (i, child) in children.iter().enumerate() {
+        let child_size = get_child_size(child, overrides);
+        if child_size.is_none() {
+            content_sizes[i] = undeclared_share;
+            if undeclared_rem > 0 {
+                content_sizes[i] += 1;
+                undeclared_rem -= 1;
+            }
+        }
+    }
+}
+
+fn phase3_remainder_distribution(
+    children: &[LayoutNode],
+    overrides: &std::collections::HashMap<String, WindowSize>,
+    _direction: Direction,
+    flex_len: u16,
+    pct_base: u16,
+    undeclared_count: u16,
+    declared_pct_sum: u16,
+    content_sizes: &mut [u16],
+) {
+    let non_absolute_sum: u16 = children.iter().enumerate()
+        .filter_map(|(i, child)| {
+            let child_size = get_child_size(child, overrides);
+            if !matches!(child_size, Some(WindowSize::Absolute(_)) | Some(WindowSize::Absolute2D(_, _)) | Some(WindowSize::Auto(_))) {
+                Some(content_sizes[i])
+            } else { None }
+        })
+        .sum();
+    let remainder = flex_len.saturating_sub(non_absolute_sum) as usize;
+
+    if remainder > 0 {
+        let undeclared_each_pct: u32 = if undeclared_count > 0 && pct_base > 0 {
+            (pct_base as u32).saturating_sub(declared_pct_sum as u32) / undeclared_count as u32
+        } else {
+            0
+        };
+
+        let mut fractional_parts: Vec<(usize, u64)> = Vec::new();
+        for (i, child) in children.iter().enumerate() {
+            let child_size = get_child_size(child, overrides);
+            if !matches!(child_size, Some(WindowSize::Absolute(_)) | Some(WindowSize::Absolute2D(_, _)) | Some(WindowSize::Auto(_))) {
+                let exact_x10000: u64 = match child_size {
+                    Some(WindowSize::Percent(p)) => {
+                        if pct_base == 0 { 0 } else {
+                            flex_len as u64 * p as u64 * 10000 / pct_base as u64
+                        }
+                    }
+                    None => {
+                        if pct_base == 0 { 0 } else {
+                            flex_len as u64 * undeclared_each_pct as u64 * 10000 / pct_base as u64
+                        }
+                    }
+                    _ => 0,
+                };
+                let frac = exact_x10000 % 10000;
+                fractional_parts.push((i, frac));
+            }
+        }
+
+        fractional_parts.sort_by(|a, b| b.1.cmp(&a.1));
+
+        for (idx, _) in fractional_parts.iter().take(remainder) {
+            content_sizes[*idx] += 1;
+        }
+
+        let distributed = fractional_parts.len().min(remainder);
+        let leftover = remainder - distributed;
+        if leftover > 0 {
+            if let Some(last) = content_sizes.last_mut() { *last += leftover as u16; }
         }
     }
 }

@@ -14,17 +14,16 @@ impl Hash for KeyBindingKey {
     }
 }
 
-/// 解析后的绑定类型：物理按键 或 逻辑信号
 enum ParsedBinding {
-    Key(KeyEvent, Vec<String>, bool),
-    Signal(Option<String>, String, Vec<String>, bool), // (Scope/Window, SignalName, Args, IsSilent)
+    Key(Option<String>, KeyEvent, Vec<String>, bool), // (Scope, Key, Args, IsSilent)
+    Signal(Option<String>, String, Vec<String>, bool),
 }
 
 #[derive(Debug, Clone)]
 pub struct BindConfig {
-    // 物理按键绑定
-    bindings: HashMap<KeyBindingKey, (Vec<String>, bool)>,
-    // 【新增】信号绑定: (Option<WindowName>, SignalName) -> (命令参数模板, 是否静默)
+    // 结构改为：HashMap<作用域, HashMap<按键, (命令, 是否静默)>>
+    // None 作用域代表全局基础层
+    bindings: HashMap<Option<String>, HashMap<KeyBindingKey, (Vec<String>, bool)>>,
     signal_bindings: HashMap<(Option<String>, String), (Vec<String>, bool)>,
 }
 
@@ -35,27 +34,23 @@ impl BindConfig {
             signal_bindings: HashMap::new(),
         };
         let defaults = vec![
-            ("q", "__EXIT__"), ("esc", "__ESC__"),
-            // 【修改】Tab 改为 Z 轴图层切换
+            ("q", "__EXIT__"), ("esc", "__CLOSE_TOP_OVERLAY__"),
             ("tab", "__CYCLE_LAYER__"),
-
             ("up", "__UP__"), ("k", "__UP__"), ("down", "__DOWN__"), ("j", "__DOWN__"),
             ("left", "__EXPAND__"), ("h", "__EXPAND__"), ("right", "__EXPAND__"), ("l", "__EXPAND__"),
             ("space", "__MARK__"), ("g", "__TOP__"), ("G", "__BOTTOM__"),
             ("H", "__SCROLL_LEFT__"), ("L", "__SCROLL_RIGHT__"),
-            ("/", "__ACTIVATE_SEARCH__"), (":", "__ACTIVATE_CMD__"), ("enter", "__ENTER__"),
-
-            // 【新增】Vim 风格的窗口方向切换
-            ("ctrl-h", "__FOCUS_LEFT__"),
-            ("ctrl-l", "__FOCUS_RIGHT__"),
-            ("ctrl-k", "__FOCUS_UP__"),
-            ("ctrl-j", "__FOCUS_DOWN__"),
+            ("enter", "__ENTER__"),
+            ("ctrl-h", "__FOCUS_LEFT__"), ("ctrl-l", "__FOCUS_RIGHT__"),
+            ("ctrl-k", "__FOCUS_UP__"), ("ctrl-j", "__FOCUS_DOWN__"),
         ];
+
+        let global_map = config.bindings.entry(None).or_default();
         for (key_desc, cmd) in defaults {
             if let Some(key_event) = parse_key_desc(key_desc) {
                 let args = split_args(cmd);
                 let key = KeyBindingKey(key_event.code, key_event.modifiers);
-                config.bindings.insert(key, (args, false));
+                global_map.insert(key, (args, false));
             }
         }
         config
@@ -66,9 +61,10 @@ impl BindConfig {
         for arg in bind_args {
             if let Some(parsed) = parse_binding(arg) {
                 match parsed {
-                    ParsedBinding::Key(key_event, args, is_silent) => {
+                    ParsedBinding::Key(scope, key_event, args, is_silent) => {
                         let key = KeyBindingKey(key_event.code, key_event.modifiers);
-                        config.bindings.insert(key, (args, is_silent));
+                        let map = config.bindings.entry(scope).or_default();
+                        map.insert(key, (args, is_silent));
                     }
                     ParsedBinding::Signal(scope, signal_name, args, is_silent) => {
                         config.signal_bindings.insert((scope, signal_name), (args, is_silent));
@@ -79,27 +75,31 @@ impl BindConfig {
         config
     }
 
-    pub fn get(&self, key: &KeyEvent) -> Option<&(Vec<String>, bool)> {
-        let mut code = key.code;
-        let mut modifiers = key.modifiers;
+    pub fn get_scoped(&self, scope: Option<&str>, key: &KeyEvent) -> Option<&(Vec<String>, bool)> {
+        let scope_str = scope.map(|s| s.to_string());
+        if let Some(map) = self.bindings.get(&scope_str) {
+            let mut code = key.code;
+            let mut modifiers = key.modifiers;
 
-        // 【修复终端兼容性】：将终端发来的 Shift + 字母 统一规范化为 NONE + 大写字母
-        if modifiers == KeyModifiers::SHIFT {
-            if let KeyCode::Char(c) = code {
-                if c.is_ascii_alphabetic() {
-                    modifiers = KeyModifiers::NONE;
-                    if c.is_ascii_lowercase() {
-                        code = KeyCode::Char(c.to_ascii_uppercase());
+            if modifiers == KeyModifiers::SHIFT {
+                if let KeyCode::Char(c) = code {
+                    if c.is_ascii_alphabetic() {
+                        modifiers = KeyModifiers::NONE;
+                        if c.is_ascii_lowercase() {
+                            code = KeyCode::Char(c.to_ascii_uppercase());
+                        }
                     }
                 }
             }
-        }
 
-        let k = KeyBindingKey(code, modifiers);
-        self.bindings.get(&k)
+            let k = KeyBindingKey(code, modifiers);
+            if let Some(res) = map.get(&k) {
+                return Some(res);
+            }
+        }
+        None
     }
 
-    /// 【新增】查找信号绑定。优先查找局部作用域 (Window:signal)，找不到则回退到全局 (signal)。
     pub fn get_signal_binding(&self, window_name: Option<&str>, signal: &str) -> Option<&(Vec<String>, bool)> {
         if let Some(win) = window_name {
             let local_key = (Some(win.to_string()), signal.to_string());
@@ -144,23 +144,37 @@ fn parse_binding(input: &str) -> Option<ParsedBinding> {
 
     let args = split_args(&cmd_template);
 
-    if let Some(key_event) = parse_key_desc(left_side) {
-        return Some(ParsedBinding::Key(key_event, args, is_silent));
+    // 解析 Scope:Key 格式
+    let (scope, key_desc) = if let Some(colon_pos) = left_side.rfind(':') {
+        let potential_scope = left_side[..colon_pos].trim();
+        let potential_key = left_side[colon_pos + 1..].trim();
+        // 如果右边部分能解析为按键，且左边不是空的，就认为是带作用域的
+        if !potential_scope.is_empty() && parse_key_desc(potential_key).is_some() {
+            (Some(potential_scope.to_string()), potential_key)
+        } else {
+            (None, left_side)
+        }
+    } else {
+        (None, left_side)
+    };
+
+    if let Some(key_event) = parse_key_desc(key_desc) {
+        return Some(ParsedBinding::Key(scope, key_event, args, is_silent));
     }
 
-    let (scope, signal_name) = if let Some(colon_pos) = left_side.find(':') {
-        let scope = left_side[..colon_pos].trim().to_string();
-        let signal = left_side[colon_pos + 1..].trim().to_string();
-        if scope.is_empty() || signal.is_empty() {
-            eprintln!("[WARN] 信号绑定格式无效（作用域或信号名为空）: {}", trimmed);
+    let (signal_scope, signal_name) = if let Some(colon_pos) = left_side.find(':') {
+        let s = left_side[..colon_pos].trim().to_string();
+        let sig = left_side[colon_pos + 1..].trim().to_string();
+        if s.is_empty() || sig.is_empty() {
+            eprintln!("[WARN] 信号绑定格式无效: {}", trimmed);
             return None;
         }
-        (Some(scope), signal)
+        (Some(s), sig)
     } else {
         (None, left_side.to_string())
     };
 
-    Some(ParsedBinding::Signal(scope, signal_name, args, is_silent))
+    Some(ParsedBinding::Signal(signal_scope, signal_name, args, is_silent))
 }
 
 fn parse_key_desc(desc: &str) -> Option<KeyEvent> {
@@ -189,7 +203,6 @@ fn parse_key_desc(desc: &str) -> Option<KeyEvent> {
         "left" => KeyCode::Left, "right" => KeyCode::Right, "home" => KeyCode::Home,
         "end" => KeyCode::End, "pageup" => KeyCode::PageUp, "pagedown" => KeyCode::PageDown,
         s if s.chars().count() == 1 => {
-            // 【修复】保留单字符的原始大小写，解决 g/G 冲突
             let c = key_part_original.chars().next().unwrap();
             KeyCode::Char(c)
         },
@@ -198,8 +211,6 @@ fn parse_key_desc(desc: &str) -> Option<KeyEvent> {
         }
     };
 
-    // 兼容性处理：Shift + 字母 -> 转为大写字母且修饰符置为 NONE
-    // 这样 'shift-g' 和 'G' 的行为一致，且符合大多数终端的按键发送习惯
     let final_modifiers = if modifier == KeyModifiers::SHIFT {
         if let KeyCode::Char(c) = code {
             if c.is_ascii_alphabetic() {
@@ -271,7 +282,8 @@ mod tests {
 
     #[test]
     fn test_parse_simple_key() {
-        if let ParsedBinding::Key(key, args, silent) = parse_binding("enter=edit {path}").unwrap() {
+        if let ParsedBinding::Key(scope, key, args, silent) = parse_binding("enter=edit {path}").unwrap() {
+            assert_eq!(scope, None);
             assert_eq!(key.code, KeyCode::Enter);
             assert_eq!(args, vec!["edit", "{path}"]);
             assert!(!silent);
@@ -281,8 +293,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_scoped_key() {
+        if let ParsedBinding::Key(scope, key, args, _silent) = parse_binding("RenameInput:enter=edit {path}").unwrap() {
+            assert_eq!(scope, Some("RenameInput".to_string()));
+            assert_eq!(key.code, KeyCode::Enter);
+            assert_eq!(args, vec!["edit", "{path}"]);
+        } else {
+            panic!("Expected Scoped Key binding");
+        }
+    }
+
+    #[test]
     fn test_parse_silent_key() {
-        if let ParsedBinding::Key(key, args, silent) = parse_binding("ctrl-t=@switch-view.sh").unwrap() {
+        if let ParsedBinding::Key(_, key, args, silent) = parse_binding("ctrl-t=@switch-view.sh").unwrap() {
             assert_eq!(key.code, KeyCode::Char('t'));
             assert_eq!(args, vec!["switch-view.sh"]);
             assert!(silent);

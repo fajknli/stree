@@ -24,8 +24,6 @@ thread_local! {
     // 【优化1】新增 CURR_BUFFER 用于复用
     static CURR_BUFFER: RefCell<Option<Buffer>> = RefCell::new(None);
     static CURSOR_POS: RefCell<Option<(u16, u16)>> = RefCell::new(None);
-    // 【极致优化】预分配 HashMap，避免每帧渲染状态栏时分配内存
-    static METRICS_BUF: RefCell<std::collections::HashMap<String, String>> = RefCell::new(std::collections::HashMap::new());
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -76,38 +74,41 @@ pub fn render_all<W: Write>(ctx: &mut RenderCtx, all_rects: &[(WindowRect, Strin
     let mut visible_rects: Vec<&(WindowRect, String, BorderStyle, usize)> = all_rects.iter().filter(|r| ctx.engine.components.contains_key(&r.1)).collect();
     visible_rects.sort_by_key(|e| e.3);
 
-    // 【修复借用冲突】提取所需数据并克隆，立即释放不可变借用
-    let active_input_data = ctx.engine.components.values()
-        .find_map(|c| if let Component::Input(i) = c {
-            if i.is_active {
-                Some((i.prefix.clone(), i.buffer.clone(), i.cursor as u16))
-            } else { None }
-        } else { None });
-
     for (rect, name, border, _z_index) in visible_rects {
         let safe_rect = match clip_rect_to_term(rect, term_width as u16, term_height as u16) {
             Some(r) => r, None => continue,
         };
 
-        let comp = ctx.engine.components.get(name);
-        let title = comp.map(|_| name.as_str());
+        // 【渲染门卫】检查是否有覆盖者劫持了这个区域
+        let rendering_name = {
+            let mut target_name = name.clone();
+            for layer in ctx.engine.overlay_stack.iter().rev() {
+                if layer.target == *name {
+                    target_name = layer.source.clone();
+                    break;
+                }
+            }
+            target_name
+        };
+
+        let comp = ctx.engine.components.get(&rendering_name);
+        let title = comp.map(|_| name.as_str()); // 标题保留原组件名
         let is_focused = ctx.engine.focus.current == Focus::Component(name.clone());
         let border_chars = ctx.engine.border_chars.get(name).map(|s| s.as_str());
         let border_color = if is_focused { ctx.engine.ui_theme.border_focused } else { ctx.engine.ui_theme.border_unfocused };
 
         primitives::draw_border(&mut curr_buffer, &safe_rect, title, *border, border_color, border_chars)?;
-        // 【修复】浮动窗口必须强制清空背景，防止底层内容透出
         let is_floating = *_z_index > 0;
         let mut renderer = WindowRenderer::new(&mut curr_buffer, safe_rect, *border, is_floating);
 
-        if let Some(Component::Tree(t)) = ctx.engine.components.get_mut(name) {
-            // ... (保留 Tree 渲染逻辑不变)
+        // 根劫持后的组件类型进行渲染
+        if let Some(Component::Tree(t)) = ctx.engine.components.get_mut(&rendering_name) {
             let max_rows = renderer.content_height() as usize;
             t.v_scroll = calc_scroll_offset(t.selected_idx, t.visible_ids.len(), max_rows, t.v_scroll);
             let scroll_offset = t.v_scroll;
             let drawn = draw_tree_window(&mut renderer, t, ctx.style_engine, scroll_offset, is_focused, &ctx.engine.ui_theme)?;
             for i in drawn as u16..max_rows as u16 { renderer.clear_row(i)?; }
-        } else if let Some(comp) = ctx.engine.components.get(name) {
+        } else if let Some(comp) = ctx.engine.components.get(&rendering_name) {
             match comp {
                 Component::View(v) => {
                     let content = v.content_buffer.as_str();
@@ -118,7 +119,6 @@ pub fn render_all<W: Write>(ctx: &mut RenderCtx, all_rects: &[(WindowRect, Strin
                     let color = if is_focused { ctx.engine.ui_theme.view_focused } else { ctx.engine.ui_theme.view_unfocused };
                     let style = TextStyle { fg: color, ..Default::default() };
                     for i in 0..max_rows {
-                        // 【同步修复】预览窗也先清行再画，防止短行覆盖长行时的属性残留
                         renderer.clear_row(i as u16)?;
                         if let Some(line) = lines.get(i + actual_offset) {
                             renderer.print(0, i as u16, line, style, v.h_scroll)?;
@@ -126,70 +126,25 @@ pub fn render_all<W: Write>(ctx: &mut RenderCtx, all_rects: &[(WindowRect, Strin
                     }
                 }
                 Component::StatusBar(s) => {
-                    if let Some((prefix, buffer, cursor)) = &active_input_data {
-                        // 有 Input 激活：劫持此 StatusBar 的物理区域渲染输入框
-                        renderer.clear_row(0)?;
-                        let prefix_style = TextStyle { fg: ctx.engine.ui_theme.input_prefix, ..Default::default() };
-                        renderer.print(0, 0, prefix, prefix_style, 0)?;
-                        let prefix_w = UnicodeWidthStr::width(prefix.as_str()) as u16;
-                        let buffer_style = TextStyle { fg: ctx.engine.ui_theme.input_buffer, ..Default::default() };
-                        renderer.print(prefix_w, 0, buffer, buffer_style, 0)?;
-                        renderer.show_cursor(prefix_w + *cursor, 0)?;
-                    } else {
-                        // 无 Input 激活：正常渲染状态栏
-                        let mut status_text = s.format_template.clone();
+                    let max_rows = renderer.content_height() as u16;
+                    for i in 0..max_rows { renderer.clear_row(i)?; }
+                    let style = TextStyle { fg: ctx.engine.ui_theme.statusbar_fg, ..Default::default() };
+                    // 直接使用引擎算好的 current_text
+                    renderer.print(0, 0, &s.current_text, style, 0)?;
+                }
+                Component::Input(i) => {
+                    // 【修复】清空目标区域的所有行，防止 StatusBar 高度 > 1 时残留旧文本
+                    let max_rows = renderer.content_height() as u16;
+                    for r in 0..max_rows { renderer.clear_row(r)?; }
 
-                        // 优先渲染临时消息，如果未过期
-                        let show_msg = if let Some(expire) = s.message_expire {
-                            std::time::Instant::now() < expire
-                        } else { false };
-                        if show_msg {
-                            if let Some(msg) = &s.message { status_text = msg.clone(); }
-                        }
-
-                        // ==========================================
-                        // 【终极重构】UI 层不再写任何业务逻辑，直接向引擎要数据！
-                        // ==========================================
-                        METRICS_BUF.with(|buf| {
-                            let mut m = buf.borrow_mut();
-                            ctx.engine.collect_status_metrics(
-                                ctx.term_size.columns,
-                                ctx.term_size.rows,
-                                all_rects,
-                                &mut m
-                            );
-                            for (key, val) in m.iter() {
-                                status_text = status_text.replace(&format!("{{stree_{}}}", key), val);
-                            }
-                        });
-
-                        let max_rows = renderer.content_height() as u16;
-                        for i in 0..max_rows { renderer.clear_row(i)?; }
-                        let style = TextStyle { fg: ctx.engine.ui_theme.statusbar_fg, ..Default::default() };
-                        renderer.print(0, 0, &status_text, style, 0)?;
-                    }
+                    let prefix_style = TextStyle { fg: ctx.engine.ui_theme.input_prefix, ..Default::default() };
+                    renderer.print(0, 0, &i.prefix, prefix_style, 0)?;
+                    let prefix_w = UnicodeWidthStr::width(i.prefix.as_str()) as u16;
+                    let buffer_style = TextStyle { fg: ctx.engine.ui_theme.input_buffer, ..Default::default() };
+                    renderer.print(prefix_w, 0, &i.buffer, buffer_style, 0)?;
+                    renderer.show_cursor(prefix_w + i.cursor as u16, 0)?;
                 }
                 _ => {}
-            }
-        }
-    }
-
-    // 【修改】兜底机制也使用克隆出的数据
-    if active_input_data.is_some() {
-        let has_statusbar = ctx.engine.components.values().any(|c| matches!(c, Component::StatusBar(_)));
-        if !has_statusbar {
-            let bottom_y = (term_height as u16).saturating_sub(1);
-            let fake_rect = WindowRect { start_col: 0, start_row: bottom_y, width: term_width as u16, height: 1 };
-            let mut fake_renderer = WindowRenderer::new(&mut curr_buffer, fake_rect, BorderStyle::None, true);
-
-            if let Some((prefix, buffer, cursor)) = &active_input_data {
-                fake_renderer.clear_row(0)?;
-                let prefix_style = TextStyle { fg: ctx.engine.ui_theme.input_prefix, ..Default::default() };
-                fake_renderer.print(0, 0, prefix, prefix_style, 0)?;
-                let prefix_w = UnicodeWidthStr::width(prefix.as_str()) as u16;
-                let buffer_style = TextStyle { fg: ctx.engine.ui_theme.input_buffer, ..Default::default() };
-                fake_renderer.print(prefix_w, 0, buffer, buffer_style, 0)?;
-                fake_renderer.show_cursor(prefix_w + *cursor, 0)?;
             }
         }
     }
