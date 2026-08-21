@@ -807,4 +807,175 @@ impl Engine {
             }
         }
     }
+    /// 处理当前帧的拖拽逻辑，注入 Absolute 覆盖，让布局引擎自然计算
+    /// 【重构提取】将 main.rs 中的物理篡改与 AST 重组逻辑收束回引擎内部
+    pub fn process_drag_frame(
+        &mut self,
+        all_rects: &mut Vec<(WindowRect, String, BorderStyle, usize)>,
+        columns: u16,
+        rows: u16,
+    ) {
+        if self.drag.active {
+            // 【终极架构】拖拽时注入 Absolute 覆盖，让布局引擎自然计算，彻底消灭 AST 突变与布局偏移
+            if let Some(crate::app::DragTarget::ResizeFloating(layer_name, edge_mask)) = self.drag.resize_target.clone() {
+                let dx = self.drag.last_col as i32 - self.drag.start_col as i32;
+                let dy = self.drag.last_row as i32 - self.drag.start_row as i32;
+
+                let mut new_x = self.drag.initial_anchor_x as i32;
+                let mut new_y = self.drag.initial_anchor_y as i32;
+                let mut new_w = self.drag.initial_width as i32;
+                let mut new_h = self.drag.initial_height as i32;
+
+                // 1. 根据掩码应用原始位移
+                if edge_mask & 1 != 0 { // Left
+                    new_x += dx;
+                    new_w -= dx;
+                }
+                if edge_mask & 2 != 0 { // Right
+                    new_w += dx;
+                }
+                if edge_mask & 4 != 0 { // Top
+                    new_y += dy;
+                    new_h -= dy;
+                }
+                if edge_mask & 8 != 0 { // Bottom
+                    new_h += dy;
+                }
+
+                // 2. 最小尺寸限制（保证对侧边缘绝对不动！）
+                const MIN_W: i32 = 2;
+                const MIN_H: i32 = 2;
+                if new_w < MIN_W {
+                    // 如果是左侧收缩到极限，必须反向修正 x，保持右边缘不动
+                    if edge_mask & 1 != 0 {
+                        new_x = self.drag.initial_anchor_x as i32 + (self.drag.initial_width as i32 - MIN_W);
+                    }
+                    new_w = MIN_W;
+                }
+                if new_h < MIN_H {
+                    // 如果是顶部收缩到极限，必须反向修正 y，保持下边缘不动
+                    if edge_mask & 4 != 0 {
+                        new_y = self.drag.initial_anchor_y as i32 + (self.drag.initial_height as i32 - MIN_H);
+                    }
+                    new_h = MIN_H;
+                }
+
+                // 3. 屏幕边界限制（同样保证对侧边缘不动！）
+                let term_w = columns as i32;
+                let term_h = rows as i32;
+                if new_x < 0 {
+                    // 如果左侧碰到了左边界，必须加宽，保持右边缘不动
+                    if edge_mask & 1 != 0 {
+                        new_w += new_x; // new_x 是负数，相当于加宽
+                    }
+                    new_x = 0;
+                }
+                if new_y < 0 {
+                    // 如果顶部碰到了上边界，必须加高，保持下边缘不动
+                    if edge_mask & 4 != 0 {
+                        new_h += new_y;
+                    }
+                    new_y = 0;
+                }
+                if new_x + new_w > term_w {
+                    // 右侧超出屏幕，直接截断宽度
+                    new_w = term_w - new_x;
+                }
+                if new_y + new_h > term_h {
+                    // 底部超出屏幕，直接截断高度
+                    new_h = term_h - new_y;
+                }
+
+                let final_x = new_x as u16;
+                let final_y = new_y as u16;
+                let final_w = new_w as u16;
+                let final_h = new_h as u16;
+
+                // 【关键修复】必须同时注入 window_rect_overrides！
+                self.window_rect_overrides.insert(
+                    layer_name.clone(),
+                    crate::layout::WindowSize::Absolute2D(final_w, final_h)
+                );
+
+                // 更新画布尺寸（维持锚点位置）
+                for layer in &mut self.layout_layers {
+                    if !matches!(layer.anchor, crate::layout::Anchor::ScreenAbsolute {..}) { continue; }
+                    if Self::layout_contains_window(layer, &layer_name) {
+                        layer.runtime_rect_override = Some(crate::layout::WindowRect {
+                            start_col: final_x,
+                            start_row: final_y,
+                            width: final_w,
+                            height: final_h,
+                        });
+                        break;
+                    }
+                }
+
+                *all_rects = self.calc_all_rects(columns, rows);
+                self.mark_all_dirty();
+
+            } else if let Some(crate::app::DragTarget::ResizeEdge(primary, neighbor, dir)) = self.drag.resize_target.clone() {
+                let has_moved = self.drag.last_col != self.drag.start_col
+                    || self.drag.last_row != self.drag.start_row;
+
+                // 【核心修复】只在首次真正拖拽时重组 AST，并立刻冻结物理像素
+                if !self.drag.is_restructured && has_moved {
+                    // 1. 重组 AST（改变拓扑结构，将叶子拉平为兄弟）
+                    self.restructure_tree_after_drag(&primary, &neighbor, dir, all_rects);
+                    // 2. 立刻用旧物理坐标反算新 AST 百分比，杜绝拓扑突变带来的视觉跳跃
+                    self.force_recalculate_percentages(all_rects);
+                    self.drag.is_restructured = true;
+                    // 3. AST 变了，必须重算物理真相
+                    *all_rects = self.calc_all_rects(columns, rows);
+                }
+
+                // 只有重组完成后，才进行物理坐标篡改
+                if self.drag.is_restructured {
+                    let r1 = self.drag.initial_t1_rect;
+                    let r2 = self.drag.initial_t2_rect;
+
+                    let oh1 = all_rects.iter().find(|(_, n, _, _)| n == &primary)
+                        .map(|(_, _, b, _)| {
+                            let (ox, oy) = b.overhead();
+                            if dir == crate::layout::Direction::Horizontal { ox } else { oy }
+                        }).unwrap_or(0);
+
+                    let oh2 = all_rects.iter().find(|(_, n, _, _)| n == &neighbor)
+                        .map(|(_, _, b, _)| {
+                            let (ox, oy) = b.overhead();
+                            if dir == crate::layout::Direction::Horizontal { ox } else { oy }
+                        }).unwrap_or(0);
+
+                    match dir {
+                        crate::layout::Direction::Horizontal => {
+                            let min_split = r1.start_col.saturating_add(oh1.max(1));
+                            let max_split = r2.start_col.saturating_add(r2.width).saturating_sub(oh2.max(1));
+                            if min_split < max_split {
+                                let split = self.drag.last_col.clamp(min_split, max_split);
+                                let new_w1 = split - r1.start_col;
+                                let new_w2 = (r2.start_col + r2.width) - split;
+
+                                self.window_rect_overrides.insert(primary.clone(), crate::layout::WindowSize::Absolute(new_w1.saturating_sub(oh1)));
+                                self.window_rect_overrides.insert(neighbor.clone(), crate::layout::WindowSize::Absolute(new_w2.saturating_sub(oh2)));
+                            }
+                        }
+                        crate::layout::Direction::Vertical => {
+                            let min_split = r1.start_row.saturating_add(oh1.max(1));
+                            let max_split = r2.start_row.saturating_add(r2.height).saturating_sub(oh2.max(1));
+                            if min_split < max_split {
+                                let split = self.drag.last_row.clamp(min_split, max_split);
+                                let new_h1 = split - r1.start_row;
+                                let new_h2 = (r2.start_row + r2.height) - split;
+
+                                self.window_rect_overrides.insert(primary.clone(), crate::layout::WindowSize::Absolute(new_h1.saturating_sub(oh1)));
+                                self.window_rect_overrides.insert(neighbor.clone(), crate::layout::WindowSize::Absolute(new_h2.saturating_sub(oh2)));
+                            }
+                        }
+                    }
+                    // 覆盖注入后，必须重算 all_rects 才能拿到正确的物理坐标供渲染使用
+                    *all_rects = self.calc_all_rects(columns, rows);
+                }
+            }
+        }
+    }
 }

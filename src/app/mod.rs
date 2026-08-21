@@ -578,31 +578,9 @@ impl Engine {
             self.emit_select_if_changed(term_width, term_height);
         }
 
-        // 【新增】处理失去焦点信号
+        // 【重构】处理失去焦点信号
         if let Some(blur_name) = self.pending_blur.take() {
-            // 【修复】使用 keymap 查找 blur 信号，保持一致性
-            let blur_keymaps_owned = self.get_keymaps_for(&blur_name);
-            let blur_keymaps: Vec<Option<&str>> = blur_keymaps_owned.iter().map(|s| s.as_deref()).collect();
-            let binding = self.key_bindings.get_signal_binding_keymap(&blur_keymaps, "blur");
-
-            if let Some((cmd_template_args, _is_silent)) = binding {
-                let ctx = Self::build_exec_context(
-                    None, "", "", &blur_name,
-                    &term_width.to_string(), &term_height.to_string(), "blur", None
-                );
-                let full_cmd_args = crate::exec::replace_placeholders_in_args(cmd_template_args, &ctx);
-
-                // 复用内部指令直连魔法！零延迟同步执行 UI 状态变更
-                if let Some(internal_cmd) = InternalCommand::from_args(&full_cmd_args) {
-                    match internal_cmd {
-                        InternalCommand::ToggleLayout(name) => self.toggle_layout_visible(&name),
-                        InternalCommand::ShowLayout(name) => self.set_layout_visible(&name, true),
-                        InternalCommand::HideLayout(name) => self.set_layout_visible(&name, false),
-                        _ => {}
-                    }
-                    let _ = crate::exec::execute_command_silent(&full_cmd_args);
-                }
-            }
+            self.process_pending_blur(blur_name, term_width, term_height);
         }
     }
 
@@ -904,27 +882,14 @@ impl Engine {
                 sel.map(|e| vec![e]).unwrap_or_default()
             };
 
-    // 【修改】给 ids_str 也加上引号处理，防止带有空格的 ID 传参断裂
             let ids_str = entities
                 .iter()
-                .map(|e| {
-                    if e.id.contains(' ') {
-                        format!("\"{}\"", e.id)
-                    } else {
-                        e.id.clone()
-                    }
-                })
+                .map(|e| quote_if_needed(&e.id))
                 .collect::<Vec<_>>()
                 .join(" ");
             let paths_str = entities
                 .iter()
-                .map(|e| {
-                    if e.path.contains(' ') {
-                        format!("\"{}\"", e.path)
-                    } else {
-                        e.path.clone()
-                    }
-                })
+                .map(|e| quote_if_needed(&e.path))
                 .collect::<Vec<_>>()
                 .join(" ");
 
@@ -998,13 +963,7 @@ impl Engine {
             }
 
             if let Some(internal_cmd) = InternalCommand::from_args(&full_cmd_args) {
-                match internal_cmd {
-                    InternalCommand::ToggleLayout(name) => self.toggle_layout_visible(&name),
-                    InternalCommand::ShowLayout(name) => self.set_layout_visible(&name, true),
-                    InternalCommand::HideLayout(name) => self.set_layout_visible(&name, false),
-                    InternalCommand::ActivateInput(name) => self.activate_input(&name, ""),
-                    _ => {}
-                }
+                self.apply_internal_command(internal_cmd);
                 return true;
             }
 
@@ -1088,5 +1047,164 @@ impl Engine {
         } else {
             vec![None]
         }
+    }
+    /// 统一处理内部指令的执行，避免到处散落的 match
+    fn apply_internal_command(&mut self, cmd: InternalCommand) {
+        match cmd {
+            InternalCommand::ToggleLayout(name) => self.toggle_layout_visible(&name),
+            InternalCommand::ShowLayout(name) => self.set_layout_visible(&name, true),
+            InternalCommand::HideLayout(name) => self.set_layout_visible(&name, false),
+            InternalCommand::ActivateInput(name) => self.activate_input(&name, ""),
+            _ => {}
+        }
+    }
+
+    /// 提取失去焦点信号的处理逻辑，集中管理挂起状态
+    fn process_pending_blur(&mut self, blur_name: String, term_width: u16, term_height: u16) {
+        let blur_keymaps_owned = self.get_keymaps_for(&blur_name);
+        let blur_keymaps: Vec<Option<&str>> = blur_keymaps_owned.iter().map(|s| s.as_deref()).collect();
+        let binding = self.key_bindings.get_signal_binding_keymap(&blur_keymaps, "blur");
+
+        if let Some((cmd_template_args, _is_silent)) = binding {
+            let ctx = Self::build_exec_context(
+                None, "", "", &blur_name,
+                &term_width.to_string(), &term_height.to_string(), "blur", None
+            );
+            let full_cmd_args = crate::exec::replace_placeholders_in_args(cmd_template_args, &ctx);
+
+            // 复用内部指令直连魔法！零延迟同步执行 UI 状态变更
+            if let Some(internal_cmd) = InternalCommand::from_args(&full_cmd_args) {
+                self.apply_internal_command(internal_cmd);
+                let _ = crate::exec::execute_command_silent(&full_cmd_args);
+            }
+        }
+    }
+
+    /// 统一消费异步通道，收口 main.rs 的零散逻辑
+    pub fn drain_async_channels(&mut self, columns: u16, rows: u16) {
+        // 1. 接收异步重载数据
+        while let Ok((tree_name, result)) = self.async_reload_rx.try_recv() {
+            match result {
+                Ok(stdout) => {
+                    self.handle_ipc_update(&tree_name, &stdout, columns, rows);
+                }
+                Err(e) => {
+                    self.last_error = Some(format!("Reload failed for {}: {}", tree_name, e));
+                }
+            }
+        }
+
+        // 2. 接收后台静默脚本执行完毕的信号，触发全局刷新
+        while let Ok(()) = self.async_exec_rx.try_recv() {
+            // 1. 重新加载 Tree 数据源
+            self.trigger_reload();
+            // 2. 清空 View 缓存
+            for comp in self.components.values_mut() {
+                if let Component::View(v) = comp {
+                    v.cached_entity_id = None;
+                }
+            }
+            // 3. 刷新 View 内容
+            if let Focus::Component(tree_name) = &self.focus.current.clone() {
+                let tree_name = tree_name.clone();
+                self.broadcast_selection_changed(&tree_name, columns, rows);
+            }
+            self.mark_all_dirty();
+        }
+    }
+
+    /// 清理过期的状态栏临时消息
+    pub fn expire_status_messages(&mut self) {
+        let mut status_expired = false;
+        for comp in self.components.values_mut() {
+            if let Component::StatusBar(s) = comp {
+                if let Some(expire) = s.message_expire {
+                    if std::time::Instant::now() >= expire {
+                        s.message = None;
+                        s.message_expire = None;
+                        status_expired = true;
+                    }
+                }
+            }
+        }
+        if status_expired {
+            self.mark_all_dirty();
+        }
+    }
+
+    /// 统一接收并处理异步视图更新，收口 main.rs 的零散逻辑
+    pub fn process_async_view_updates(&mut self, columns: u16, rows: u16) {
+        while let Ok((view_name, target_id, content_bytes, is_graphic)) = self.async_view_rx.try_recv() {
+            if let Some(Component::View(v)) = self.components.get_mut(&view_name) {
+                v.is_loading = false;
+                if v.cached_entity_id == target_id {
+
+                    // 【修复】检测内容是否真的改变了，防止相同图片重复渲染导致卡顿！
+                    let changed = match &v.content {
+                        crate::app::view::ViewContent::Graphic(old_bytes) => {
+                            if is_graphic {
+                                // 对比新旧字节流，只有不一样才重绘
+                                old_bytes.as_slice() != content_bytes.as_slice()
+                            } else {
+                                true
+                            }
+                        }
+                        _ => true,
+                    };
+
+                    if changed {
+                        // 【修复缺失的代码】在这里检测是否从图片切换到了非图片
+                        let was_graphic = matches!(v.content, crate::app::view::ViewContent::Graphic(_));
+                        let will_be_graphic = is_graphic;
+
+                        if was_graphic && !will_be_graphic {
+                            v.needs_graphic_clear = true; // 触发物理擦除旧图片像素！
+                        }
+
+                        v.content = if is_graphic {
+                            crate::app::view::ViewContent::Graphic(content_bytes)
+                        } else {
+                            let text = String::from_utf8_lossy(&content_bytes).to_string();
+                            crate::app::view::ViewContent::Text(text)
+                        };
+                        v.scroll_offset = 0;
+                        v.graphic_dirty = true; // 只有真正改变时才标记 dirty
+                    }
+                    self.mark_dirty(&view_name);
+                }
+            }
+        }
+
+        // 如果之前有因加载中而被挂起的更新，现在重新触发
+        if !self.pending_view_reload.is_empty() {
+            self.pending_view_reload.clear();
+            if let Focus::Component(tree_name) = &self.focus.current.clone() {
+                let tree_name = tree_name.clone(); // 【修复】提前 clone，释放不可变借用
+                self.broadcast_selection_changed(&tree_name, columns, rows);
+            }
+        }
+    }
+
+    /// 初始化引擎状态，触发首次加载
+    pub fn initialize_if_needed(&mut self, columns: u16, rows: u16) {
+        if !self.is_initialized {
+            self.is_initialized = true;
+            self.init_views();
+            if let Focus::Component(name) = &self.focus.current.clone() {
+                let name = name.clone();
+                self.broadcast_selection_changed(&name, columns, rows);
+                // 【补丁】启动时触发 load 信号，符合契约
+                self.emit("load", columns, rows);
+            }
+        }
+    }
+}
+
+/// 辅助函数：如果字符串包含空格，则用双引号包裹
+fn quote_if_needed(s: &str) -> String {
+    if s.contains(' ') {
+        format!("\"{}\"", s)
+    } else {
+        s.to_string()
     }
 }

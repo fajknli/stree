@@ -160,12 +160,18 @@ area(size)[border,drag]:Name
 - **普通字符**：直接书写。如 `a`, `1`, `/`。注意：`shift-a` 会被引擎规范化为 `A`。
 - **特殊键**：`enter`, `esc`, `tab`, `backspace`, `delete`, `space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `f1`-`f12`。
 
-#### 作用域绑定
+#### 作用域绑定与 Keymap 继承链
 支持 `Scope:Key=Cmd` 语法。当焦点处于 `Scope` 组件时，该绑定生效，优先级高于全局绑定。
 ```bash
 # 仅当焦点在 RenameInput 时，按 Enter 关闭它
 --bind "RenameInput:enter=__CLOSE_OVERLAY__ RenameInput"
 ```
+
+引擎支持强大的 **Keymap 继承链机制**（类似 CSS 的 class 优先级或 Vim 的 mode 映射），通过 `keymap:` 前缀声明：
+1. **声明继承链**：组件通过 `keymap:default+bookmarks` 的形式声明多层映射表（用 `+` 连接）。引擎在解析时，会从右向左将其压入查找栈。
+2. **链式回退查找**：按键事件发生时，引擎按栈顺序依次在这些 Keymap 中查找绑定。如果都没找到，最后才穿透回退到全局（`None`）默认绑定。这完美保证了 DRY 原则：基础导航键绑在 `default`，特定业务键绑在专属 Keymap。
+3. **严格防穿透 (模态隔离)**：当 `Input` 组件激活或处于特定模态时，引擎切换为严格查找模式（`get_keymap_strict`），只查当前栈顶组件声明的 Keymap，**跳过全局穿透**，天然实现模态隔离，消灭旧时代的硬编码拦截。
+4. **NOOP 防火墙**：在任意 Keymap 层级，都可通过 `--bind "Bookmarks:h=__NOOP__"` 建立精准拦截，吞噬按键事件，防止特定上下文引起业务 Bug。
 
 #### 内部指令全集 (零延迟同步执行)
 绑定以下指令时，引擎在 Rust 内存中直接完成状态变更，不产生任何进程开销。
@@ -176,23 +182,18 @@ area(size)[border,drag]:Name
 | `__ESC__` | 无 | 退出输入 / 取消搜索 / 隐藏浮动层 / 请求退出。 |
 | `__TAB__` | 无 | 在当前可见图层的主要组件间循环切换焦点。 |
 | `__CYCLE_LAYER__` | 无 | Z 轴跨图层循环切换焦点。 |
-| `__UP__` / `__DOWN__` | 无 | 向上/向下移动选中项（Tree）或滚动（View）。 |
+| `__UP__` / `__DOWN__` | 无 | 向上/向下移动选中项（Tree）或滚动。 |
 | `__TOP__` / `__BOTTOM__` | 无 | 跳转到顶/底部。 |
 | `__EXPAND__` | 无 | 切换当前节点的展开/折叠状态。 |
 | `__MARK__` | 无 | 切换当前节点标记状态（标记后自动下移）。 |
 | `__ENTER__` | 无 | 切换展开 + 触发 `confirm` 信号。 |
-| `__SCROLL_LEFT__` | 无 | 水平左滚 5 字符。 |
-| `__SCROLL_RIGHT__` | 无 | 水平右滚 5 字符。 |
-| `__FOCUS_LEFT__` | 无 | 焦点向左移（基于空间距离排序）。 |
-| `__FOCUS_RIGHT__` | 无 | 焦点向右移。 |
-| `__FOCUS_UP__` | 无 | 焦点向上移。 |
-| `__FOCUS_DOWN__` | 无 | 焦点向下移。 |
+| `__SCROLL_LEFT__` / `__SCROLL_RIGHT__` | 无 | 水平左/右滚 5 字符。 |
+| `__FOCUS_LEFT__` / `__FOCUS_RIGHT__` / `__FOCUS_UP__` / `__FOCUS_DOWN__` | 无 | 焦点方向切换（空间距离排序）。 |
 | `__ACTIVATE_INPUT__` | Name | 激活指定 Input 组件，接管 StatusBar。 |
-| `__TOGGLE_LAYOUT__` | Name | 切换指定图层的可见性。 |
-| `__SHOW_LAYOUT__` | Name | 显示指定图层。 |
-| `__HIDE_LAYOUT__` | Name | 隐藏指定图层。 |
+| `__TOGGLE_LAYOUT__` / `__SHOW_LAYOUT__` / `__HIDE_LAYOUT__` | Name | 切换/显示/隐藏指定图层。 |
 | `__CLOSE_OVERLAY__` | Name | 关闭指定的 Input 覆盖层。 |
 | `__CLOSE_TOP_OVERLAY__` | 无 | 关闭栈顶的 Input 覆盖层。 |
+| `__NOOP__` | 无 | 吞噬按键，什么都不做。作为精准防火墙，用于屏蔽特定组件中会引起冲突的全局穿透按键。 |
 
 ---
 
@@ -219,6 +220,10 @@ area(size)[border,drag]:Name
 
 Socket 路径通过 `$STREE_SOCK` 暴露。帧结构（大端序）：
 `[4B target_len][8B data_len][target (UTF-8)][data (UTF-8)]` (硬限制：`target_len ≤ 128`，`data_len ≤ 512KB`)。
+
+通信安全防御：为防恶意或卡死的客户端阻塞主渲染循环，引擎为 IPC 连接强制设置读写超时（2秒），并复用 512KB 硬限制防止 OOM。
+
+双向异步闭环：引擎通过“信号”向外广播状态（如 quit_request），外部脚本通过“IPC”向内操控 UI（如 @exit, @layout-show）。两者在代码层面完全解耦，形成“终端无头浏览器”的双向通信通道。
 
 ### 6.1 组件数据更新
 ```bash
@@ -326,3 +331,5 @@ printf "STREE_GRAPHIC\n" | cat - <(chafa -f sixel image.jpg) | stree update Prev
 6. **异步挂起队列优先**：严禁同步触发跨组件级联广播。状态变更推入挂起队列，由主循环在安全时间点统一 `flush`。
 7. **极限防御**：所有物理坐标计算使用饱和运算防 Panic；历史帧状态继承必须经过 `clamp` 边界重校验；遭遇不可恢复错误时通过 panic hook 安全退出。
 8. **焦点与交互解耦**：引擎将键盘焦点与鼠标悬停分离。通过 `nohover:` 和 `nofocus:` 前缀，允许组件仅接受滚轮滚动而不夺焦或不可聚焦，保障复杂 TUI 布局的空间多路复用体验。
+9. **I/O 绝对异步化**：任何静默执行（@）的外部脚本必须丢入后台线程。切断主线程与子进程生命周期的强绑定，防止脚本反向调用 IPC 时产生死锁。
+10. **模态隔离纯视觉化**：所有的弹窗、输入框覆盖只是渲染槽位的临时替换。后端状态机永远保持运转，不暂停、不快照、不干涉。

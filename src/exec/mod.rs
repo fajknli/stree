@@ -92,86 +92,12 @@ pub fn execute_command_args(
         let peek_str = String::from_utf8_lossy(&peek_buf[..n]);
 
         if peek_str.starts_with("STREE_GRAPHIC\n") {
-            let mut rest_buf = Vec::new();
-            reader.read_to_end(&mut rest_buf)?;
-
-            let mut full_bytes = peek_buf[..n].to_vec();
-            full_bytes.extend_from_slice(&rest_buf);
-
-            if full_bytes.len() > MAX_TOTAL_BYTES {
-                full_bytes.truncate(MAX_TOTAL_BYTES);
-            }
-
-            if let Some(pos) = full_bytes.iter().position(|&b| b == b'\n') {
-                let graphic_bytes = full_bytes[pos+1..].to_vec();
-
-                let mut filtered_bytes = Vec::with_capacity(graphic_bytes.len());
-                let mut i = 0;
-                while i < graphic_bytes.len() {
-                    if graphic_bytes[i] == 0x1b && i + 1 < graphic_bytes.len() && graphic_bytes[i+1] == b']' {
-                        i += 2;
-                        while i < graphic_bytes.len() {
-                            if graphic_bytes[i] == 0x07 { i += 1; break; }
-                            if graphic_bytes[i] == 0x1b && i + 1 < graphic_bytes.len() && graphic_bytes[i+1] == b'\\' { i += 2; break; }
-                            i += 1;
-                        }
-                    } else {
-                        filtered_bytes.push(graphic_bytes[i]);
-                        i += 1;
-                    }
-                }
-                stdout_buf = filtered_bytes;
-            } else {
-                stdout_buf = full_bytes;
-            }
+            stdout_buf = parse_graphic_output(&mut reader, &peek_buf, n)?;
             is_graphic = true;
         } else {
             let cursor = std::io::Cursor::new(peek_buf[..n].to_vec());
             let mut chained = cursor.chain(reader);
-            let buf_reader = BufReader::new(&mut chained);
-
-            let mut text_buf = String::new();
-            let mut total_bytes = 0;
-            let mut line_count = 0;
-            let mut truncated_lines = 0;
-
-            for line in buf_reader.lines() {
-                let line = line?;
-
-                if total_bytes + line.len() > MAX_TOTAL_BYTES {
-                    break;
-                }
-
-                line_count += 1;
-
-                if line_count > max_lines {
-                    truncated_lines += 1;
-                    break;
-                }
-
-                let final_line = if line.len() > MAX_LINE_CHARS * 4 {
-                    let mut s: String = line.chars().take(MAX_LINE_CHARS - 3).collect();
-                    s.push_str("...");
-                    s
-                } else {
-                    let mut iter = line.chars();
-                    let s: String = iter.by_ref().take(MAX_LINE_CHARS - 3).collect();
-                    if iter.next().is_some() {
-                        format!("{}...", s)
-                    } else {
-                        line
-                    }
-                };
-
-                total_bytes += final_line.len() + 1;
-                text_buf.push_str(&final_line);
-                text_buf.push('\n');
-            }
-
-            if truncated_lines > 0 {
-                text_buf.push_str(&format!("\n... [stree: output truncated due to limits] ...\n"));
-            }
-            stdout_buf = text_buf.into_bytes();
+            stdout_buf = parse_text_output(&mut chained, max_lines)?;
         }
     }
 
@@ -227,4 +153,93 @@ pub fn execute_command_silent(cmd_args: &[String]) -> std::io::Result<i32> {
         .status()?;
 
     Ok(status.code().unwrap_or(-1))
+}
+
+// ================= 输出解析提取逻辑 =================
+
+fn parse_graphic_output(
+    reader: &mut impl std::io::Read,
+    peek_buf: &[u8],
+    n: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut rest_buf = Vec::new();
+    reader.read_to_end(&mut rest_buf)?;
+
+    let mut full_bytes = peek_buf[..n].to_vec();
+    full_bytes.extend_from_slice(&rest_buf);
+
+    if full_bytes.len() > MAX_TOTAL_BYTES {
+        full_bytes.truncate(MAX_TOTAL_BYTES);
+    }
+
+    if let Some(pos) = full_bytes.iter().position(|&b| b == b'\n') {
+        let graphic_bytes = full_bytes[pos+1..].to_vec();
+
+        let mut filtered_bytes = Vec::with_capacity(graphic_bytes.len());
+        let mut i = 0;
+        while i < graphic_bytes.len() {
+            if graphic_bytes[i] == 0x1b && i + 1 < graphic_bytes.len() && graphic_bytes[i+1] == b']' {
+                i += 2;
+                while i < graphic_bytes.len() {
+                    if graphic_bytes[i] == 0x07 { i += 1; break; }
+                    if graphic_bytes[i] == 0x1b && i + 1 < graphic_bytes.len() && graphic_bytes[i+1] == b'\\' { i += 2; break; }
+                    i += 1;
+                }
+            } else {
+                filtered_bytes.push(graphic_bytes[i]);
+                i += 1;
+            }
+        }
+        Ok(filtered_bytes)
+    } else {
+        Ok(full_bytes)
+    }
+}
+
+fn parse_text_output(
+    reader: &mut impl std::io::BufRead,
+    max_lines: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut text_buf = String::new();
+    let mut total_bytes = 0;
+    let mut line_count = 0;
+    let mut truncated_lines = 0;
+
+    for line in reader.lines() {
+        let line = line?;
+
+        if total_bytes + line.len() > MAX_TOTAL_BYTES {
+            break;
+        }
+
+        line_count += 1;
+
+        if line_count > max_lines {
+            truncated_lines += 1;
+            break;
+        }
+
+        let final_line = if line.len() > MAX_LINE_CHARS * 4 {
+            let mut s: String = line.chars().take(MAX_LINE_CHARS - 3).collect();
+            s.push_str("...");
+            s
+        } else {
+            let mut iter = line.chars();
+            let s: String = iter.by_ref().take(MAX_LINE_CHARS - 3).collect();
+            if iter.next().is_some() {
+                format!("{}...", s)
+            } else {
+                line
+            }
+        };
+
+        total_bytes += final_line.len() + 1;
+        text_buf.push_str(&final_line);
+        text_buf.push('\n');
+    }
+
+    if truncated_lines > 0 {
+        text_buf.push_str(&format!("\n... [stree: output truncated due to limits] ...\n"));
+    }
+    Ok(text_buf.into_bytes())
 }

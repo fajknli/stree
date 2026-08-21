@@ -125,80 +125,16 @@ pub fn render_all<W: Write>(ctx: &mut RenderCtx, all_rects: &[(WindowRect, Strin
         if let Some(comp) = comp_opt {
             match comp {
                 Component::Tree(t) => {
-                    let max_rows = renderer.content_height() as usize;
-                    t.v_scroll = calc_scroll_offset(t.selected_idx, t.visible_ids.len(), max_rows, t.v_scroll);
-                    let scroll_offset = t.v_scroll;
-                    let drawn = draw_tree_window(&mut renderer, t, ctx.style_engine, scroll_offset, is_focused, &ctx.engine.ui_theme)?;
-                    for i in drawn as u16..max_rows as u16 { renderer.clear_row(i)?; }
+                    render_tree_comp(&mut renderer, t, ctx.style_engine, is_focused, &ctx.engine.ui_theme)?;
                 }
                 Component::View(v) => {
-                    match &v.content {
-                        ViewContent::Graphic(_) => {
-                            if v.graphic_dirty {
-                                let offset_x = safe_rect.start_col + 1;
-                                let offset_y = safe_rect.start_row + 1;
-                                let img_w = renderer.content_width();
-                                let img_h = renderer.content_height();
-
-                                // 【核心优化】用 mem::take 移走内容，避免 4MB clone！
-                                // 渲染完毕后在函数末尾放回去
-                                if let ViewContent::Graphic(bytes) = std::mem::take(&mut v.content) {
-                                    pending_graphics.push((offset_x, offset_y, img_w, img_h, rendering_name.clone(), bytes));
-                                }
-                                v.graphic_dirty = false;
-                            }
-                        }
-                        ViewContent::Text(text) => {
-                            if v.needs_graphic_clear {
-                                let offset_x = safe_rect.start_col + 1;
-                                let offset_y = safe_rect.start_row + 1;
-                                let img_w = renderer.content_width();
-                                let img_h = renderer.content_height();
-                                pending_clears.push((offset_x, offset_y, img_w, img_h));
-                                v.needs_graphic_clear = false;
-                            }
-
-                            let scroll_offset = v.scroll_offset;
-                            let h_scroll = v.h_scroll;
-
-                            let lines: Vec<&str> = text.lines().collect();
-                            let max_rows = renderer.content_height() as usize;
-                            let max_offset = lines.len().saturating_sub(max_rows);
-                            let actual_offset = scroll_offset.min(max_offset);
-                            let color = if is_focused { ctx.engine.ui_theme.view_focused } else { ctx.engine.ui_theme.view_unfocused };
-                            let style = TextStyle { fg: color, ..Default::default() };
-                            for i in 0..max_rows {
-                                renderer.clear_row(i as u16)?;
-                                if let Some(line) = lines.get(i + actual_offset) {
-                                    renderer.print(0, i as u16, line, style, h_scroll)?;
-                                }
-                            }
-                        }
-                        ViewContent::Empty => {
-                            // 空内容，只清理背景
-                            let max_rows = renderer.content_height() as usize;
-                            for i in 0..max_rows {
-                                renderer.clear_row(i as u16)?;
-                            }
-                        }
-                    }
+                    render_view_comp(&mut renderer, v, safe_rect, is_focused, &rendering_name, &mut pending_graphics, &mut pending_clears, &ctx.engine.ui_theme)?;
                 }
                 Component::StatusBar(s) => {
-                    let max_rows = renderer.content_height() as u16;
-                    for i in 0..max_rows { renderer.clear_row(i)?; }
-                    let style = TextStyle { fg: ctx.engine.ui_theme.statusbar_fg, ..Default::default() };
-                    renderer.print(0, 0, &s.current_text, style, 0)?;
+                    render_statusbar_comp(&mut renderer, s, &ctx.engine.ui_theme)?;
                 }
                 Component::Input(i) => {
-                    let max_rows = renderer.content_height() as u16;
-                    for r in 0..max_rows { renderer.clear_row(r)?; }
-
-                    let prefix_style = TextStyle { fg: ctx.engine.ui_theme.input_prefix, ..Default::default() };
-                    renderer.print(0, 0, &i.prefix, prefix_style, 0)?;
-                    let prefix_w = UnicodeWidthStr::width(i.prefix.as_str()) as u16;
-                    let buffer_style = TextStyle { fg: ctx.engine.ui_theme.input_buffer, ..Default::default() };
-                    renderer.print(prefix_w, 0, &i.buffer, buffer_style, 0)?;
-                    renderer.show_cursor(prefix_w + i.cursor as u16, 0)?;
+                    render_input_comp(&mut renderer, i, &ctx.engine.ui_theme)?;
                 }
             }
         }
@@ -216,23 +152,8 @@ pub fn render_all<W: Write>(ctx: &mut RenderCtx, all_rects: &[(WindowRect, Strin
         }
     }
 
-    // ==========================================
-    // 【新增】预分配可复用的空格缓冲区，消灭每行 b" ".repeat() 分配
-    // ==========================================
-    let mut space_buf: Vec<u8> = Vec::new();
-
     // 1. 先强制物理清除旧图片残留区域
-    for (offset_x, offset_y, img_w, img_h) in &pending_clears {
-        let _ = out.write_all(b"\x1b[0m");
-        if space_buf.len() < *img_w as usize {
-            space_buf.resize(*img_w as usize, b' ');
-        }
-        let spaces = &space_buf[..*img_w as usize];
-        for i in 0..*img_h {
-            let _ = out.queue(crossterm::cursor::MoveTo(*offset_x, *offset_y + i as u16));
-            let _ = out.write_all(spaces);
-        }
-    }
+    clear_pending_graphics(out, &pending_clears)?;
 
     // 2. 执行文本 Diff 刷新
     PREV_BUFFER.with(|prev_cell| -> std::io::Result<()> {
@@ -251,29 +172,9 @@ pub fn render_all<W: Write>(ctx: &mut RenderCtx, all_rects: &[(WindowRect, Strin
     })?;
 
     // 3. 统一绘制新图片（消费 pending_graphics，避免 clone）
-    let mut recovered_content: Vec<(String, Vec<u8>)> = Vec::new();
-    for (offset_x, offset_y, img_w, img_h, view_name, content) in pending_graphics {
-        let _ = out.write_all(b"\x1b[0m");
+    let recovered_content = draw_pending_graphics(out, &mut pending_graphics)?;
 
-        // 【恢复擦除逻辑】画图前必须用空格擦除背景，防止旧图片残影！
-        if space_buf.len() < img_w as usize {
-            space_buf.resize(img_w as usize, b' ');
-        }
-        let spaces = &space_buf[..img_w as usize];
-        for i in 0..img_h {
-            let _ = out.queue(crossterm::cursor::MoveTo(offset_x, offset_y + i as u16));
-            let _ = out.write_all(spaces);
-        }
-
-        let _ = out.queue(crossterm::cursor::MoveTo(offset_x, offset_y));
-
-        let _ = out.write_all(&content);
-        let _ = out.write_all(b"\x1b\\\x1b[0m");
-
-        recovered_content.push((view_name, content));
-    }
-
-    // 【新增】将内容放回视图，供下次全屏重绘使用
+    // 4. 将内容放回视图，供下次全屏重绘使用
     for (view_name, content) in recovered_content {
         if let Some(Component::View(v)) = ctx.engine.components.get_mut(&view_name) {
             v.content = ViewContent::Graphic(content);
@@ -312,4 +213,165 @@ pub fn calc_scroll_offset(selected_idx: usize, visible_count: usize, max_rows: u
     } else {
         current_offset
     }.min(max_offset)
+}
+
+// ================= 组件渲染提取逻辑 =================
+
+fn render_tree_comp(
+    renderer: &mut WindowRenderer,
+    t: &mut crate::app::TreeState,
+    style_engine: &crate::style::StyleEngine,
+    is_focused: bool,
+    ui_theme: &crate::style::UiTheme,
+) -> std::io::Result<()> {
+    let max_rows = renderer.content_height() as usize;
+    t.v_scroll = calc_scroll_offset(t.selected_idx, t.visible_ids.len(), max_rows, t.v_scroll);
+    let scroll_offset = t.v_scroll;
+    let drawn = draw_tree_window(renderer, t, style_engine, scroll_offset, is_focused, ui_theme)?;
+    for i in drawn as u16..max_rows as u16 { renderer.clear_row(i)?; }
+    Ok(())
+}
+
+fn render_view_comp(
+    renderer: &mut WindowRenderer,
+    v: &mut crate::app::ViewState,
+    safe_rect: WindowRect,
+    is_focused: bool,
+    rendering_name: &str,
+    pending_graphics: &mut Vec<(u16, u16, u16, u16, String, Vec<u8>)>,
+    pending_clears: &mut Vec<(u16, u16, u16, u16)>,
+    ui_theme: &crate::style::UiTheme,
+) -> std::io::Result<()> {
+    match &v.content {
+        ViewContent::Graphic(_) => {
+            if v.graphic_dirty {
+                let offset_x = safe_rect.start_col + 1;
+                let offset_y = safe_rect.start_row + 1;
+                let img_w = renderer.content_width();
+                let img_h = renderer.content_height();
+
+                // 【核心优化】用 mem::take 移走内容，避免 4MB clone！
+                // 渲染完毕后在函数末尾放回去
+                if let ViewContent::Graphic(bytes) = std::mem::take(&mut v.content) {
+                    pending_graphics.push((offset_x, offset_y, img_w, img_h, rendering_name.to_string(), bytes));
+                }
+                v.graphic_dirty = false;
+            }
+        }
+        ViewContent::Text(text) => {
+            if v.needs_graphic_clear {
+                let offset_x = safe_rect.start_col + 1;
+                let offset_y = safe_rect.start_row + 1;
+                let img_w = renderer.content_width();
+                let img_h = renderer.content_height();
+                pending_clears.push((offset_x, offset_y, img_w, img_h));
+                v.needs_graphic_clear = false;
+            }
+
+            let scroll_offset = v.scroll_offset;
+            let h_scroll = v.h_scroll;
+
+            let lines: Vec<&str> = text.lines().collect();
+            let max_rows = renderer.content_height() as usize;
+            let max_offset = lines.len().saturating_sub(max_rows);
+            let actual_offset = scroll_offset.min(max_offset);
+            let color = if is_focused { ui_theme.view_focused } else { ui_theme.view_unfocused };
+            let style = TextStyle { fg: color, ..Default::default() };
+            for i in 0..max_rows {
+                renderer.clear_row(i as u16)?;
+                if let Some(line) = lines.get(i + actual_offset) {
+                    renderer.print(0, i as u16, line, style, h_scroll)?;
+                }
+            }
+        }
+        ViewContent::Empty => {
+            // 空内容，只清理背景
+            let max_rows = renderer.content_height() as usize;
+            for i in 0..max_rows {
+                renderer.clear_row(i as u16)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_statusbar_comp(
+    renderer: &mut WindowRenderer,
+    s: &crate::app::StatusBarState,
+    ui_theme: &crate::style::UiTheme,
+) -> std::io::Result<()> {
+    let max_rows = renderer.content_height() as u16;
+    for i in 0..max_rows { renderer.clear_row(i)?; }
+    let style = TextStyle { fg: ui_theme.statusbar_fg, ..Default::default() };
+    renderer.print(0, 0, &s.current_text, style, 0)?;
+    Ok(())
+}
+
+fn render_input_comp(
+    renderer: &mut WindowRenderer,
+    i: &crate::app::InputState,
+    ui_theme: &crate::style::UiTheme,
+) -> std::io::Result<()> {
+    let max_rows = renderer.content_height() as u16;
+    for r in 0..max_rows { renderer.clear_row(r)?; }
+
+    let prefix_style = TextStyle { fg: ui_theme.input_prefix, ..Default::default() };
+    renderer.print(0, 0, &i.prefix, prefix_style, 0)?;
+    let prefix_w = UnicodeWidthStr::width(i.prefix.as_str()) as u16;
+    let buffer_style = TextStyle { fg: ui_theme.input_buffer, ..Default::default() };
+    renderer.print(prefix_w, 0, &i.buffer, buffer_style, 0)?;
+    renderer.show_cursor(prefix_w + i.cursor as u16, 0)?;
+    Ok(())
+}
+
+// ================= 图形渲染提取逻辑 =================
+
+fn clear_pending_graphics<W: Write>(
+    out: &mut W,
+    pending_clears: &[(u16, u16, u16, u16)],
+) -> std::io::Result<()> {
+    let mut space_buf: Vec<u8> = Vec::new();
+    for (offset_x, offset_y, img_w, img_h) in pending_clears {
+        let _ = out.write_all(b"\x1b[0m");
+        if space_buf.len() < *img_w as usize {
+            space_buf.resize(*img_w as usize, b' ');
+        }
+        let spaces = &space_buf[..*img_w as usize];
+        for i in 0..*img_h {
+            let _ = out.queue(crossterm::cursor::MoveTo(*offset_x, *offset_y + i as u16));
+            let _ = out.write_all(spaces);
+        }
+    }
+    Ok(())
+}
+
+fn draw_pending_graphics<W: Write>(
+    out: &mut W,
+    pending_graphics: &mut Vec<(u16, u16, u16, u16, String, Vec<u8>)>,
+) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let mut space_buf: Vec<u8> = Vec::new();
+    let mut recovered_content: Vec<(String, Vec<u8>)> = Vec::new();
+
+    for (offset_x, offset_y, img_w, img_h, view_name, content) in pending_graphics.drain(..) {
+        let _ = out.write_all(b"\x1b[0m");
+
+        // 【恢复擦除逻辑】画图前必须用空格擦除背景，防止旧图片残影！
+        if space_buf.len() < img_w as usize {
+            space_buf.resize(img_w as usize, b' ');
+        }
+        let spaces = &space_buf[..img_w as usize];
+        for i in 0..img_h {
+            let _ = out.queue(crossterm::cursor::MoveTo(offset_x, offset_y + i as u16));
+            let _ = out.write_all(spaces);
+        }
+
+        let _ = out.queue(crossterm::cursor::MoveTo(offset_x, offset_y));
+
+        let _ = out.write_all(&content);
+        let _ = out.write_all(b"\x1b\\\x1b[0m");
+
+        recovered_content.push((view_name, content));
+    }
+
+    Ok(recovered_content)
 }

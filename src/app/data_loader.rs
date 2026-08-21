@@ -3,6 +3,7 @@
 use crate::app::{Engine, Component};
 use crate::exec;
 use std::collections::HashSet;
+use crate::app::quote_if_needed;
 
 impl Engine {
     pub fn broadcast_selection_changed(&mut self, tree_name: &str, _term_width: u16, _term_height: u16) {
@@ -16,14 +17,8 @@ impl Engine {
             t.get_selected_entity().cloned()
         } else { return; };
 
-        let ids_str = selected_entity.as_ref().map(|e| e.id.clone()).unwrap_or_default();
-        let paths_str = selected_entity.as_ref().map(|e| {
-            if e.path.contains(' ') {
-                format!("\"{}\"", e.path)
-            } else {
-                e.path.clone()
-            }
-        }).unwrap_or_default();
+        let ids_str = selected_entity.as_ref().map(|e| quote_if_needed(&e.id)).unwrap_or_default();
+        let paths_str = selected_entity.as_ref().map(|e| quote_if_needed(&e.path)).unwrap_or_default();
         let window_name = tree_name.to_string();
         let mut dirty_views = Vec::new();
 
@@ -39,11 +34,7 @@ impl Engine {
                 let width_str = v.rect_width.to_string();
                 let height_str = v.rect_height.to_string();
                 let template_args_vec = crate::config::split_args(&v.cmd_template);
-
-                let depends_on_selection = template_args_vec.iter().any(|arg|
-                    arg.contains("{id}") || arg.contains("{path}") || arg.contains("{display}") ||
-                    arg.contains("{tags}") || arg.contains("{ids}") || arg.contains("{paths}")
-                );
+                let depends_on_selection = cmd_depends_on_selection(&template_args_vec);
                 if !depends_on_selection && !is_empty {
                     continue;
                 }
@@ -64,7 +55,7 @@ impl Engine {
                 );
                 let full_cmd_args = exec::replace_placeholders_in_args(&template_args_vec, &ctx);
 
-                if full_cmd_args.is_empty() || (full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) {
+                if is_empty_command(&full_cmd_args) {
                     v.content = crate::app::view::ViewContent::Empty;
                     v.scroll_offset = 0;
                     v.is_loading = false;
@@ -83,19 +74,7 @@ impl Engine {
                     let result = std::panic::catch_unwind(|| {
                         crate::exec::execute_command_args(&full_cmd_args, max_lines, child_pid)
                     });
-
-                    let (content_bytes, is_graphic): (Vec<u8>, bool) = match result {
-                        Ok(Ok((code, stdout, is_graphic))) => {
-                            let is_blank = stdout.iter().all(|&b| b.is_ascii_whitespace());
-                            if code != 0 && is_blank {
-                                (format!("[ERR] Command exited with code {}\n", code).into_bytes(), false)
-                            } else {
-                                (stdout, is_graphic)
-                            }
-                        },
-                        Ok(Err(e)) => (format!("[ERR] {}\n", e).into_bytes(), false),
-                        Err(_) => (b"[ERR] Background thread panicked\n".to_vec(), false),
-                    };
+                    let (content_bytes, is_graphic) = format_command_result(result);
                     let _ = tx.send((view_name_clone, target_id_clone, content_bytes, is_graphic));
                 });
             }
@@ -111,11 +90,7 @@ impl Engine {
                 let height_str = v.rect_height.to_string();
                 let window_name = view_name.clone();
                 let template_args_vec = crate::config::split_args(&v.cmd_template);
-
-                let depends_on_selection = template_args_vec.iter().any(|arg|
-                    arg.contains("{id}") || arg.contains("{path}") || arg.contains("{display}") ||
-                    arg.contains("{tags}") || arg.contains("{ids}") || arg.contains("{paths}")
-                );
+                let depends_on_selection = cmd_depends_on_selection(&template_args_vec);
                 if depends_on_selection {
                     continue;
                 }
@@ -123,18 +98,12 @@ impl Engine {
                 let ctx = Self::build_exec_context(None, "", "", &window_name, &width_str, &height_str, "", None);
                 let full_cmd_args = exec::replace_placeholders_in_args(&template_args_vec, &ctx);
 
-                if full_cmd_args.is_empty() || (full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) { continue; }
+                if is_empty_command(&full_cmd_args) { continue; }
 
                 // 传入 PID 共享指针
                 match exec::execute_command_args(&full_cmd_args, self.max_lines, v.child_pid.clone()) {
-                    Ok((code, stdout_bytes, is_graphic)) => {
-                        let is_blank = stdout_bytes.iter().all(|&b| b.is_ascii_whitespace());
-                        let content_bytes = if code != 0 && is_blank {
-                            format!("[ERR] Command exited with code {}\n", code).into_bytes()
-                        } else {
-                            stdout_bytes
-                        };
-
+                    Ok(res) => {
+                        let (content_bytes, is_graphic) = format_command_result(Ok(Ok(res)));
                         v.content = if is_graphic {
                             crate::app::view::ViewContent::Graphic(content_bytes)
                         } else {
@@ -145,7 +114,8 @@ impl Engine {
                         v.graphic_dirty = true;
                     }
                     Err(e) => {
-                        v.content = crate::app::view::ViewContent::Text(format!("[ERR] {}", e));
+                        let (content_bytes, _) = format_command_result(Ok(Err(e)));
+                        v.content = crate::app::view::ViewContent::Text(String::from_utf8_lossy(&content_bytes).to_string());
                     }
                 }
             }
@@ -284,5 +254,36 @@ impl Engine {
                 });
             }
         }
+    }
+}
+
+// ================= 命令解析辅助逻辑 =================
+
+/// 检查命令模板是否依赖选中项
+fn cmd_depends_on_selection(template_args: &[String]) -> bool {
+    template_args.iter().any(|arg|
+        arg.contains("{id}") || arg.contains("{path}") || arg.contains("{display}") ||
+        arg.contains("{tags}") || arg.contains("{ids}") || arg.contains("{paths}")
+    )
+}
+
+/// 检查命令是否为空
+pub fn is_empty_command(args: &[String]) -> bool {
+    args.is_empty() || (args.len() == 1 && args[0].trim().is_empty())
+}
+
+/// 统一处理命令执行结果，收口错误格式化逻辑
+fn format_command_result(result: std::thread::Result<std::io::Result<(i32, Vec<u8>, bool)>>) -> (Vec<u8>, bool) {
+    match result {
+        Ok(Ok((code, stdout, is_graphic))) => {
+            let is_blank = stdout.iter().all(|&b| b.is_ascii_whitespace());
+            if code != 0 && is_blank {
+                (format!("[ERR] Command exited with code {}\n", code).into_bytes(), false)
+            } else {
+                (stdout, is_graphic)
+            }
+        },
+        Ok(Err(e)) => (format!("[ERR] {}\n", e).into_bytes(), false),
+        Err(_) => (b"[ERR] Background thread panicked\n".to_vec(), false),
     }
 }

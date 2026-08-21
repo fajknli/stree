@@ -43,6 +43,18 @@ impl Buffer {
     pub fn set_cell(&mut self, x: usize, y: usize, symbol: char, fg: Color, bg: Option<Color>, bold: bool) {
         if x < self.width && y < self.height {
             let idx = y * self.width + x;
+
+            // 【终极解法】精准物理降级
+            // 如果要写入的是实质字符（非空格），且左边是宽字符（如中文）
+            if symbol != ' ' && x > 0 {
+                let left_idx = y * self.width + (x - 1);
+                let left_symbol = self.cells[left_idx].symbol;
+                if UnicodeWidthChar::width(left_symbol).unwrap_or(0) == 2 {
+                    // 必须将左边的中文强制降级为空格，否则终端会吞噬边框
+                    self.cells[left_idx].symbol = ' ';
+                }
+            }
+
             self.cells[idx] = Cell { symbol, fg, bg, bold };
         }
     }

@@ -2,6 +2,7 @@
 use crate::app::{Component, Engine, OverlayLayer};
 use crossterm::event::KeyModifiers;
 use crate::app::input::InputKeyResult;
+use crate::app::data_loader::is_empty_command;
 
 impl Engine {
     pub fn has_active_input(&self) -> bool {
@@ -183,7 +184,7 @@ impl Engine {
             );
 
             let full_cmd_args = crate::exec::replace_placeholders_in_args(&args, &ctx);
-            if !full_cmd_args.is_empty() {
+            if !is_empty_command(&full_cmd_args) {
                 crate::runner::execute_binding(self, &full_cmd_args, is_silent, term_width, term_height);
             }
         }
