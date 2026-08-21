@@ -17,27 +17,37 @@ use std::collections::HashSet;
 ///
 /// # 返回
 /// 匹配的实体 ID 集合 (HashSet<String>)
-pub fn match_entities(entities: &[Entity], query: &str) -> HashSet<String> {
+pub fn match_entities(entities: &[Entity], query: &str, scope: &str) -> HashSet<String> {
     let mut matched = HashSet::new();
 
-    // 空查询直接返回空集合，TreeState 会将其视为“无过滤”状态
     if query.trim().is_empty() {
         return matched;
     }
 
     let lower_query = query.to_lowercase();
+    let s = scope.to_lowercase();
+
+    // 判断安全策略：决定哪些字段允许被搜索
+    let check_id = s == "all" || s.contains("id");
+    let check_display = s == "all" || s.contains("display");
+    let check_path = s == "all" || s.contains("path");
 
     for entity in entities {
-        // 仅搜索内容层，不搜索元数据层
-        // 【修复】使用标准库安全地移除文件扩展名，保留完整目录结构
-        let searchable_path = std::path::Path::new(&entity.path)
-            .with_extension("")
-            .to_string_lossy()
-            .to_string();
+        let mut is_match = false;
 
-        let is_match = entity.id.to_lowercase().contains(&lower_query)
-            || entity.display.to_lowercase().contains(&lower_query)
-            || searchable_path.to_lowercase().contains(&lower_query);
+        if check_display {
+            is_match |= entity.display.to_lowercase().contains(&lower_query);
+        }
+        if !is_match && check_id {
+            is_match |= entity.id.to_lowercase().contains(&lower_query);
+        }
+        if !is_match && check_path {
+            let searchable_path = std::path::Path::new(&entity.path)
+                .with_extension("")
+                .to_string_lossy()
+                .to_string();
+            is_match |= searchable_path.to_lowercase().contains(&lower_query);
+        }
 
         if is_match {
             matched.insert(entity.id.clone());

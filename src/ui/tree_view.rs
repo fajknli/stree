@@ -24,10 +24,8 @@ pub fn draw_tree_window(
     // 获取搜索词（如果有）
     let query_opt = tree.search_query.as_deref().filter(|q| !q.is_empty());
 
-    // 准备高亮颜色的 ANSI 转义码（使用您指定的 TrueColor 红色：#c93b3b）
-    let highlight_start = "\x1b[38;2;201;59;59m";
-    // 【关键修复】使用 \x1b[39m 仅重置前景色，防止把选中状态的背景色给重置掉！
-    let highlight_end = "\x1b[39m";
+    let _highlight_start = "\x1b[38;2;201;59;59m";
+    let _highlight_end = "\x1b[39m";
 
     for i in start..end {
         let id = &tree.visible_ids[i];
@@ -47,23 +45,17 @@ pub fn draw_tree_window(
 
         // 【新增】高亮匹配的子串
         if let Some(query) = query_opt {
-            let lower_query = query.to_lowercase();
-            let lower_display = entity.display.to_lowercase();
+            // 【修复】使用 to_ascii_lowercase 保证字节长度不变，防止多字节切片 Panic
+            let lower_query = query.to_ascii_lowercase();
+            let lower_display = entity.display.to_ascii_lowercase();
 
             let mut last_idx = 0;
             for (idx, _) in lower_display.match_indices(&lower_query) {
-                // 推入匹配前的普通文本
                 display.push_str(&entity.display[last_idx..idx]);
-                // 推入高亮开始标记
-                display.push_str(highlight_start);
-                // 推入匹配的文本（保持原大小写）
                 let match_end = idx + query.len();
                 display.push_str(&entity.display[idx..match_end]);
-                // 推入高亮结束标记
-                display.push_str(highlight_end);
                 last_idx = match_end;
             }
-            // 推入剩余的普通文本
             display.push_str(&entity.display[last_idx..]);
         } else {
             display.push_str(&entity.display);

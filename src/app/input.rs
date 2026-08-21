@@ -19,6 +19,7 @@ pub struct InputState {
     pub is_instant: bool,
     pub target_override: Option<String>,
     pub is_search: bool, // 【新增】标记是否为实时搜索框
+    pub keymap: String,
 }
 
 impl InputState {
@@ -34,6 +35,7 @@ impl InputState {
             is_instant: false,
             target_override: None,
             is_search: false, // 初始化
+            keymap: "default".to_string(),
         }
     }
 

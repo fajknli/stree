@@ -146,7 +146,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     terminal::enable_raw_mode()?;
 
     let scroll_step = cli.scroll_step;
-    let mut last_event_time = std::time::Instant::now();
 
     // 【性能优化】将事件队列移到循环外，避免每帧分配内存
     let mut key_events: Vec<crossterm::event::KeyEvent> = Vec::with_capacity(16);
@@ -234,54 +233,92 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let dx = engine.drag.last_col as i32 - engine.drag.start_col as i32;
                 let dy = engine.drag.last_row as i32 - engine.drag.start_row as i32;
 
-                let mut new_w = engine.drag.initial_width as i32;
-                let mut new_h = engine.drag.initial_height as i32;
                 let mut new_x = engine.drag.initial_anchor_x as i32;
                 let mut new_y = engine.drag.initial_anchor_y as i32;
+                let mut new_w = engine.drag.initial_width as i32;
+                let mut new_h = engine.drag.initial_height as i32;
 
-                // 【核心魔法】根据拖拽的边，计算新尺寸和新坐标，保证对侧不动
-                if edge_mask & 2 != 0 { new_w = engine.drag.initial_width as i32 + dx; }
-                if edge_mask & 1 != 0 { new_w = engine.drag.initial_width as i32 - dx; new_x = engine.drag.initial_anchor_x as i32 + dx; }
-                if edge_mask & 8 != 0 { new_h = engine.drag.initial_height as i32 + dy; }
-                if edge_mask & 4 != 0 { new_h = engine.drag.initial_height as i32 - dy; new_y = engine.drag.initial_anchor_y as i32 + dy; }
-
-                // only keep border
-                let min_w = 2;
-                let min_h = 2;
-                if new_w < min_w {
-                    if edge_mask & 1 != 0 { new_x -= min_w - new_w; }
-                    new_w = min_w;
+                // 1. 根据掩码应用原始位移
+                if edge_mask & 1 != 0 { // Left
+                    new_x += dx;
+                    new_w -= dx;
                 }
-                if new_h < min_h {
-                    if edge_mask & 4 != 0 { new_y -= min_h - new_h; }
-                    new_h = min_h;
+                if edge_mask & 2 != 0 { // Right
+                    new_w += dx;
+                }
+                if edge_mask & 4 != 0 { // Top
+                    new_y += dy;
+                    new_h -= dy;
+                }
+                if edge_mask & 8 != 0 { // Bottom
+                    new_h += dy;
                 }
 
-                // 递归找到图层中的 Window 节点并篡改它的 Root 尺寸和锚点坐标
-                fn modify_node(node: &mut crate::layout::LayoutNode, name: &str, new_w: i32, new_h: i32) -> bool {
-                    match node {
-                        crate::layout::LayoutNode::Window { name: n, size, .. } => {
-                            if n == name {
-                                *size = Some(crate::layout::WindowSize::Absolute2D(new_w as u16, new_h as u16));
-                                return true;
-                            }
-                        }
-                        crate::layout::LayoutNode::Container { children, .. } => {
-                            for c in children {
-                                if modify_node(c, name, new_w, new_h) { return true; }
-                            }
-                        }
+                // 2. 最小尺寸限制（保证对侧边缘绝对不动！）
+                const MIN_W: i32 = 2;
+                const MIN_H: i32 = 2;
+                if new_w < MIN_W {
+                    // 如果是左侧收缩到极限，必须反向修正 x，保持右边缘不动
+                    if edge_mask & 1 != 0 {
+                        new_x = engine.drag.initial_anchor_x as i32 + (engine.drag.initial_width as i32 - MIN_W);
                     }
-                    false
+                    new_w = MIN_W;
+                }
+                if new_h < MIN_H {
+                    // 如果是顶部收缩到极限，必须反向修正 y，保持下边缘不动
+                    if edge_mask & 4 != 0 {
+                        new_y = engine.drag.initial_anchor_y as i32 + (engine.drag.initial_height as i32 - MIN_H);
+                    }
+                    new_h = MIN_H;
                 }
 
+                // 3. 屏幕边界限制（同样保证对侧边缘不动！）
+                let term_w = columns as i32;
+                let term_h = rows as i32;
+                if new_x < 0 {
+                    // 如果左侧碰到了左边界，必须加宽，保持右边缘不动
+                    if edge_mask & 1 != 0 {
+                        new_w += new_x; // new_x 是负数，相当于加宽
+                    }
+                    new_x = 0;
+                }
+                if new_y < 0 {
+                    // 如果顶部碰到了上边界，必须加高，保持下边缘不动
+                    if edge_mask & 4 != 0 {
+                        new_h += new_y;
+                    }
+                    new_y = 0;
+                }
+                if new_x + new_w > term_w {
+                    // 右侧超出屏幕，直接截断宽度
+                    new_w = term_w - new_x;
+                }
+                if new_y + new_h > term_h {
+                    // 底部超出屏幕，直接截断高度
+                    new_h = term_h - new_y;
+                }
+
+                let final_x = new_x as u16;
+                let final_y = new_y as u16;
+                let final_w = new_w as u16;
+                let final_h = new_h as u16;
+
+                // 【关键修复】必须同时注入 window_rect_overrides！
+                engine.window_rect_overrides.insert(
+                    layer_name.clone(),
+                    crate::layout::WindowSize::Absolute2D(final_w, final_h)
+                );
+
+                // 更新画布尺寸（维持锚点位置）
                 for layer in &mut engine.layout_layers {
                     if !matches!(layer.anchor, crate::layout::Anchor::ScreenAbsolute {..}) { continue; }
-                    if modify_node(&mut layer.root, &layer_name, new_w, new_h) {
-                        layer.anchor = crate::layout::Anchor::ScreenAbsolute {
-                            x: crate::layout::Coord::Pixels(new_x.max(0) as u16),
-                            y: crate::layout::Coord::Pixels(new_y.max(0) as u16),
-                        };
+                    if app::Engine::layout_contains_window(layer, &layer_name) {
+                        layer.runtime_rect_override = Some(crate::layout::WindowRect {
+                            start_col: final_x,
+                            start_row: final_y,
+                            width: final_w,
+                            height: final_h,
+                        });
                         break;
                     }
                 }
@@ -368,65 +405,107 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let poll_timeout = if engine.has_active_input() {
             Duration::from_millis(16)
         } else {
-            if last_event_time.elapsed() < Duration::from_secs(1) { Duration::from_millis(10) }
-            else if last_event_time.elapsed() > Duration::from_secs(5) { Duration::from_millis(200) }
-            else { Duration::from_millis(50) }
+            Duration::from_millis(16)
         };
 
         if event::poll(poll_timeout)? {
-            last_event_time = std::time::Instant::now();
 
-            // 清空但保留底层容量
             key_events.clear();
             mouse_events.clear();
 
+            // 防御 crossterm 合并按键的 OSC 过滤状态机
+            let mut osc_state = 0; // 0=正常, 1=看到了ESC, 2=确认在OSC序列中, 3=OSC中看到了ESC
+
             loop {
                 match event::read()? {
-                    Event::Key(k) => key_events.push(k),
+                    Event::Key(k) => {
+                        match osc_state {
+                            0 => {
+                                // 【关键修复】同时拦截单独的 Esc 和 crossterm 合并的 Alt+]
+                                if k.code == crossterm::event::KeyCode::Esc {
+                                    osc_state = 1;
+                                } else if k.code == crossterm::event::KeyCode::Char(']') && k.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+                                    osc_state = 2; // 捕获到合并键，直接进入丢弃模式
+                                } else {
+                                    key_events.push(k);
+                                }
+                            }
+                            1 => {
+                                if k.code == crossterm::event::KeyCode::Char(']') {
+                                    osc_state = 2;
+                                } else {
+                                    key_events.push(crossterm::event::KeyEvent {
+                                        code: crossterm::event::KeyCode::Esc,
+                                        modifiers: crossterm::event::KeyModifiers::NONE,
+                                        kind: crossterm::event::KeyEventKind::Press,
+                                        state: crossterm::event::KeyEventState::NONE,
+                                    });
+                                    if k.code != crossterm::event::KeyCode::Esc {
+                                        key_events.push(k);
+                                        osc_state = 0;
+                                    }
+                                }
+                            }
+                            2 => {
+                                // 在 OSC 序列内部，丢弃所有字符
+                                if k.code == crossterm::event::KeyCode::Char('\u{7}') {
+                                    osc_state = 0; // 遇到 BEL，结束
+                                } else if k.code == crossterm::event::KeyCode::Esc {
+                                    osc_state = 3;
+                                }
+                            }
+                            3 => {
+                                if k.code == crossterm::event::KeyCode::Char('\\') {
+                                    osc_state = 0;
+                                } else {
+                                    osc_state = 0;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     Event::Mouse(m) => {
+                        if osc_state == 1 {
+                            key_events.push(crossterm::event::KeyEvent {
+                                code: crossterm::event::KeyCode::Esc,
+                                modifiers: crossterm::event::KeyModifiers::NONE,
+                                kind: crossterm::event::KeyEventKind::Press,
+                                state: crossterm::event::KeyEventState::NONE,
+                            });
+                            osc_state = 0;
+                        }
+
                         if matches!(m.kind, crossterm::event::MouseEventKind::Drag(_) | crossterm::event::MouseEventKind::Moved) {
                             let should_replace = if let Some(last_m) = mouse_events.last() {
                                 matches!(last_m.kind, crossterm::event::MouseEventKind::Drag(_) | crossterm::event::MouseEventKind::Moved)
-                            } else {
-                                false
-                            };
+                            } else { false };
 
-                            if should_replace {
-                                *mouse_events.last_mut().unwrap() = m;
-                            } else {
-                                mouse_events.push(m);
-                            }
-                        } else {
-                            mouse_events.push(m);
-                        }
+                            if should_replace { *mouse_events.last_mut().unwrap() = m; }
+                            else { mouse_events.push(m); }
+                        } else { mouse_events.push(m); }
                     }
                     _ => {}
                 }
 
                 if !event::poll(Duration::ZERO)? { break; }
-
-                // 【修复】限制单帧最大处理事件数，防止大量鼠标移动事件导致渲染饥饿
                 if key_events.len() + mouse_events.len() > 50 { break; }
-
-                // 【极致丝滑优化】如果在拖拽中，并且已经拿到了最新的鼠标位置，立刻退出去渲染！
-                // 队列里积压的旧 Drag 事件会在下一轮循环中被快速丢弃，绝不阻塞渲染。
                 if engine.drag.active {
                     if let Some(last_m) = mouse_events.last() {
-                        if matches!(last_m.kind, crossterm::event::MouseEventKind::Drag(_) | crossterm::event::MouseEventKind::Moved) {
-                            break;
-                        }
+                        if matches!(last_m.kind, crossterm::event::MouseEventKind::Drag(_) | crossterm::event::MouseEventKind::Moved) { break; }
                     }
                 }
             }
 
-            // 1. 优先处理所有键盘事件
-            for key_event in &key_events {
-                if engine.handle_key_event(key_event, &all_rects, columns, rows) {
-                    break 'main_loop;
-                }
+            if osc_state == 1 {
+                key_events.push(crossterm::event::KeyEvent {
+                    code: crossterm::event::KeyCode::Esc, modifiers: crossterm::event::KeyModifiers::NONE,
+                    kind: crossterm::event::KeyEventKind::Press, state: crossterm::event::KeyEventState::NONE,
+                });
             }
 
-            // 2. 处理鼠标事件
+            for key_event in &key_events {
+                if engine.handle_key_event(key_event, &all_rects, columns, rows) { break 'main_loop; }
+            }
             for mouse_event in &mouse_events {
                 engine.handle_mouse_event(mouse_event, &all_rects, columns, rows, scroll_step, layout_changed);
             }
@@ -465,16 +544,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 【新增】预计算状态栏文本
         engine.update_status_bars(columns, rows, &all_rects);
 
-        // 【异步接收】检查是否有后台预览命令执行完毕
-        while let Ok((view_name, target_id, content)) = engine.async_view_rx.try_recv() {
+        while let Ok((view_name, target_id, content_bytes, is_graphic)) = engine.async_view_rx.try_recv() {
             if let Some(app::Component::View(v)) = engine.components.get_mut(&view_name) {
                 v.is_loading = false;
-                // 只有当返回的结果对应于当前最新选中的 ID 时，才更新缓冲区
                 if v.cached_entity_id == target_id {
-                    // 【修复】如果内容没变，保留滚动位置，防止跳动
-                    if v.content_buffer != content {
-                        v.content_buffer = content;
+
+                    // 【修复】检测内容是否真的改变了，防止相同图片重复渲染导致卡顿！
+                    let changed = match &v.content {
+                        app::view::ViewContent::Graphic(old_bytes) => {
+                            if is_graphic {
+                                // 对比新旧字节流，只有不一样才重绘
+                                old_bytes.as_slice() != content_bytes.as_slice()
+                            } else {
+                                true
+                            }
+                        }
+                        _ => true,
+                    };
+
+                    if changed {
+                        // 【修复缺失的代码】在这里检测是否从图片切换到了非图片
+                        let was_graphic = matches!(v.content, app::view::ViewContent::Graphic(_));
+                        let will_be_graphic = is_graphic;
+
+                        if was_graphic && !will_be_graphic {
+                            v.needs_graphic_clear = true; // 触发物理擦除旧图片像素！
+                        }
+
+                        v.content = if is_graphic {
+                            app::view::ViewContent::Graphic(content_bytes)
+                        } else {
+                            let text = String::from_utf8_lossy(&content_bytes).to_string();
+                            app::view::ViewContent::Text(text)
+                        };
                         v.scroll_offset = 0;
+                        v.graphic_dirty = true; // 只有真正改变时才标记 dirty
                     }
                     engine.mark_dirty(&view_name);
                 }

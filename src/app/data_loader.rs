@@ -30,26 +30,31 @@ impl Engine {
         for (view_name, comp) in self.components.iter_mut() {
             if let Component::View(v) = comp {
                 let new_cached_id = selected_entity.as_ref().map(|e| e.id.clone());
-                if v.cached_entity_id == new_cached_id && !v.content_buffer.is_empty() { continue; }
+
+                let is_empty = matches!(v.content, crate::app::view::ViewContent::Empty);
+                if v.cached_entity_id == new_cached_id && !is_empty { continue; }
+
                 if v.is_loading { self.pending_view_reload.insert(view_name.clone()); continue; }
 
                 let width_str = v.rect_width.to_string();
                 let height_str = v.rect_height.to_string();
                 let template_args_vec = crate::config::split_args(&v.cmd_template);
 
-                // 如果命令不依赖选中实体（如静态帮助菜单），且已有内容，则不参与 Tree 选中变化的自动重载！
                 let depends_on_selection = template_args_vec.iter().any(|arg|
                     arg.contains("{id}") || arg.contains("{path}") || arg.contains("{display}") ||
                     arg.contains("{tags}") || arg.contains("{ids}") || arg.contains("{paths}")
                 );
-                if !depends_on_selection && !v.content_buffer.is_empty() {
+                if !depends_on_selection && !is_empty {
                     continue;
+                }
+
+                // 【核心魔法】杀掉上一个还在跑的预览进程树！防止孤儿进程吃 CPU
+                if let Some(pid) = v.child_pid.lock().unwrap().take() {
+                    crate::exec::kill_process_group(pid);
                 }
 
                 v.cached_entity_id = new_cached_id.clone();
                 v.is_loading = true;
-
-                // 【新增】切换节点时，重置水平和垂直滚动位置，从头展示新内容
                 v.h_scroll = 0;
                 v.scroll_offset = 0;
 
@@ -60,7 +65,9 @@ impl Engine {
                 let full_cmd_args = exec::replace_placeholders_in_args(&template_args_vec, &ctx);
 
                 if full_cmd_args.is_empty() || (full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) {
-                    v.content_buffer = String::new(); v.scroll_offset = 0; v.is_loading = false;
+                    v.content = crate::app::view::ViewContent::Empty;
+                    v.scroll_offset = 0;
+                    v.is_loading = false;
                     dirty_views.push(view_name.clone()); continue;
                 }
 
@@ -69,14 +76,27 @@ impl Engine {
                 let target_id_clone = new_cached_id.clone();
                 let max_lines = self.max_lines;
 
+                // 克隆 PID 共享指针传给后台线程
+                let child_pid = v.child_pid.clone();
+
                 std::thread::spawn(move || {
-                    let result = std::panic::catch_unwind(|| { crate::exec::execute_command_args(&full_cmd_args, max_lines) });
-                    let content = match result {
-                        Ok(Ok((code, stdout))) => if code != 0 && stdout.trim().is_empty() { format!("[ERR] Command exited with code {}", code) } else { stdout },
-                        Ok(Err(e)) => format!("[ERR] {}", e),
-                        Err(_) => "[ERR] Background thread panicked".to_string(),
+                    let result = std::panic::catch_unwind(|| {
+                        crate::exec::execute_command_args(&full_cmd_args, max_lines, child_pid)
+                    });
+
+                    let (content_bytes, is_graphic): (Vec<u8>, bool) = match result {
+                        Ok(Ok((code, stdout, is_graphic))) => {
+                            let is_blank = stdout.iter().all(|&b| b.is_ascii_whitespace());
+                            if code != 0 && is_blank {
+                                (format!("[ERR] Command exited with code {}\n", code).into_bytes(), false)
+                            } else {
+                                (stdout, is_graphic)
+                            }
+                        },
+                        Ok(Err(e)) => (format!("[ERR] {}\n", e).into_bytes(), false),
+                        Err(_) => (b"[ERR] Background thread panicked\n".to_vec(), false),
                     };
-                    let _ = tx.send((view_name_clone, target_id_clone, content));
+                    let _ = tx.send((view_name_clone, target_id_clone, content_bytes, is_graphic));
                 });
             }
         }
@@ -92,8 +112,6 @@ impl Engine {
                 let window_name = view_name.clone();
                 let template_args_vec = crate::config::split_args(&v.cmd_template);
 
-                // 【优化】如果是依赖选中实体的动态视图，跳过初始化同步执行，
-                // 交给 broadcast_selection_changed 进行异步加载，防止闪烁和错误输出。
                 let depends_on_selection = template_args_vec.iter().any(|arg|
                     arg.contains("{id}") || arg.contains("{path}") || arg.contains("{display}") ||
                     arg.contains("{tags}") || arg.contains("{ids}") || arg.contains("{paths}")
@@ -107,24 +125,38 @@ impl Engine {
 
                 if full_cmd_args.is_empty() || (full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) { continue; }
 
-                match exec::execute_command_args(&full_cmd_args, self.max_lines) {
-                    Ok((code, stdout)) => {
-                        v.content_buffer = if code != 0 && stdout.trim().is_empty() { format!("[ERR] Command exited with code {}", code) } else { stdout };
+                // 传入 PID 共享指针
+                match exec::execute_command_args(&full_cmd_args, self.max_lines, v.child_pid.clone()) {
+                    Ok((code, stdout_bytes, is_graphic)) => {
+                        let is_blank = stdout_bytes.iter().all(|&b| b.is_ascii_whitespace());
+                        let content_bytes = if code != 0 && is_blank {
+                            format!("[ERR] Command exited with code {}\n", code).into_bytes()
+                        } else {
+                            stdout_bytes
+                        };
+
+                        v.content = if is_graphic {
+                            crate::app::view::ViewContent::Graphic(content_bytes)
+                        } else {
+                            let text = String::from_utf8_lossy(&content_bytes).to_string();
+                            crate::app::view::ViewContent::Text(text)
+                        };
                         v.scroll_offset = 0;
+                        v.graphic_dirty = true;
                     }
-                    Err(e) => { v.content_buffer = format!("[ERR] {}", e); }
+                    Err(e) => {
+                        v.content = crate::app::view::ViewContent::Text(format!("[ERR] {}", e));
+                    }
                 }
             }
         }
     }
 
     pub fn handle_ipc_update(&mut self, target: &str, data: &str, term_width: u16, term_height: u16) {
-        // 1. 优先处理系统控制指令 (@exit, @layout-reset, @layout-show/hide)
         if self.handle_system_command(target) {
-            return; // 如果是系统指令，处理完直接返回，不再走数据更新逻辑
+            return;
         }
 
-        // 2. 处理组件数据更新 (Tree, View, StatusBar)
         if let Some(comp) = self.components.get_mut(target) {
             match comp {
                 Component::Tree(t) => {
@@ -141,6 +173,9 @@ impl Engine {
                         t.root_tree = crate::tree::build_tree(&t.dataset);
                         let valid_ids: HashSet<_> = t.dataset.entity_map.keys().cloned().collect();
                         t.expanded_ids.retain(|id| valid_ids.contains(id));
+                        // 【核心修复】当收到全新的目录数据时，自动清除搜索状态！
+                        // 防止切换目录后，旧的搜索词继续过滤新目录的内容。
+                        t.search_query = None;
                         t.rebuild_visible_ids();
                         if let Some(id) = old_selected_id {
                             t.select_id(&id);
@@ -155,13 +190,12 @@ impl Engine {
                     self.mark_dirty(target);
                 }
                 Component::View(v) => {
-                    v.content_buffer = data.to_string();
+                    v.content = crate::app::view::ViewContent::Text(data.to_string());
                     v.scroll_offset = 0;
                     v.cached_entity_id = None;
                     self.mark_dirty(target);
                 }
                 Component::StatusBar(s) => {
-                    // 不再永久覆盖模板，改为临时消息，3秒后自动消失
                     s.message = Some(data.to_string());
                     s.message_expire = Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                     self.mark_dirty(target);
@@ -171,7 +205,6 @@ impl Engine {
         }
     }
 
-    /// 【新增】专门处理 @ 开头的引擎系统控制指令
     fn handle_system_command(&mut self, target: &str) -> bool {
         match target {
             "@exit" => {
@@ -185,7 +218,6 @@ impl Engine {
                 self.mark_all_dirty();
                 true
             }
-            // 【新增】清理所有 Tree 组件的标记状态
             "@clear-marks" => {
                 let mut cleared = false;
                 for comp in self.components.values_mut() {
@@ -208,8 +240,23 @@ impl Engine {
                 } else if let Some(layer_name) = target.strip_prefix("@layout-hide ") {
                     self.set_layout_visible(layer_name.trim(), false);
                     true
+                } else if let Some(args) = target.strip_prefix("@select ") {
+                    let parts: Vec<&str> = args.splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        self.select_id(parts[0], parts[1]);
+                    }
+                    true
+                } else if let Some(args) = target.strip_prefix("@title ") {
+                    let parts: Vec<&str> = args.splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        if let Some(Component::Tree(t)) = self.components.get_mut(parts[0]) {
+                            t.title_override = Some(parts[1].to_string());
+                            self.mark_dirty(parts[0]);
+                        }
+                    }
+                    true
                 } else {
-                    false // 不是系统指令，交给数据更新逻辑处理
+                    false
                 }
             }
         }
@@ -231,7 +278,6 @@ impl Engine {
             if let Some(cmd) = source_cmd {
                 let tx = self.async_reload_tx.clone();
                 let name_clone = name.clone();
-                // 【修复】放入后台线程执行，彻底解除主线程阻塞
                 std::thread::spawn(move || {
                     let result = crate::exec::execute_reload_hook(Some(&cmd));
                     let _ = tx.send((name_clone, result));

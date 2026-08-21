@@ -45,7 +45,16 @@ pub fn draw_border(buf: &mut Buffer, rect: &WindowRect, title: Option<&str>, bor
             if let Some(t) = title {
                 if !t.is_empty() {
                     let title_str = format!(" {} ", t);
-                    if width >= title_str.chars().count() + 2 { top_line.push_str(&title_str); }
+                    let max_title_len = width.saturating_sub(2); // 留位置给左右角
+
+                    if title_str.chars().count() > max_title_len && width > 4 {
+                        // 【修复】截断并加上 ..
+                        let truncated: String = title_str.chars().take(max_title_len.saturating_sub(2)).collect();
+                        top_line.push_str(&truncated);
+                        top_line.push_str("..");
+                    } else if width >= title_str.chars().count() + 2 {
+                        top_line.push_str(&title_str);
+                    }
                 }
             }
             let current_len = top_line.chars().count();

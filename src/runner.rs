@@ -1,7 +1,6 @@
 // src/runner.rs
 
 use crate::app::Engine;
-use crate::exec;
 use crossterm::{terminal, ExecutableCommand, cursor, event::{EnableMouseCapture, DisableMouseCapture}};
 use std::io::{stdout, Write};
 use std::process::{Command, Stdio};

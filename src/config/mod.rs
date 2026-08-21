@@ -76,27 +76,39 @@ impl BindConfig {
     }
 
     pub fn get_scoped(&self, scope: Option<&str>, key: &KeyEvent) -> Option<&(Vec<String>, bool)> {
-        let scope_str = scope.map(|s| s.to_string());
-        if let Some(map) = self.bindings.get(&scope_str) {
-            let mut code = key.code;
-            let mut modifiers = key.modifiers;
+        // 1. 预处理按键：处理 Shift 组合键的归一化
+        let mut code = key.code;
+        let mut modifiers = key.modifiers;
 
-            if modifiers == KeyModifiers::SHIFT {
-                if let KeyCode::Char(c) = code {
-                    if c.is_ascii_alphabetic() {
-                        modifiers = KeyModifiers::NONE;
-                        if c.is_ascii_lowercase() {
-                            code = KeyCode::Char(c.to_ascii_uppercase());
-                        }
+        if modifiers == KeyModifiers::SHIFT {
+            if let KeyCode::Char(c) = code {
+                if c.is_ascii_alphabetic() {
+                    modifiers = KeyModifiers::NONE;
+                    if c.is_ascii_lowercase() {
+                        code = KeyCode::Char(c.to_ascii_uppercase());
                     }
                 }
             }
+        }
 
-            let k = KeyBindingKey(code, modifiers);
+        let k = KeyBindingKey(code, modifiers);
+
+        // 2. 先尝试在指定的作用域中查找
+        if let Some(s) = scope {
+            if let Some(map) = self.bindings.get(&Some(s.to_string())) {
+                if let Some(res) = map.get(&k) {
+                    return Some(res);
+                }
+            }
+        }
+
+        // 3. 如果作用域没找到，穿透回全局作用域
+        if let Some(map) = self.bindings.get(&None) {
             if let Some(res) = map.get(&k) {
                 return Some(res);
             }
         }
+
         None
     }
 
@@ -109,6 +121,98 @@ impl BindConfig {
         }
         let global_key = (None, signal.to_string());
         self.signal_bindings.get(&global_key)
+    }
+    /// 严格只在指定作用域内查找，不穿透回全局。用于输入框激活时防止全局按键干扰。
+    pub fn get_scoped_strict(&self, scope: Option<&str>, key: &KeyEvent) -> Option<&(Vec<String>, bool)> {
+        let mut code = key.code;
+        let mut modifiers = key.modifiers;
+
+        if modifiers == KeyModifiers::SHIFT {
+            if let KeyCode::Char(c) = code {
+                if c.is_ascii_alphabetic() {
+                    modifiers = KeyModifiers::NONE;
+                    if c.is_ascii_lowercase() {
+                        code = KeyCode::Char(c.to_ascii_uppercase());
+                    }
+                }
+            }
+        }
+
+        let k = KeyBindingKey(code, modifiers);
+
+        if let Some(s) = scope {
+            if let Some(map) = self.bindings.get(&Some(s.to_string())) {
+                return map.get(&k);
+            }
+        }
+
+        None
+    }
+
+    /// 【新增】按 Keymap 继承链查找按键绑定
+    pub fn get_keymap(&self, keymaps: &[Option<&str>], key: &KeyEvent) -> Option<&(Vec<String>, bool)> {
+        let mut code = key.code;
+        let mut modifiers = key.modifiers;
+
+        if modifiers == KeyModifiers::SHIFT {
+            if let KeyCode::Char(c) = code {
+                if c.is_ascii_alphabetic() {
+                    modifiers = KeyModifiers::NONE;
+                    if c.is_ascii_lowercase() { code = KeyCode::Char(c.to_ascii_uppercase()); }
+                }
+            }
+        }
+        let k = KeyBindingKey(code, modifiers);
+
+        for &map_name in keymaps {
+            let map_key = map_name.map(|s| s.to_string());
+            if let Some(map) = self.bindings.get(&map_key) {
+                if let Some(res) = map.get(&k) {
+                    return Some(res);
+                }
+            }
+        }
+        None
+    }
+
+    /// 【新增】严格只在指定的 Keymap 链中查找（跳过 None/全局默认），用于 Input 防穿透
+    pub fn get_keymap_strict(&self, keymaps: &[Option<&str>], key: &KeyEvent) -> Option<&(Vec<String>, bool)> {
+        let mut code = key.code;
+        let mut modifiers = key.modifiers;
+
+        if modifiers == KeyModifiers::SHIFT {
+            if let KeyCode::Char(c) = code {
+                if c.is_ascii_alphabetic() {
+                    modifiers = KeyModifiers::NONE;
+                    if c.is_ascii_lowercase() { code = KeyCode::Char(c.to_ascii_uppercase()); }
+                }
+            }
+        }
+        let k = KeyBindingKey(code, modifiers);
+
+        for &map_name in keymaps {
+            if map_name.is_some() { // 严格模式跳过 None
+                let map_key = map_name.map(|s| s.to_string());
+                if let Some(map) = self.bindings.get(&map_key) {
+                    if let Some(res) = map.get(&k) {
+                        return Some(res);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 【新增】按 Keymap 继承链查找信号绑定
+    pub fn get_signal_binding_keymap(&self, keymaps: &[Option<&str>], signal: &str) -> Option<&(Vec<String>, bool)> {
+        for &map_name in keymaps {
+            let map_key = map_name.map(|s| s.to_string());
+            let key = (map_key, signal.to_string());
+            if let Some(b) = self.signal_bindings.get(&key) {
+                return Some(b);
+            }
+        }
+        None
     }
 }
 
@@ -202,6 +306,7 @@ fn parse_key_desc(desc: &str) -> Option<KeyEvent> {
         "space" => KeyCode::Char(' '), "up" => KeyCode::Up, "down" => KeyCode::Down,
         "left" => KeyCode::Left, "right" => KeyCode::Right, "home" => KeyCode::Home,
         "end" => KeyCode::End, "pageup" => KeyCode::PageUp, "pagedown" => KeyCode::PageDown,
+        "quote" => KeyCode::Char('\''),
         s if s.chars().count() == 1 => {
             let c = key_part_original.chars().next().unwrap();
             KeyCode::Char(c)

@@ -120,28 +120,33 @@ pub fn calc_window_rects(
 
     for layer in layers {
         if !layer.visible { continue; }
-        let canvas = match &layer.anchor {
-            Anchor::FullScreen => WindowRect {
-                start_col: 0,
-                start_row: 0,
-                width: term_width,
-                height: term_height,
-            },
-            Anchor::ScreenAbsolute { x, y } => {
-                let actual_x = match x {
-                    Coord::Pixels(p) => *p,
-                    Coord::Percent(p) => (*p as u32 * term_width as u32 / 100) as u16,
-                };
-                let actual_y = match y {
-                    Coord::Pixels(p) => *p,
-                    Coord::Percent(p) => (*p as u32 * term_height as u32 / 100) as u16,
-                };
 
-                WindowRect {
-                    start_col: actual_x.min(term_width.saturating_sub(1)),
-                    start_row: actual_y.min(term_height.saturating_sub(1)),
-                    width: term_width.saturating_sub(actual_x),
-                    height: term_height.saturating_sub(actual_y),
+        // 【新增】优先使用运行时拖拽覆盖（浮动窗口专用）
+        let canvas = if let Some(override_rect) = layer.runtime_rect_override {
+            override_rect
+        } else {
+            match &layer.anchor {
+                Anchor::FullScreen => WindowRect {
+                    start_col: 0,
+                    start_row: 0,
+                    width: term_width,
+                    height: term_height,
+                },
+                Anchor::ScreenAbsolute { x, y } => {
+                    let actual_x = match x {
+                        Coord::Pixels(p) => *p,
+                        Coord::Percent(p) => (*p as u32 * term_width as u32 / 100) as u16,
+                    };
+                    let actual_y = match y {
+                        Coord::Pixels(p) => *p,
+                        Coord::Percent(p) => (*p as u32 * term_height as u32 / 100) as u16,
+                    };
+                    WindowRect {
+                        start_col: actual_x.min(term_width.saturating_sub(1)),
+                        start_row: actual_y.min(term_height.saturating_sub(1)),
+                        width: term_width.saturating_sub(actual_x),
+                        height: term_height.saturating_sub(actual_y),
+                    }
                 }
             }
         };
@@ -169,14 +174,18 @@ fn compute_rects(
     match node {
         LayoutNode::Window { name, border, size, .. } => {
             let mut final_rect = rect;
-            match size {
+
+            // 【终极修复】必须优先使用 overrides 中的尺寸！
+            let effective_size = overrides.get(name).copied().or(*size);
+
+            match effective_size {
                 Some(WindowSize::Absolute2D(w, h)) => {
-                    final_rect.width = *w;
-                    final_rect.height = *h;
+                    final_rect.width = w;   // 去掉 * 号
+                    final_rect.height = h;  // 去掉 * 号
                 }
                 Some(WindowSize::Percent2D(w, h)) => {
-                    final_rect.width = (*w as u32 * rect.width as u32 / 10000) as u16;
-                    final_rect.height = (*h as u32 * rect.height as u32 / 10000) as u16;
+                    final_rect.width = (w as u32 * rect.width as u32 / 10000) as u16;   // 去掉 * 号
+                    final_rect.height = (h as u32 * rect.height as u32 / 10000) as u16;  // 去掉 * 号
                 }
                 _ => {}
             }

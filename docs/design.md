@@ -682,3 +682,182 @@ if visited.contains(child_id) {
 ### 总结
 
 我们用 **O(1) 的缓存查询**换取了极致的交互性能。代价是面临“外部并发修改导致缓存过期”的微小风险。但这被 Rust 引擎底层的**防环截断机制**完美兜底，且通过脚本末尾的**自动重建索引**，在 99% 的正常 TUI 交互场景下保证了强一致性。这是一个极其优秀的工程权衡。
+
+----
+
+为什么图片解析会很慢？
+chafa 并不是一个简单的“复制粘贴”工具。当它面对一张图片时，它需要：
+
+把 JPEG/PNG 解码成内存中的原始像素点阵。
+根据终端尺寸，在 CPU 上重新缩放图片。
+把每一个像素点转换为 Sixel 图形协议的专用字节流。
+这个过程全靠 CPU 硬算，非常耗时。如果是高分辨率的图片，延迟会非常明显。
+
+为什么结束时正好触发 Rename？（它真的在问终端！）
+你猜得完全正确！chafa 在运行和结束时，为了确认终端的能力和背景色，确实会向终端发起询问。
+
+更糟糕的是，我刚刚发现了之前那个“状态机”为什么失效的根本原因：
+stree 使用的底层库 crossterm 有一个坑爹的特性：当它从输入流读到 ESC 紧接着 ] 时，它经常不会把这当成两个独立的按键，而是自动合并成一个 Alt + ] 按键事件抛给上层！
+因为我之前的状态机在等待先收到 Esc，再收到 ]，所以它完美错过了 crossterm 合并后的 Alt+]，导致防线被击穿，后面的 r 泄漏给了 Rename。
+
+
+i-----------
+
+这是一个非常实际的问题。简短的回答是：**你不需要修改 `stree` 引擎的任何 Rust 代码，仅仅通过修改 Shell 脚本就能实现 Type 1 (fzf 风格)！**
+
+这正是 `stree` 架构的魅力所在：引擎已经提供了足够的“积木”，你只需要用脚本把它们拼起来。
+
+如果你想实现一个“按 `f` 键弹出浮动搜索窗口，输入文字过滤，选中后按 `Enter` 打开并关闭窗口”的纯 fzf 体验，只需要按照以下步骤修改你的 `stree-fm`：
+
+### 1. 修改入口文件 `stree-fm` (注册浮动层和按键)
+
+在 `stree-fm/bin/stree-fm` 中，增加一个浮动层 `FzfTree`，并绑定相关按键：
+
+```sh
+  # 增加一个浮动层用于 fzf 搜索
+  --layout "|@(20%,20%) area(60%,60%)[box,drag]:FzfTree" \
+  \
+  # 注册 FzfTree，它的数据源是 fzf-scan.sh (会输出所有文件)
+  --tree "FzfTree:$VIEW_BIN/fzf-scan.sh" \
+  \
+  # 在 FzfTree 中的作用域绑定
+  # 按 / 激活搜索 (复用 SearchLeft 输入框，引擎会自动过滤当前聚焦的 FzfTree)
+  --bind "FzfTree:/=__ACTIVATE_INPUT__ SearchLeft" \
+  # 按 Enter 打开文件并关闭浮动窗
+  --bind "FzfTree:enter=@$VIEW_BIN/fzf-open-and-close.sh {path}" \
+  # 按 Esc 或 q 关闭浮动窗
+  --bind "FzfTree:esc=__HIDE_LAYOUT__ FzfTree" \
+  --bind "FzfTree:q=__HIDE_LAYOUT__ FzfTree" \
+  \
+  # 全局按 f 键，弹出 fzf 浮动窗
+  --bind "f=__TOGGLE_LAYOUT__ FzfTree" \
+```
+
+### 2. 创建数据源 `fzf-scan.sh`
+
+这个脚本负责把所有文件（可以递归）输出给 `stree`。为了简单，你可以直接复用 `fm-scan.sh` 的逻辑，但不分页，或者用 `find` 递归。
+
+创建 `stree-fm/bin/fzf-scan.sh`：
+```sh
+#!/bin/sh
+. "$STREE_COMMON_LIB/_common.sh"
+suite_init
+
+# 读取当前面板路径
+ACTIVE_PANE="$(cat "$STATE_DIR/last_focus_pane" 2>/dev/null)"
+[ -z "$ACTIVE_PANE" ] && ACTIVE_PANE="Left"
+CWD="$(suite_get_cwd_for "$ACTIVE_PANE")"
+
+cd "$CWD" 2>/dev/null || exit 1
+
+# 简单输出当前目录及子目录的文件 (你可以用 find 限制深度)
+find . -maxdepth 3 -type f 2>/dev/null | while read -r f; do
+    # 去掉开头的 ./
+    name="${f#./}"
+    printf "%s\t%s\t%s/%s\tfile\n" "$name" "$name" "$CWD" "$name"
+done
+```
+
+### 3. 创建打开并关闭的脚本 `fzf-open-and-close.sh`
+
+当用户在 `FzfTree` 中按 `Enter` 时，执行打开操作，然后隐藏浮动层。
+
+创建 `stree-fm/bin/fzf-open-and-close.sh`：
+```sh
+#!/bin/sh
+. "$STREE_COMMON_LIB/_common.sh"
+suite_init
+
+TARGET_PATH="$1"
+[ -z "$TARGET_PATH" ] && exit 0
+
+ACTIVE_PANE="$(cat "$STATE_DIR/last_focus_pane" 2>/dev/null)"
+[ -z "$ACTIVE_PANE" ] && ACTIVE_PANE="Left"
+
+# 如果是目录，就 cd 过去；如果是文件，就用编辑器打开
+if [ -d "$TARGET_PATH" ]; then
+    suite_set_cwd "$ACTIVE_PANE" "$TARGET_PATH"
+    suite_fm_refresh "$ACTIVE_PANE"
+    ipc_ok " Jumped to: $TARGET_PATH"
+else
+    # 比如用默认编辑器打开 (因为带了 @，所以这里不能挂起 TUI，只能提示或者后台打开)
+    ipc_info " Press 'e' to edit: $(basename "$TARGET_PATH")"
+fi
+
+# 核心魔法：隐藏 Fzf 浮动窗！
+stree update "@layout-hide FzfTree" >/dev/null 2>&1
+exit 0
+```
+
+### 工作流演示 (纯 Type 1 体验)：
+
+1. 你在 `LeftTree` 浏览文件。
+2. 按下 `f` 键。屏幕中央瞬间弹出 `FzfTree` 浮动窗（里面列出了当前目录的所有文件）。
+3. 按下 `/` 键，底部状态栏变成搜索框。
+4. 输入 `abc`，浮动窗里的列表实时过滤。
+5. 找到目标后，按 `Esc` 退出搜索框（或者直接按 `Enter` 退出搜索框，光标留在高亮项上）。
+6. 再按一次 `Enter`，触发 `FzfTree:enter`，执行 `fzf-open-and-close.sh`。
+7. 文件被打开（或目录被跳转），**浮动窗自动关闭**，焦点切回 `LeftTree`。
+
+### 总结
+你看，不需要动一行 Rust 代码，`stree` 的原生搜索过滤 + 浮动图层 + 按键作用域，完美组合出了一个 fzf 风格的模态选择器！这正是“机制与策略分离”带来的红利。
+
+----
+
+well, we need in sync, your means '绝不穿透回全局！' each view conponent have a suit of default key binding, and it only works on view you just focus, right? not through floating and works on the bottommost components? right? or the stree will take the key event on what i haven't focus? that is totally bug?
+
+to give each view the entire default key binding and give it noop for cancel, is a better way than key penetration?
+
+
+so , what is the situation of stree now? does it penetrate key to other non-floating views?
+
+
+
+思考过程
+这是一个非常深刻的架构问题！我需要澄清一下 stree 目前的真实行为，因为“穿透”这个词可能引起了误解。
+
+1. stree 现在的真实情况：焦点绝对隔离，穿透只朝一个方向
+首先，请你一万个放心：stree 绝对不会把按键事件发送给“没有获得焦点”的视图！
+
+在 stree 引擎底层，焦点系统是极其严格的：
+
+任何时候，只有一个组件能获得焦点（比如 LeftTree 或 Bookmarks）。
+如果你焦点在 LeftTree，按 h，引擎绝对不会把这个 h 事件发给 RightTree 或底下的 Preview。它们完全不知道你按了 h。
+那么，“穿透”到底是指什么？
+“穿透”不是指事件穿透到其他视图，而是指按键绑定的查找逻辑穿透到了全局配置。
+
+引擎的查找逻辑是这样的：
+
+焦点在 Bookmarks，按下 h。
+引擎去查 Bookmarks:h 绑定了什么？发现没绑定。
+引擎 回退（穿透） 去查全局的 h 绑定了什么。发现全局绑定了 h=@fm-cd-up.sh {window}。
+引擎执行这个全局脚本，并把当前焦点组件的名字 {window}（也就是 Bookmarks）作为参数传给它。
+Bug 产生的根源：
+全局的 h 脚本 (fm-cd-up.sh) 是为文件浏览设计的，它期望收到 Left 或 Right。但穿透导致它收到了 Bookmarks，于是脚本内部逻辑错乱，尝试去获取 Bookmarks 的目录路径，导致不可预知的错误或静默失败。
+
+2. 两种设计哲学的对比
+你提出的方案是：“为每个视图提供完整的默认按键绑定，并用 noop 取消不需要的按键。”
+这被称为 “严格作用域模式” 。
+
+特性
+当前设计：默认穿透 + 防火墙
+你的提议：严格隔离 + NOOP
+配置量	极小。全局写一次 j=__DOWN__，所有组件复用。	极大。必须为 Left、Right、Bookmarks 各写一遍 j=__DOWN__。
+安全性	需要手动在浮动窗里拦截危险键（如 h）。	绝对安全。未声明的按键天然失效，不会误触全局脚本。
+灵活性	高。新增组件自动继承全局行为。	低。新增组件必须显式声明所有需要的按键。
+
+3. 哪种方式更好？
+在 TUI 框架设计中， “默认穿透 + 允许手动拦截” 是更主流的做法（比如 vim 的模式映射、tmux 的按键表）。
+
+为什么？因为在 90% 的情况下，组件之间的行为是相似的（j/k 都是上下移动）。如果用严格隔离，你的 stree-fm 入口文件会膨胀到几百行，全都是重复的 LeftTree:j=__DOWN__, RightTree:j=__DOWN__...，这违背了 Unix 哲学中的 DRY (Don't Repeat Yourself) 原则。
+
+但是，对于那 10% 的特殊情况（如模态浮动窗 Bookmarks），我们需要一个开关来关闭穿透。
+
+这就是我们刚刚发明的 __NOOP__ 的真正用途：
+它不是为了让你去给每个按键都写 NOOP，而是只针对那些“全局有绑定，但在当前组件会引起 Bug”的危险键，用 __NOOP__ 建立一堵精准的防火墙。
+
+总结
+按键不会乱飞：stree 的事件分发绝对只作用于当前焦点视图。
+穿透是配置查找的回退：它为了让你少写配置而存在。
+最佳实践：保持当前的“穿透”机制，只在 Bookmarks 这种特殊组件里，用 __NOOP__ 拦截掉 h、l 等会引起冲突的危险键。这就是兼顾“配置简洁”与“状态安全”的终极解法！
+

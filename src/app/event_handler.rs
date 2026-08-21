@@ -1,5 +1,6 @@
 // src/app/event_handler.rs
 use crate::app::{Component, Engine, Focus, InternalCommand};
+use crate::exec;
 use crate::layout::{WindowRect, BorderStyle};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind, MouseButton};
 
@@ -25,8 +26,20 @@ impl Engine {
 
         if self.last_error.is_some() { self.last_error = None; }
 
-        let active_scope = self.overlay_stack.last().map(|l| l.source.as_str());
-        let binding_opt = self.prepare_key_binding_args(active_scope, key, columns, rows);
+        // 1. 构建 Keymap 继承链
+        let active_keymaps_owned = self.get_active_keymaps();
+        let active_keymaps: Vec<Option<&str>> = active_keymaps_owned.iter().map(|s| s.as_deref()).collect();
+
+        // 2. 查找按键绑定
+        let mut binding_opt = self.prepare_key_binding_args_keymap(&active_keymaps, key, columns, rows);
+
+        // 3. 输入框激活时的防穿透逻辑
+        if !self.overlay_stack.is_empty() {
+            let has_scoped_binding = self.key_bindings.get_keymap_strict(&active_keymaps, key).is_some();
+            if !has_scoped_binding {
+                binding_opt = None; // 丢弃全局绑定，让它掉进 handle_input_key
+            }
+        }
 
         if let Some((full_cmd_args, is_silent)) = binding_opt {
             if let Some(internal_cmd) = InternalCommand::from_args(&full_cmd_args) {
@@ -78,50 +91,8 @@ impl Engine {
                     InternalCommand::Enter => {
                         if let Some(_layer) = self.overlay_stack.last().cloned() {
                             if let Some((input_name, result)) = self.handle_input_key(*key) {
-                                match result {
-                                    crate::app::input::InputKeyResult::Submitted(text) => {
-                                        let is_search = self.components.get(&input_name)
-                                            .map(|c| matches!(c, Component::Input(i) if i.is_search))
-                                            .unwrap_or(false);
-                                        if is_search {
-                                            self.apply_search(&text, columns, rows);
-                                        } else {
-                                            self.submit_input(&input_name, &text, columns, rows);
-                                        }
-                                        self.close_overlay(&input_name);
-                                    }
-                                    crate::app::input::InputKeyResult::Cancelled => {
-                                        self.close_overlay(&input_name);
-                                        let is_search = self.components.get(&input_name)
-                                            .map(|c| matches!(c, Component::Input(i) if i.is_search))
-                                            .unwrap_or(false);
-                                        if is_search {
-                                            if let Focus::Component(focused_name) = self.focus.current.clone() {
-                                                if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
-                                                    if t.search_query.take().is_some() {
-                                                        t.rebuild_visible_ids();
-                                                        if !t.visible_ids.is_empty() {
-                                                            t.selected_idx = 0;
-                                                            t.selected_id = Some(t.visible_ids[0].clone());
-                                                        }
-                                                    }
-                                                }
-                                                self.pending_selection_changed = Some(focused_name);
-                                            }
-                                            self.mark_all_dirty();
-                                        }
-                                    }
-                                    crate::app::input::InputKeyResult::Updated => {
-                                        let is_search = self.components.get(&input_name)
-                                            .map(|c| matches!(c, Component::Input(i) if i.is_search))
-                                            .unwrap_or(false);
-                                        if is_search {
-                                            if let Some(buffer) = self.components.get(&input_name).map(|c| if let Component::Input(i) = c { i.buffer.clone() } else { String::new() }) {
-                                                self.apply_search(&buffer, columns, rows);
-                                            }
-                                        }
-                                    }
-                                }
+                                // 【重构】调用提取的方法
+                                self.handle_input_key_result(&input_name, result, columns, rows);
                             }
                         } else {
                             self.toggle_expand();
@@ -143,6 +114,7 @@ impl Engine {
                     InternalCommand::FocusDown => self.focus_direction("down", all_rects),
                     InternalCommand::CloseOverlay(name) => self.close_overlay(&name),
                     InternalCommand::CloseTopOverlay => self.close_top_overlay(),
+                    InternalCommand::Noop => { /* 什么都不做，成功吞掉按键！ */ }
                 }
             } else {
                 crate::runner::execute_binding(self, &full_cmd_args, is_silent, columns, rows);
@@ -151,50 +123,8 @@ impl Engine {
             // 未查到绑定的按键
             if let Some(_layer) = self.overlay_stack.last().cloned() {
                 if let Some((input_name, result)) = self.handle_input_key(*key) {
-                    match result {
-                        crate::app::input::InputKeyResult::Cancelled => {
-                            self.close_overlay(&input_name);
-                            let is_search = self.components.get(&input_name)
-                                .map(|c| matches!(c, Component::Input(i) if i.is_search))
-                                .unwrap_or(false);
-                            if is_search {
-                                if let Focus::Component(focused_name) = self.focus.current.clone() {
-                                    if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
-                                        if t.search_query.take().is_some() {
-                                            t.rebuild_visible_ids();
-                                            if !t.visible_ids.is_empty() {
-                                                t.selected_idx = 0;
-                                                t.selected_id = Some(t.visible_ids[0].clone());
-                                            }
-                                        }
-                                    }
-                                    self.pending_selection_changed = Some(focused_name);
-                                }
-                                self.mark_all_dirty();
-                            }
-                        }
-                        crate::app::input::InputKeyResult::Submitted(text) => {
-                            let is_search = self.components.get(&input_name)
-                                .map(|c| matches!(c, Component::Input(i) if i.is_search))
-                                .unwrap_or(false);
-                            if is_search {
-                                self.apply_search(&text, columns, rows);
-                            } else {
-                                self.submit_input(&input_name, &text, columns, rows);
-                            }
-                            self.close_overlay(&input_name);
-                        }
-                        crate::app::input::InputKeyResult::Updated => {
-                            let is_search = self.components.get(&input_name)
-                                .map(|c| matches!(c, Component::Input(i) if i.is_search))
-                                .unwrap_or(false);
-                            if is_search {
-                                if let Some(buffer) = self.components.get(&input_name).map(|c| if let Component::Input(i) = c { i.buffer.clone() } else { String::new() }) {
-                                    self.apply_search(&buffer, columns, rows);
-                                }
-                            }
-                        }
-                    }
+                    // 【重构】调用提取的方法
+                    self.handle_input_key_result(&input_name, result, columns, rows);
                 }
             }
         }
@@ -227,9 +157,11 @@ impl Engine {
                 let in_y = mouse_event.row >= rect.start_row && mouse_event.row < rect.start_row + rect.height;
 
                 if in_x && in_y {
-                    if let Some(Component::StatusBar(_)) = self.components.get(name) { break; }
+                    // 【修改】扩展免疫防线：StatusBar 和 开启了 no_hover 的组件均不抢夺焦点
+                    if self.is_hover_immune(name) || self.is_unfocusable(name) { break; }
 
                     if self.focus.current != Focus::Component(name.to_string()) {
+
                         let old_focus = self.focus.current.clone();
                         self.focus.current = Focus::Component(name.to_string());
 
@@ -278,11 +210,75 @@ impl Engine {
             }
         }
 
-        // 3. 拖拽中实时记录坐标
+        // 3. 拖拽中实时记录坐标并应用尺寸变更
         if self.drag.active && self.drag.resize_target.is_some() {
             if let MouseEventKind::Drag(MouseButton::Left) = mouse_event.kind {
                 self.drag.last_col = mouse_event.column;
                 self.drag.last_row = mouse_event.row;
+
+                // 【新增】如果是浮动窗口拖拽，直接在此处计算并应用尺寸
+                if let Some(crate::app::DragTarget::ResizeFloating(name, mask)) = &self.drag.resize_target.clone() {
+                    // 必须使用 i32 计算 delta，因为可以向左/向上拖动
+                    let delta_x = self.drag.last_col as i32 - self.drag.start_col as i32;
+                    let delta_y = self.drag.last_row as i32 - self.drag.start_row as i32;
+
+                    let mut new_x = self.drag.initial_anchor_x as i32;
+                    let mut new_y = self.drag.initial_anchor_y as i32;
+                    let mut new_w = self.drag.initial_width as i32;
+                    let mut new_h = self.drag.initial_height as i32;
+
+                    if mask & 1 != 0 { // Left
+                        new_x += delta_x;
+                        new_w -= delta_x;
+                    }
+                    if mask & 2 != 0 { // Right
+                        new_w += delta_x;
+                    }
+                    if mask & 4 != 0 { // Top
+                        new_y += delta_y;
+                        new_h -= delta_y;
+                    }
+                    if mask & 8 != 0 { // Bottom
+                        new_h += delta_y;
+                    }
+
+                    // 碰撞检测与最小尺寸限制
+                    let term_w = columns as i32;
+                    let term_h = rows as i32;
+                    const MIN_W: i32 = 2;
+                    const MIN_H: i32 = 2;
+
+                    if new_w < MIN_W { new_w = MIN_W; }
+                    if new_h < MIN_H { new_h = MIN_H; }
+                    if new_x < 0 { new_x = 0; }
+                    if new_y < 0 { new_y = 0; }
+                    if new_x + new_w > term_w { new_w = term_w - new_x; }
+                    if new_y + new_h > term_h { new_h = term_h - new_y; }
+
+                    let final_x = new_x as u16;
+                    let final_y = new_y as u16;
+                    let final_w = new_w as u16;
+                    let final_h = new_h as u16;
+
+                    // 覆盖窗口本身的尺寸声明
+                    self.window_rect_overrides.insert(
+                        name.clone(),
+                        crate::layout::WindowSize::Absolute2D(final_w, final_h)
+                    );
+
+                    // 覆盖画布尺寸（维持锚点）
+                    let name_clone = name.clone();
+                    for layer in &mut self.layout_layers {
+                        if crate::app::Engine::layout_contains_window(layer, &name_clone) {
+                            layer.runtime_rect_override = Some(crate::layout::WindowRect {
+                                start_col: final_x,
+                                start_row: final_y,
+                                width: final_w,
+                                height: final_h,
+                            });
+                        }
+                    }
+                }
             }
             return;
         }
@@ -381,22 +377,25 @@ impl Engine {
             );
 
             if is_press {
-                let old_focus = self.focus.current.clone();
-                self.focus.current = Focus::Component(name.to_string());
+                // 【防线】如果点击的是 nofocus 组件，不夺焦
+                if !self.is_unfocusable(name) {
+                    let old_focus = self.focus.current.clone();
+                    self.focus.current = Focus::Component(name.to_string());
 
-                if old_focus != self.focus.current {
-                    if let Focus::Component(old_name) = &old_focus {
-                        self.mark_dirty(old_name);
-                    }
-                    self.mark_dirty(name);
-                    for (n, c) in &self.components {
-                        if matches!(c, Component::StatusBar(_)) {
-                            self.dirty_components.insert(n.clone());
+                    if old_focus != self.focus.current {
+                        if let Focus::Component(old_name) = &old_focus {
+                            self.mark_dirty(old_name);
                         }
-                    }
-                    if let Some(Component::Tree(t)) = self.components.get(name) {
-                        if t.focus_to_fire {
-                            self.emit("focus", columns, rows);
+                        self.mark_dirty(name);
+                        for (n, c) in &self.components {
+                            if matches!(c, Component::StatusBar(_)) {
+                                self.dirty_components.insert(n.clone());
+                            }
+                        }
+                        if let Some(Component::Tree(t)) = self.components.get(name) {
+                            if t.focus_to_fire {
+                                self.emit("focus", columns, rows);
+                            }
                         }
                     }
                 }
@@ -489,8 +488,9 @@ impl Engine {
                 }
                 Some(Component::View(_)) => {
                     match mouse_event.kind {
-                        MouseEventKind::ScrollUp => { self.move_up_n(scroll_step as usize); }
-                        MouseEventKind::ScrollDown => { self.move_down_n(scroll_step as usize); }
+                        // 【修改】直接滚动鼠标当前悬停的组件，而不是键盘焦点组件
+                        MouseEventKind::ScrollUp => { self.scroll_target_up(name, scroll_step as usize); }
+                        MouseEventKind::ScrollDown => { self.scroll_target_down(name, scroll_step as usize); }
                         _ => {}
                     }
                 }
@@ -498,5 +498,63 @@ impl Engine {
             }
             break;
         }
+    }
+    // 【新增】判断是否为搜索输入框
+    fn is_search_input(&self, name: &str) -> bool {
+        self.components.get(name)
+            .map(|c| matches!(c, Component::Input(i) if i.is_search))
+            .unwrap_or(false)
+    }
+
+    // 【新增】提取输入结果处理逻辑
+    fn handle_input_key_result(&mut self, input_name: &str, result: crate::app::input::InputKeyResult, columns: u16, rows: u16) {
+        match result {
+            crate::app::input::InputKeyResult::Submitted(text) => {
+                // 移除多余的 & 符号
+                if self.is_search_input(input_name) {
+                    self.apply_search(&text, columns, rows);
+                } else {
+                    self.submit_input(input_name, &text, columns, rows);
+                }
+                self.close_overlay(input_name);
+            }
+            crate::app::input::InputKeyResult::Cancelled => {
+                self.close_overlay(input_name);
+                if self.is_search_input(input_name) {
+                    if let Focus::Component(focused_name) = self.focus.current.clone() {
+                        if let Some(Component::Tree(t)) = self.components.get_mut(&focused_name) {
+                            if t.search_query.take().is_some() {
+                                t.rebuild_visible_ids();
+                                if !t.visible_ids.is_empty() {
+                                    t.selected_idx = 0;
+                                    t.selected_id = Some(t.visible_ids[0].clone());
+                                }
+                            }
+                        }
+                        self.pending_selection_changed = Some(focused_name);
+                    }
+                    self.mark_all_dirty();
+                }
+            }
+            crate::app::input::InputKeyResult::Updated => {
+                if self.is_search_input(input_name) {
+                    // 移除多余的 & 符号
+                    if let Some(buffer) = self.components.get(input_name).map(|c| if let Component::Input(i) = c { i.buffer.clone() } else { String::new() }) {
+                        self.apply_search(&buffer, columns, rows);
+                    }
+                }
+            }
+        }
+    }
+    pub fn prepare_key_binding_args_keymap(&self, keymaps: &[Option<&str>], key: &crossterm::event::KeyEvent, term_width: u16, term_height: u16) -> Option<(Vec<String>, bool)> {
+        let (cmd_template_args, is_silent) = self.key_bindings.get_keymap(keymaps, key)?;
+        let tree_name = self.get_active_tree_name()?;
+        let tree_state = if let Some(Component::Tree(t)) = self.components.get(&tree_name) { t } else { return None; };
+        let selected_entity = tree_state.get_selected_entity();
+        let (ids_str, paths_str) = self.get_target_strings(&tree_name);
+        let window_name = match &self.focus.current { Focus::Component(n) => n.clone(), Focus::None => String::new() };
+        let ctx = Self::build_exec_context(selected_entity, &ids_str, &paths_str, &window_name, &term_width.to_string(), &term_height.to_string(), "", None);
+        let full_cmd_args = exec::replace_placeholders_in_args(cmd_template_args, &ctx);
+        if full_cmd_args.is_empty() || (full_cmd_args.len() == 1 && full_cmd_args[0].trim().is_empty()) { None } else { Some((full_cmd_args, *is_silent)) }
     }
 }

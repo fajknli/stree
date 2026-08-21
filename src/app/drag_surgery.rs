@@ -1,6 +1,6 @@
 use crate::app::{Engine, DragEdge};
-use crate::layout::{LayoutNode, WindowRect, BorderStyle, WindowSize, Direction};
 use std::collections::HashMap;
+use crate::layout::{LayoutNode, LayoutLayer, WindowRect, BorderStyle, WindowSize, Direction};
 
 impl Engine {
     /// 查找两个相邻窗口在父容器中的“原始百分比总和”
@@ -697,7 +697,28 @@ impl Engine {
             _ => None,
         }
     }
-    // 【新增】统一的浮动窗口边缘检测辅助函数
+    // 【新增辅助函数】收集节点下的所有窗口矩形，用于遮挡判定
+    fn collect_node_window_rects(
+        node: &LayoutNode,
+        all_rects: &[(WindowRect, String, BorderStyle, usize)]
+    ) -> Vec<WindowRect> {
+        let mut rects = Vec::new();
+        match node {
+            LayoutNode::Window { name, .. } => {
+                if let Some((r, _, _, _)) = all_rects.iter().find(|(_, n, _, _)| n == name) {
+                    rects.push(*r);
+                }
+            }
+            LayoutNode::Container { children, .. } => {
+                for child in children {
+                    rects.extend(Self::collect_node_window_rects(child, all_rects));
+                }
+            }
+        }
+        rects
+    }
+
+    // 【重写】统一的浮动窗口边缘检测辅助函数，加入遮挡剔除
     pub fn check_floating_edge_hit(
         &self,
         mouse_col: u16,
@@ -705,20 +726,40 @@ impl Engine {
         all_rects: &[(WindowRect, String, BorderStyle, usize)]
     ) -> (Option<(String, u8, u16, u16, u16, u16)>, bool) {
         let mut hit_inside_any = false;
-        for layer in &self.layout_layers {
-            if !layer.visible || !matches!(layer.anchor, crate::layout::Anchor::ScreenAbsolute {..}) { continue; }
 
+        // 1. 提取可见的浮动图层
+        let mut visible_float_layers: Vec<&LayoutLayer> = self.layout_layers.iter()
+            .filter(|l| l.visible && matches!(l.anchor, crate::layout::Anchor::ScreenAbsolute {..}))
+            .collect();
+
+        // 2. 按 z_index 倒序排序，模拟渲染覆盖关系（高层在前）
+        visible_float_layers.sort_by(|a, b| b.z_index.cmp(&a.z_index));
+
+        let mut covered_rects: Vec<WindowRect> = Vec::new();
+
+        for layer in visible_float_layers {
             if let Some(res) = Self::check_node_edge_recursive(&layer.root, mouse_col, mouse_row, all_rects) {
-                // 如果点中了边缘，直接返回
-                if res.0.is_some() {
-                    return (res.0, true);
-                }
-                // 如果只是点在了内部，记录下来
                 if res.1 {
                     hit_inside_any = true;
+
+                    // 【核心修复】碰撞检测：判断鼠标点是否被更高层级的窗口覆盖
+                    let is_covered = covered_rects.iter().any(|r| {
+                        mouse_col >= r.start_col && mouse_col < r.start_col + r.width &&
+                        mouse_row >= r.start_row && mouse_row < r.start_row + r.height
+                    });
+
+                    if !is_covered {
+                        // 只有未被遮挡的边缘，才允许触发边缘拖拽
+                        if res.0.is_some() {
+                            return (res.0, true);
+                        }
+                    }
                 }
+                // 收集当前层级的所有窗口矩形，作为更低层级判定遮挡的参考
+                covered_rects.extend(Self::collect_node_window_rects(&layer.root, all_rects));
             }
         }
+
         (None, hit_inside_any)
     }
 

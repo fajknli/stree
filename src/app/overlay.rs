@@ -161,26 +161,15 @@ impl Engine {
                 _ => self.focus.main_tree_name.clone().unwrap_or_default(),
             };
 
-            let (selected_entity, ids_str, paths_str) = if let Some(Component::Tree(t)) = self.components.get(&tree_name) {
-                let sel = t.get_selected_entity().cloned();
-                let marked = t.get_marked_entities();
-                let entities: Vec<&crate::protocol::Entity> = if !marked.is_empty() {
-                    marked.iter().cloned().collect()
+            // 【重构后】直接调用提取的方法，干净利落！
+            let (selected_entity, ids_str, paths_str) = if !tree_name.is_empty() {
+                if let Some(Component::Tree(t)) = self.components.get(&tree_name) {
+                    let sel = t.get_selected_entity().cloned();
+                    let (ids, paths) = self.get_target_strings(&tree_name);
+                    (sel, ids, paths)
                 } else {
-                    sel.as_ref().map(|e| vec![e]).unwrap_or_default()
-                };
-                let ids = entities.iter().map(|e| e.id.as_str()).collect::<Vec<_>>().join(" ");
-                let paths = entities.iter()
-                    .map(|e| {
-                        if e.path.contains(' ') {
-                            format!("\"{}\"", e.path)
-                        } else {
-                            e.path.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                (sel, ids, paths)
+                    (None, String::new(), String::new())
+                }
             } else {
                 (None, String::new(), String::new())
             };

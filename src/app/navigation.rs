@@ -17,14 +17,11 @@ fn collect_visible_leaf_names(node: &LayoutNode, names: &mut HashSet<String>) {
 
 impl Engine {
     pub fn set_focus(&mut self, name: &str) {
-        // 【防线1】绝不允许聚焦到 StatusBar
-        if let Some(c) = self.components.get(name) {
-            if matches!(c, Component::StatusBar(_)) {
-                return;
-            }
-        }
+        // 【防线1】绝不允许聚焦到 StatusBar 或 nofocus 组件
+        if self.is_unfocusable(name) { return; }
 
         let old_focus = self.focus.current.clone();
+
         if let Focus::Component(old) = &old_focus {
             if old != name {
                 self.focus_history.retain(|n| n != old);
@@ -62,10 +59,7 @@ impl Engine {
         }
 
         let mut names: Vec<String> = self.components.iter()
-            .filter(|(k, c)| {
-                // 【防线2】Tab 循环时过滤掉 StatusBar
-                !matches!(c, Component::StatusBar(_)) && visible_names.contains(k.as_str())
-            })
+            .filter(|(k, _)| !self.is_unfocusable(k) && visible_names.contains(k.as_str()))
             .map(|(k, _)| k.clone())
             .collect();
 
@@ -160,10 +154,8 @@ impl Engine {
         for (i, (rect, name, _, z)) in all_rects.iter().enumerate() {
             if name == &current_name { continue; }
 
-            // 【防线3】方向切换时，绝对过滤掉 StatusBar！防止误触 Ctrl-J 跳进去
-            if let Some(comp) = self.components.get(name) {
-                if matches!(comp, Component::StatusBar(_)) { continue; }
-            }
+            // 【防线3】方向切换时，绝对过滤掉 StatusBar 和 nofocus！
+            if self.is_unfocusable(name) { continue; }
 
             let layer = self.layout_layers.get(*z);
             if let Some(layer) = layer {
@@ -213,24 +205,20 @@ impl Engine {
     fn recover_focus(&mut self, all_rects: &[(WindowRect, String, BorderStyle, usize)]) {
         let mut next_name = None;
         for hist_name in self.focus_history.iter().rev() {
-            // 恢复焦点时也要排除 StatusBar
+            // 恢复焦点时也要排除 StatusBar 和 nofocus
             if all_rects.iter().any(|(_, n, _, _)| n == hist_name) {
-                if let Some(comp) = self.components.get(hist_name) {
-                    if !matches!(comp, Component::StatusBar(_)) {
-                        next_name = Some(hist_name.clone());
-                        break;
-                    }
+                if !self.is_unfocusable(hist_name) {
+                    next_name = Some(hist_name.clone());
+                    break;
                 }
             }
         }
         if next_name.is_none() {
-            // 找第一个不是 StatusBar 的组件
+            // 找第一个不是 StatusBar 和 nofocus 的组件
             for (_, n, _, _) in all_rects {
-                if let Some(comp) = self.components.get(n) {
-                    if !matches!(comp, Component::StatusBar(_)) {
-                        next_name = Some(n.clone());
-                        break;
-                    }
+                if !self.is_unfocusable(n) {
+                    next_name = Some(n.clone());
+                    break;
                 }
             }
         }
@@ -386,6 +374,40 @@ impl Engine {
                 self.emit_select_if_changed(term_width, term_height);
                 self.mark_dirty(&focused_name);
             }
+        }
+    }
+    // 【新增】针对指定组件进行滚动，而非当前焦点组件
+    pub fn scroll_target_up(&mut self, name: &str, n: usize) {
+        self.last_error = None;
+        if let Some(Component::Tree(t)) = self.components.get_mut(name) {
+            for _ in 0..n {
+                if t.selected_idx > 0 {
+                    t.selected_idx -= 1;
+                    t.selected_id = Some(t.visible_ids[t.selected_idx].clone());
+                } else { break; }
+            }
+            self.mark_dirty(name);
+            self.pending_selection_changed = Some(name.to_string());
+        } else if let Some(Component::View(v)) = self.components.get_mut(name) {
+            v.scroll_offset = v.scroll_offset.saturating_sub(n);
+            self.mark_dirty(name);
+        }
+    }
+
+    pub fn scroll_target_down(&mut self, name: &str, n: usize) {
+        self.last_error = None;
+        if let Some(Component::Tree(t)) = self.components.get_mut(name) {
+            for _ in 0..n {
+                if t.selected_idx < t.visible_ids.len().saturating_sub(1) {
+                    t.selected_idx += 1;
+                    t.selected_id = Some(t.visible_ids[t.selected_idx].clone());
+                } else { break; }
+            }
+            self.mark_dirty(name);
+            self.pending_selection_changed = Some(name.to_string());
+        } else if let Some(Component::View(v)) = self.components.get_mut(name) {
+            v.scroll_offset = (v.scroll_offset + n).min(v.max_offset);
+            self.mark_dirty(name);
         }
     }
 }

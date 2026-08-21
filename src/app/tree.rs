@@ -19,9 +19,14 @@ pub struct TreeState {
     pub relations_path: Option<String>,
     pub click_to_fire: bool,   // click: 前缀
     pub focus_to_fire: bool,   // focus: 前缀
-    pub search_query: Option<String>, // 【新增】搜索状态
+    pub search_query: Option<String>, // 搜索状态
     pub h_scroll: usize,
     pub v_scroll: usize,
+    pub title_override: Option<String>, // 动态边框标题
+    pub no_hover: bool, // 免疫鼠标悬停夺焦
+    pub no_focus: bool, // 【新增】完全不可聚焦
+    pub search_scope: String,
+    pub keymap: String,
 }
 
 impl TreeState {
@@ -31,7 +36,7 @@ impl TreeState {
 
         if let Some(query) = &self.search_query {
             if !query.is_empty() {
-                let matched = crate::search::match_entities(&self.dataset.entities, query);
+                let matched = crate::search::match_entities(&self.dataset.entities, query, &self.search_scope); // 【修改】使用 self.search_scope
                 for root in &self.root_tree {
                     Self::collect_matched(root, &matched, &mut self.visible_ids, &mut self.visible_depths);
                 }
@@ -198,8 +203,13 @@ mod tests {
             click_to_fire: false,
             focus_to_fire: false,
             search_query: None,
-            h_scroll: 0,  // 【补丁】新增
-            v_scroll: 0,  // 【补丁】新增
+            h_scroll: 0,
+            v_scroll: 0,
+            title_override: None,
+            no_hover: false,
+            no_focus: false,
+            search_scope: "all".to_string(),
+            keymap: "default".to_string(), // 【修复】补上测试用例的初始化
         };
         state.select_id("U-01");
         state

@@ -71,7 +71,15 @@ impl Engine {
                     m.insert("view_h".into(), v.h_scroll.to_string());
                     m.insert("view_w".into(), v.rect_width.to_string());
                     m.insert("view_h_px".into(), v.rect_height.to_string());
-                    m.insert("buffer_kb".into(), (v.content_buffer.len() / 1024).to_string());
+
+                    // 【修改】通过 match 获取内容长度
+                    let buffer_len = match &v.content {
+                        crate::app::view::ViewContent::Text(s) => s.len(),
+                        crate::app::view::ViewContent::Graphic(b) => b.len(),
+                        crate::app::view::ViewContent::Empty => 0,
+                    };
+                    m.insert("buffer_kb".into(), (buffer_len / 1024).to_string());
+
                     m.insert("view_max_v".into(), v.max_offset.to_string());
                     m.insert("view_cmd".into(), v.cmd_template.clone());
                     m.insert("cached_id".into(), v.cached_entity_id.clone().unwrap_or_default());

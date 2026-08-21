@@ -84,6 +84,7 @@ pub enum InternalCommand {
     CycleLayer,
     CloseOverlay(String),  // 新增
     CloseTopOverlay,       // 新增
+    Noop,
 }
 
 impl InternalCommand {
@@ -102,6 +103,7 @@ impl InternalCommand {
             ("__TOP__", None) => Some(Self::Top),
             ("__BOTTOM__", None) => Some(Self::Bottom),
             ("__ENTER__", None) => Some(Self::Enter),
+            ("__NOOP__", None) => Some(Self::Noop),
             ("__ACTIVATE_INPUT__", Some(name)) => Some(Self::ActivateInput(name)),
             ("__TOGGLE_LAYOUT__", Some(name)) => Some(Self::ToggleLayout(name)),
             ("__SHOW_LAYOUT__", Some(name)) => Some(Self::ShowLayout(name)),
@@ -206,8 +208,8 @@ pub struct Engine {
     pub dirty_components: std::collections::HashSet<String>,
     pub pending_selection_changed: Option<String>,
     pub pending_blur: Option<String>,
-    pub async_view_tx: Sender<(String, Option<String>, String)>,
-    pub async_view_rx: Receiver<(String, Option<String>, String)>,
+    pub async_view_tx: Sender<(String, Option<String>, Vec<u8>, bool)>,
+    pub async_view_rx: Receiver<(String, Option<String>, Vec<u8>, bool)>,
     pub async_reload_tx: Sender<(String, std::io::Result<String>)>,
     pub async_reload_rx: Receiver<(String, std::io::Result<String>)>,
     pub async_exec_tx: Sender<()>,       // 【新增】异步脚本执行完成通知
@@ -218,6 +220,36 @@ pub struct Engine {
     pub focus_history: Vec<String>,
     pub layout_blueprint: Vec<String>,
     pub overlay_stack: Vec<OverlayLayer>, // 【新增】统一覆盖栈
+}
+
+fn parse_view_tree_prefixes(cfg_str: &str) -> (bool, bool, String, String, &str) {
+    let mut no_hover = false;
+    let mut no_focus = false;
+    let mut search_scope = "all".to_string();
+    let mut keymap = "default".to_string(); // 默认是 default
+    let mut rest = cfg_str.trim();
+
+    loop {
+        if let Some(stripped) = rest.strip_prefix("nohover:") {
+            no_hover = true; rest = stripped.trim();
+        } else if let Some(stripped) = rest.strip_prefix("nofocus:") {
+            no_focus = true; rest = stripped.trim();
+        } else if let Some(stripped) = rest.strip_prefix("search-scope:") {
+            if let Some(end_idx) = stripped.find(':') {
+                search_scope = stripped[..end_idx].to_string();
+                rest = stripped[end_idx + 1..].trim();
+            } else { break; }
+        } else if let Some(stripped) = rest.strip_prefix("keymap:") {
+            // 解析语法: keymap:default+bookmarks
+            if let Some(end_idx) = stripped.find(':') {
+                keymap = stripped[..end_idx].to_string();
+                rest = stripped[end_idx + 1..].trim();
+            } else { break; }
+        } else {
+            break;
+        }
+    }
+    (no_hover, no_focus, search_scope, keymap, rest)
 }
 
 fn parse_component_prefixes(cfg: &str) -> (bool, bool, bool, &str) {
@@ -281,8 +313,10 @@ impl Engine {
         let mut first_tree_name = None;
 
         for t_cfg in trees {
-            let (click_to_fire, focus_to_fire, nomark, rest) = parse_component_prefixes(&t_cfg);
-            let markable = !nomark; // 【修复】反转逻辑：没有声明 nomark 的树，默认都是可标记的
+            // 【修复】解构出 5 个返回值
+            let (no_hover, no_focus, search_scope, keymap, rest_cfg) = parse_view_tree_prefixes(&t_cfg);
+            let (click_to_fire, focus_to_fire, nomark, rest) = parse_component_prefixes(rest_cfg);
+            let markable = !nomark;
             let parts: Vec<&str> = rest.splitn(2, ':').collect();
             let name = parts[0].to_string();
             let source_cmd = parts.get(1).map(|s| s.to_string());
@@ -317,7 +351,10 @@ impl Engine {
                     }
                 }
             } else {
-                initial_dataset.clone()
+                let mut ds = initial_dataset.clone();
+                ds.relations = global_relations.clone();
+                ds.child_index = crate::protocol::build_child_index(&ds.relations);
+                ds
             };
 
             let root_tree = crate::tree::build_tree(&dataset);
@@ -338,6 +375,11 @@ impl Engine {
                 search_query: None,
                 h_scroll: 0,
                 v_scroll: 0,
+                title_override: None,
+                no_hover,
+                no_focus,
+                search_scope,
+                keymap, // 【修复】注入 keymap
             };
             tree_state.rebuild_visible_ids();
             if let Some(first_id) = tree_state.visible_ids.first().cloned() {
@@ -347,19 +389,27 @@ impl Engine {
         }
 
         for v_cfg in views {
-            let parts: Vec<&str> = v_cfg.splitn(2, ':').collect();
+            // 【修复】解构出 5 个返回值
+            let (no_hover, no_focus, _search_scope, keymap, rest_cfg) = parse_view_tree_prefixes(&v_cfg);
+            let parts: Vec<&str> = rest_cfg.splitn(2, ':').collect();
             let name = parts[0].to_string();
             let cmd = parts.get(1).map(|s| s.to_string()).unwrap_or_default();
             components.insert(name, Component::View(ViewState {
                 cmd_template: cmd,
                 scroll_offset: 0,
-                content_buffer: String::new(),
+                content: crate::app::view::ViewContent::Empty,
                 cached_entity_id: None,
                 max_offset: 0,
                 rect_width: 0,
                 rect_height: 0,
                 h_scroll: 0,
                 is_loading: false,
+                no_hover,
+                no_focus,
+                graphic_dirty: false,
+                needs_graphic_clear: false,
+                child_pid: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                keymap, // 【修复】注入 keymap
             }));
         }
 
@@ -485,6 +535,26 @@ impl Engine {
         engine
     }
 
+    /// 【新增】判断组件是否绝对不可获取焦点（StatusBar 和 声明了 nofocus: 的组件）
+    pub fn is_unfocusable(&self, name: &str) -> bool {
+        match self.components.get(name) {
+            Some(Component::StatusBar(_)) => true,
+            Some(Component::View(v)) => v.no_focus,
+            Some(Component::Tree(t)) => t.no_focus,
+            _ => false,
+        }
+    }
+
+    /// 【新增】判断组件是否免疫鼠标悬停
+    pub fn is_hover_immune(&self, name: &str) -> bool {
+        match self.components.get(name) {
+            Some(Component::StatusBar(_)) => true,
+            Some(Component::View(v)) => v.no_hover,
+            Some(Component::Tree(t)) => t.no_hover,
+            _ => false,
+        }
+    }
+
     pub fn mark_dirty(&mut self, name: &str) {
         self.dirty_components.insert(name.to_string());
         if matches!(self.components.get(name), Some(Component::Tree(_))) {
@@ -510,7 +580,11 @@ impl Engine {
 
         // 【新增】处理失去焦点信号
         if let Some(blur_name) = self.pending_blur.take() {
-            let binding = self.key_bindings.get_signal_binding(Some(&blur_name), "blur");
+            // 【修复】使用 keymap 查找 blur 信号，保持一致性
+            let blur_keymaps_owned = self.get_keymaps_for(&blur_name);
+            let blur_keymaps: Vec<Option<&str>> = blur_keymaps_owned.iter().map(|s| s.as_deref()).collect();
+            let binding = self.key_bindings.get_signal_binding_keymap(&blur_keymaps, "blur");
+
             if let Some((cmd_template_args, _is_silent)) = binding {
                 let ctx = Self::build_exec_context(
                     None, "", "", &blur_name,
@@ -560,135 +634,81 @@ impl Engine {
         )
     }
 
-    pub fn toggle_layout_visible(&mut self, name: &str) {
-        for layer in &mut self.layout_layers {
-            let has_window = Self::layout_contains_window(layer, name);
-            if has_window {
-                layer.visible = !layer.visible;
+    // 【新增】提取的统一图层应用逻辑
+    fn apply_layer_visibility(&mut self, layer_idx: usize, visible: bool) {
+        let layer = &mut self.layout_layers[layer_idx];
+        if layer.visible == visible { return; }
+        layer.visible = visible;
 
-                if layer.visible {
-                    // 打开图层：获取焦点
-                    if let Some(win_name) = Self::get_first_window_name(&layer.root) {
-                        self.set_focus(&win_name);
+        if visible {
+            if let Some(win_name) = Self::get_first_window_name(&layer.root) {
+                self.set_focus(&win_name);
+            }
+        } else {
+            if let Focus::Component(curr_name) = &self.focus.current.clone() {
+                let layer_contains_curr = Self::layout_contains_window(&self.layout_layers[layer_idx], curr_name);
+                if layer_contains_curr {
+                    let mut restored = false;
+                    while let Some(prev_name) = self.focus_history.pop() {
+                        let is_visible = self.layout_layers.iter().any(|l| l.visible && Self::layout_contains_window(l, &prev_name));
+                        if is_visible {
+                            self.focus.current = Focus::Component(prev_name.clone());
+                            self.mark_dirty(&prev_name);
+                            restored = true;
+                            break;
+                        }
                     }
-                } else {
-                    // 关闭图层：如果关的是当前焦点，从历史栈找上一个可见的
-                    if let Focus::Component(curr_name) = &self.focus.current {
-                        if Self::layout_contains_window(layer, curr_name) {
-                            let mut restored = false;
-                            while let Some(prev_name) = self.focus_history.pop() {
-                                let is_visible = self.layout_layers.iter().any(|l| l.visible && Self::layout_contains_window(l, &prev_name));
-                                if is_visible {
-                                    self.focus.current = Focus::Component(prev_name.clone());
-                                    self.mark_dirty(&prev_name);
-                                    restored = true;
-                                    break;
-                                }
-                            }
-                            if !restored {
-                                if let Some(main_tree) = self.focus.main_tree_name.clone() {
-                                    self.set_focus(&main_tree);
-                                }
-                            }
+                    if !restored {
+                        if let Some(main_tree) = self.focus.main_tree_name.clone() {
+                            self.set_focus(&main_tree);
                         }
                     }
                 }
-
-                self.mark_all_dirty();
-                self.prev_rects.clear();
-                return;
             }
         }
-        if let Ok(idx) = name.parse::<usize>() {
-            if let Some(layer) = self.layout_layers.get_mut(idx) {
-                layer.visible = !layer.visible;
 
-                if layer.visible {
-                    if let Some(win_name) = Self::get_first_window_name(&layer.root) {
-                        self.set_focus(&win_name);
-                    }
-                } else {
-                    if let Focus::Component(curr_name) = &self.focus.current {
-                        if Self::layout_contains_window(layer, curr_name) {
-                            if let Some(main_tree) = self.focus.main_tree_name.clone() {
-                                self.set_focus(&main_tree);
-                            }
-                        }
-                    }
-                }
+        self.mark_all_dirty();
+        self.prev_rects.clear();
+    }
 
-                self.mark_all_dirty();
-                self.prev_rects.clear();
+    pub fn toggle_layout_visible(&mut self, name: &str) {
+        let mut found_idx = None;
+        for (i, layer) in self.layout_layers.iter().enumerate() {
+            if Self::layout_contains_window(layer, name) {
+                found_idx = Some(i);
+                break;
             }
+        }
+        if found_idx.is_none() {
+            if let Ok(idx) = name.parse::<usize>() {
+                if idx < self.layout_layers.len() { found_idx = Some(idx); }
+            }
+        }
+        if let Some(idx) = found_idx {
+            let visible = !self.layout_layers[idx].visible;
+            self.apply_layer_visibility(idx, visible);
         }
     }
 
     pub fn set_layout_visible(&mut self, name: &str, visible: bool) {
-        for layer in &mut self.layout_layers {
-            let has_window = Self::layout_contains_window(layer, name);
-            if has_window {
-                if layer.visible != visible {
-                    layer.visible = visible;
-
-                    if visible {
-                        if let Some(win_name) = Self::get_first_window_name(&layer.root) {
-                            self.set_focus(&win_name);
-                        }
-                    } else {
-                        if let Focus::Component(curr_name) = &self.focus.current {
-                            if Self::layout_contains_window(layer, curr_name) {
-                                let mut restored = false;
-                                while let Some(prev_name) = self.focus_history.pop() {
-                                    let is_visible = self.layout_layers.iter().any(|l| l.visible && Self::layout_contains_window(l, &prev_name));
-                                    if is_visible {
-                                        self.focus.current = Focus::Component(prev_name.clone());
-                                        self.mark_dirty(&prev_name);
-                                        restored = true;
-                                        break;
-                                    }
-                                }
-                                if !restored {
-                                    if let Some(main_tree) = self.focus.main_tree_name.clone() {
-                                        self.set_focus(&main_tree);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    self.mark_all_dirty();
-                    self.prev_rects.clear();
-                }
-                return;
+        let mut found_idx = None;
+        for (i, layer) in self.layout_layers.iter().enumerate() {
+            if Self::layout_contains_window(layer, name) {
+                found_idx = Some(i);
+                break;
             }
         }
-        if let Ok(idx) = name.parse::<usize>() {
-            if let Some(layer) = self.layout_layers.get_mut(idx) {
-                if layer.visible != visible {
-                    layer.visible = visible;
-
-                    if visible {
-                        if let Some(win_name) = Self::get_first_window_name(&layer.root) {
-                            self.set_focus(&win_name);
-                        }
-                    } else {
-                        if let Focus::Component(curr_name) = &self.focus.current {
-                            if Self::layout_contains_window(layer, curr_name) {
-                                if let Some(main_tree) = self.focus.main_tree_name.clone() {
-                                    self.set_focus(&main_tree);
-                                }
-                            }
-                        }
-                    }
-
-                    self.mark_all_dirty();
-                    self.prev_rects.clear();
-                }
+        if found_idx.is_none() {
+            if let Ok(idx) = name.parse::<usize>() {
+                if idx < self.layout_layers.len() { found_idx = Some(idx); }
             }
+        }
+        if let Some(idx) = found_idx {
+            self.apply_layer_visibility(idx, visible);
         }
     }
 
-    fn layout_contains_window(layer: &layout::LayoutLayer, name: &str) -> bool {
+    pub fn layout_contains_window(layer: &layout::LayoutLayer, name: &str) -> bool {
         fn check_node(node: &layout::LayoutNode, name: &str) -> bool {
             match node {
                 layout::LayoutNode::Window { name: n, .. } => n == name,
@@ -757,7 +777,12 @@ impl Engine {
     pub fn update_view_rects(&mut self, view_rects: HashMap<String, (usize, u16, u16)>) {
         for (name, (max_rows, width, height)) in view_rects {
             if let Some(Component::View(v)) = self.components.get_mut(&name) {
-                let total_lines = v.content_buffer.lines().count();
+                // 【终极修复】只有 Text 才计算行数，Graphic 直接跳过！
+                let total_lines = match &v.content {
+                    crate::app::view::ViewContent::Text(text) => text.lines().count(),
+                    _ => 1, // 图片或空内容不需要计算
+                };
+
                 v.max_offset = total_lines.saturating_sub(max_rows);
                 if v.scroll_offset > v.max_offset {
                     v.scroll_offset = v.max_offset;
@@ -830,10 +855,11 @@ impl Engine {
                     if !is_loading {
                         let content_lines = match components.get(name) {
                             Some(Component::View(v)) => {
-                                if v.content_buffer.is_empty() {
-                                    *fallback as usize
-                                } else {
-                                    v.content_buffer.lines().count()
+                                match &v.content {
+                                    crate::app::view::ViewContent::Text(text) => {
+                                        if text.is_empty() { *fallback as usize } else { text.lines().count() }
+                                    }
+                                    _ => *fallback as usize,
                                 }
                             }
                             Some(Component::Tree(t)) => {
@@ -859,34 +885,64 @@ impl Engine {
             }
         }
     }
+    // 【新增】提取：获取当前活动的 Tree 名称
+    fn get_active_tree_name(&self) -> Option<String> {
+        match &self.focus.current {
+            Focus::Component(n) if matches!(self.components.get(n), Some(Component::Tree(_))) => Some(n.clone()),
+            _ => self.focus.main_tree_name.clone(),
+        }
+    }
+
+    // 【新增】提取：获取目标的 ids 和 paths 字符串
+    fn get_target_strings(&self, tree_name: &str) -> (String, String) {
+        if let Some(Component::Tree(t)) = self.components.get(tree_name) {
+            let sel = t.get_selected_entity();
+            let marked = t.get_marked_entities();
+            let entities: Vec<&crate::protocol::Entity> = if !marked.is_empty() {
+                marked.iter().cloned().collect()
+            } else {
+                sel.map(|e| vec![e]).unwrap_or_default()
+            };
+
+    // 【修改】给 ids_str 也加上引号处理，防止带有空格的 ID 传参断裂
+            let ids_str = entities
+                .iter()
+                .map(|e| {
+                    if e.id.contains(' ') {
+                        format!("\"{}\"", e.id)
+                    } else {
+                        e.id.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let paths_str = entities
+                .iter()
+                .map(|e| {
+                    if e.path.contains(' ') {
+                        format!("\"{}\"", e.path)
+                    } else {
+                        e.path.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            (ids_str, paths_str)
+        } else {
+            (String::new(), String::new())
+        }
+    }
+
     pub fn prepare_key_binding_args(&self, scope: Option<&str>, key: &crossterm::event::KeyEvent, term_width: u16, term_height: u16) -> Option<(Vec<String>, bool)> {
         let (cmd_template_args, is_silent) = self.key_bindings.get_scoped(scope, key)?;
 
-        let tree_name = match &self.focus.current {
-            Focus::Component(n) if matches!(self.components.get(n), Some(Component::Tree(_))) => n.clone(),
-            Focus::None => self.focus.main_tree_name.as_ref()?.clone(),
-            _ => self.focus.main_tree_name.as_ref()?.clone(),
-        };
-
+        let tree_name = self.get_active_tree_name()?;
         let tree_state = if let Some(Component::Tree(t)) = self.components.get(&tree_name) { t } else { return None; };
         let selected_entity = tree_state.get_selected_entity();
-        let marked_entities = tree_state.get_marked_entities();
 
-        let entities: Vec<&crate::protocol::Entity> = if !marked_entities.is_empty() {
-            marked_entities.iter().cloned().collect()
-        } else { selected_entity.map(|e| vec![e]).unwrap_or_default() };
-
-        let ids_str = entities.iter().map(|e| e.id.as_str()).collect::<Vec<_>>().join(" ");
-        let paths_str = entities.iter()
-            .map(|e| {
-                if e.path.contains(' ') {
-                    format!("\"{}\"", e.path)
-                } else {
-                    e.path.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
+        // 【重构】调用提取的方法
+        let (ids_str, paths_str) = self.get_target_strings(&tree_name);
 
         let window_name = match &self.focus.current { Focus::Component(n) => n.clone(), Focus::None => String::new() };
         let ctx = Self::build_exec_context(
@@ -909,35 +965,26 @@ impl Engine {
             self.signals.last_emit.insert(signal, now);
         }
 
-        let current_window = match &self.focus.current { Focus::Component(n) => Some(n.as_str()), Focus::None => None };
-        let binding = self.key_bindings.get_signal_binding(current_window, signal);
+        let active_keymaps_owned = self.get_active_keymaps();
+        let active_keymaps: Vec<Option<&str>> = active_keymaps_owned.iter().map(|s| s.as_deref()).collect();
 
-        if let Some((cmd_template_args, _is_silent)) = binding {
-            let tree_name = match &self.focus.current {
-                Focus::Component(n) if matches!(self.components.get(n), Some(Component::Tree(_))) => n.clone(),
-                _ => self.focus.main_tree_name.clone().unwrap_or_default(),
+        // 【修复】使用 get_signal_binding_keymap 替代原来的 get_signal_binding
+        if let Some((cmd_template_args, _is_silent)) = self.key_bindings.get_signal_binding_keymap(&active_keymaps, signal) {
+            let tree_name = self.get_active_tree_name().unwrap_or_default();
+
+            let (selected_entity, ids_str, paths_str) = if !tree_name.is_empty() {
+                if let Some(Component::Tree(t)) = self.components.get(&tree_name) {
+                    let sel = t.get_selected_entity().cloned();
+                    let (ids, paths) = self.get_target_strings(&tree_name);
+                    (sel, ids, paths)
+                } else {
+                    (None, String::new(), String::new())
+                }
+            } else {
+                (None, String::new(), String::new())
             };
 
-            let (selected_entity, ids_str, paths_str) = if let Some(Component::Tree(t)) = self.components.get(&tree_name) {
-                let sel = t.get_selected_entity();
-                let marked = t.get_marked_entities();
-                let entities: Vec<&crate::protocol::Entity> = if !marked.is_empty() {
-                    marked.iter().cloned().collect()
-                } else { sel.map(|e| vec![e]).unwrap_or_default() };
-                let ids = entities.iter().map(|e| e.id.as_str()).collect::<Vec<_>>().join(" ");
-                let paths = entities.iter()
-                    .map(|e| {
-                        if e.path.contains(' ') {
-                            format!("\"{}\"", e.path)
-                        } else {
-                            e.path.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                (sel.cloned(), ids, paths)
-            } else { (None, String::new(), String::new()) };
-
+            let current_window = match &self.focus.current { Focus::Component(n) => Some(n.as_str()), Focus::None => None };
             let window_name = current_window.unwrap_or("").to_string();
             let ctx = Self::build_exec_context(
                 selected_entity.as_ref(), &ids_str, &paths_str, &window_name,
@@ -961,7 +1008,11 @@ impl Engine {
                 return true;
             }
 
-            let _ = exec::execute_command_silent(&full_cmd_args);
+            let tx = self.async_exec_tx.clone();
+            std::thread::spawn(move || {
+                let _ = exec::execute_command_silent(&full_cmd_args);
+                let _ = tx.send(());
+            });
         }
         true
     }
@@ -995,5 +1046,47 @@ impl Engine {
             return t.get_selected_entity();
         }
         None
+    }
+    // 【新增】通用的 Keymap 解析方法，供 active 和 blur 复用
+    pub fn get_keymaps_for(&self, comp_name: &str) -> Vec<Option<String>> {
+        let mut keymaps: Vec<Option<String>> = Vec::new();
+
+        let keymap_str = self.components.get(comp_name).and_then(|c| match c {
+            Component::Tree(t) => Some(t.keymap.as_str()),
+            Component::View(v) => Some(v.keymap.as_str()),
+            Component::Input(i) => Some(i.keymap.as_str()),
+            _ => None,
+        }).unwrap_or("default");
+
+        if keymap_str == "default" {
+            // 向后兼容：如果默认，先查组件名作用域，再查全局 None
+            keymaps.push(Some(comp_name.to_string()));
+            keymaps.push(None);
+        } else {
+            // 新的 keymap 逻辑：按 + 号拆分，从右向左压栈
+            let parts: Vec<&str> = keymap_str.split('+').collect();
+            for part in parts.iter().rev() {
+                if part.eq_ignore_ascii_case("default") || part.is_empty() {
+                    keymaps.push(None); // None 代表全局默认包
+                } else {
+                    keymaps.push(Some(part.to_string()));
+                }
+            }
+        }
+        keymaps
+    }
+
+    pub fn get_active_keymaps(&self) -> Vec<Option<String>> {
+        let active_comp_name = if let Some(layer) = self.overlay_stack.last() {
+            Some(layer.source.clone())
+        } else {
+            if let Focus::Component(n) = &self.focus.current { Some(n.clone()) } else { None }
+        };
+
+        if let Some(comp_name) = active_comp_name {
+            self.get_keymaps_for(&comp_name)
+        } else {
+            vec![None]
+        }
     }
 }
