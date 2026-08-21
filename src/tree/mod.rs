@@ -64,14 +64,13 @@ pub fn build_tree(dataset: &Dataset) -> Vec<TreeNode> {
         }
     }
 
-    let mut root_ids: Vec<String> = dataset
-        .entity_map
-        .keys()
-        .filter(|id| !all_child_ids.contains(*id))
-        .cloned()
+    // 直接从 entities 数组按原始输入顺序提取根节点
+    let root_ids: Vec<String> = dataset
+        .entities
+        .iter()
+        .map(|e| e.id.clone())
+        .filter(|id| !all_child_ids.contains(id))
         .collect();
-
-    root_ids.sort();
 
     for root_id in root_ids {
         if let Some(entity) = dataset.entity_map.get(&root_id) {
