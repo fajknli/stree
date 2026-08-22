@@ -42,11 +42,8 @@ pub fn match_entities(entities: &[Entity], query: &str, scope: &str) -> HashSet<
             is_match |= entity.id.to_lowercase().contains(&lower_query);
         }
         if !is_match && check_path {
-            let searchable_path = std::path::Path::new(&entity.path)
-                .with_extension("")
-                .to_string_lossy()
-                .to_string();
-            is_match |= searchable_path.to_lowercase().contains(&lower_query);
+            // 【修复】直接使用原始 path 匹配，消灭 with_extension 导致的隐藏文件丢失问题
+            is_match |= entity.path.to_lowercase().contains(&lower_query);
         }
 
         if is_match {

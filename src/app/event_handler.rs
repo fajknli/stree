@@ -476,9 +476,18 @@ impl Engine {
                         MouseEventKind::Down(MouseButton::Left) => {
                             if let Some(ref cid) = clicked_id {
                                 let now = std::time::Instant::now();
+
+                                // 【修复】增加面板校验，name 是 &String，要转成 &str 比较
+                                let same_pane = self.mouse.last_clicked_pane.as_deref() == Some(name.as_str());
                                 let is_double_click = self.mouse.last_click_time
                                     .map_or(false, |t| now.duration_since(t).as_millis() < 300)
+                                    && same_pane
                                     && self.mouse.last_clicked_id.as_deref() == Some(cid.as_str());
+
+                                // 必须更新面板记录和ID记录
+                                self.mouse.last_clicked_pane = Some(name.to_string());
+                                self.mouse.last_clicked_id = Some(cid.clone());
+                                self.mouse.last_click_time = Some(now);
 
                                 if is_double_click {
                                     self.select_id(&tree_name, cid);

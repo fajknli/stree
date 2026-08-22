@@ -10,6 +10,11 @@ impl Engine {
         let mut m: HashMap<String, String> = HashMap::new();
         self.collect_metrics_into(term_width, term_height, all_rects, &mut m);
 
+        // 将外部注入的变量以 var_ 前缀合并到指标池
+        for (k, v) in &self.custom_vars {
+            m.insert(format!("var_{}", k), v.clone());
+        }
+
         for (_, comp) in self.components.iter_mut() {
             if let Component::StatusBar(s) = comp {
                 let mut status_text = s.format_template.clone();

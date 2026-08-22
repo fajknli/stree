@@ -183,6 +183,7 @@ impl Engine {
             }
             "@layout-reset" => {
                 self.window_rect_overrides.clear();
+                self.auto_overrides.clear();
                 let parsed_layout = crate::layout::parse_layouts(&self.layout_blueprint);
                 self.layout_layers = parsed_layout.layers;
                 self.mark_all_dirty();
@@ -223,6 +224,14 @@ impl Engine {
                             t.title_override = Some(parts[1].to_string());
                             self.mark_dirty(parts[0]);
                         }
+                    }
+                    true
+                } else if let Some(args) = target.strip_prefix("@set-var ") {
+                    if let Some(space_idx) = args.find(' ') {
+                        let key = args[..space_idx].to_string();
+                        let val = args[space_idx + 1..].to_string();
+                        self.custom_vars.insert(key, val);
+                        self.mark_all_dirty(); // 触发重绘
                     }
                     true
                 } else {

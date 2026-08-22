@@ -162,6 +162,7 @@ pub struct MouseState {
     pub enabled: bool,
     pub last_click_time: Option<Instant>,
     pub last_clicked_id: Option<String>,
+    pub last_clicked_pane: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -220,6 +221,7 @@ pub struct Engine {
     pub focus_history: Vec<String>,
     pub layout_blueprint: Vec<String>,
     pub overlay_stack: Vec<OverlayLayer>, // 【新增】统一覆盖栈
+    pub custom_vars: HashMap<String, String>,
 }
 
 fn parse_view_tree_prefixes(cfg_str: &str) -> (bool, bool, String, String, &str) {
@@ -529,6 +531,7 @@ impl Engine {
             focus_history: Vec::new(),
             layout_blueprint: layout_strings,
             overlay_stack: Vec::new(), // 【新增】初始化
+            custom_vars: HashMap::new(),
         };
 
         engine.is_initialized = false;
@@ -776,7 +779,7 @@ impl Engine {
         if let Some(Component::Tree(t)) = self.components.get(name) { Some(t) } else { None }
     }
 
-    // 【新增】预计算自适应高度，将 Auto 转化为临时的 Absolute 覆盖
+    // 预计算自适应高度，将 Auto 转化为临时的 Absolute 覆盖
     pub fn precalculate_auto_sizes(&mut self, term_height: u16) {
         // 拖拽期间绝对禁止预计算，防止与物理像素冻结冲突
         if self.drag.active {
@@ -792,11 +795,13 @@ impl Engine {
 
         // 2. 【冻结魔法】对于正在加载中的视图，如果上一帧有高度，直接继承过来！
         // 这样在异步加载的零点几秒内，窗口尺寸纹丝不动，消灭闪烁。
+        // 2. 【冻结魔法】对于正在加载中的视图，如果上一帧有高度，直接继承过来！
+        // 这样在异步加载的零点几秒内，窗口尺寸纹丝不动，消灭闪烁。
         for (name, size) in &self.auto_overrides {
             if !next_overrides.contains_key(name) {
                 if let Some(Component::View(v)) = self.components.get(name) {
                     if v.is_loading {
-                        // 【修复】继承高度时，必须强制 clamp，防止终端缩小导致高度溢出
+                        // 【修复】恢复正确的 match 语法，不要用 if let Some(h) = size
                         let clamped_size = match size {
                             layout::WindowSize::Absolute(h) => {
                                 layout::WindowSize::Absolute((*h).min(term_height).max(1))
